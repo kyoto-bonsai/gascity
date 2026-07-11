@@ -182,12 +182,16 @@ func (c *Client) RigCreate(req RigCreateRequest, onProgress func(RigProvisionPro
 	}
 	// Decode the structured 409 (request_id or rig-name collision) before the
 	// generic problem-detail mapping so the CLI can print the re-attach recipe.
+	// create-rig enumerates its error statuses (the P12 error contract), so the
+	// generator decodes each problem+json body into ApplicationproblemJSON<code>
+	// rather than a catch-all default; pdOf returns whichever field is populated.
+	pd := pdOf(resp)
 	if resp.StatusCode() == http.StatusConflict {
-		if cerr := rigConflictFromError(resp.ApplicationproblemJSONDefault); cerr != nil {
+		if cerr := rigConflictFromError(pd); cerr != nil {
 			return RigCreateResult{}, cerr
 		}
 	}
-	if err := apiErrorFromResponse(resp.StatusCode(), resp.ApplicationproblemJSONDefault); err != nil {
+	if err := apiErrorFromResponse(resp.StatusCode(), pd); err != nil {
 		return RigCreateResult{}, err
 	}
 
