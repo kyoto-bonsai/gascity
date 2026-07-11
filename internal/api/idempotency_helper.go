@@ -21,7 +21,11 @@ import "github.com/gastownhall/gascity/internal/api/apierr"
 // return the domain body value to cache. Callers wrap that value in their
 // response envelope after withIdempotency returns, so envelope fields derived
 // from live state (e.g. the X-GC-Index event sequence) stay fresh on replay.
-func withIdempotency[T any](s *Server, path, key string, body any, create func() (T, error)) (T, error) {
+//
+// idem is the owning cache: per-city handlers pass s.idem (one cache per city
+// Server, so static paths cannot collide across cities); supervisor-scope
+// handlers pass sm.idem.
+func withIdempotency[T any](idem *idempotencyCache, path, key string, body any, create func() (T, error)) (T, error) {
 	var zero T
 	if key == "" {
 		return create()
@@ -29,7 +33,7 @@ func withIdempotency[T any](s *Server, path, key string, body any, create func()
 	scopedKey := "POST:" + path + ":" + key
 	bodyHash := hashBody(body)
 
-	existing, found := s.idem.reserve(scopedKey, bodyHash)
+	existing, found := idem.reserve(scopedKey, bodyHash)
 	if found {
 		if existing.bodyHash != bodyHash {
 			return zero, apierr.IdempotencyMismatch.Msg("idempotency_mismatch: Idempotency-Key reused with different request body")
@@ -52,7 +56,7 @@ func withIdempotency[T any](s *Server, path, key string, body any, create func()
 	settled := false
 	defer func() {
 		if !settled {
-			s.idem.unreserve(scopedKey)
+			idem.unreserve(scopedKey)
 		}
 	}()
 
@@ -61,6 +65,6 @@ func withIdempotency[T any](s *Server, path, key string, body any, create func()
 		return zero, err
 	}
 	settled = true
-	s.idem.storeResponse(scopedKey, bodyHash, v)
+	idem.storeResponse(scopedKey, bodyHash, v)
 	return v, nil
 }
