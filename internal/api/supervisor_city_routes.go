@@ -271,6 +271,12 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	cityGet(sm, "/workflow/{workflow_id}", (*Server).humaHandleWorkflowGet, errorStatuses(http.StatusBadRequest, http.StatusNotFound))
 	cityDelete(sm, "/workflow/{workflow_id}", (*Server).humaHandleWorkflowDelete, errorStatuses(http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound))
 
+	// Canonical Run resource — the ONE typed run projection, sourced from the
+	// city event log.
+	cityGet(sm, "/runs", (*Server).humaHandleRunsList, errorStatuses(http.StatusServiceUnavailable))
+	cityGet(sm, "/runs/{run_id}", (*Server).humaHandleRunGet, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
+	cityGet(sm, "/runs/{run_id}/steps", (*Server).humaHandleRunSteps, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
+
 	// Packs.
 	cityGet(sm, "/packs", (*Server).humaHandlePackList, errorStatuses(http.StatusBadRequest, http.StatusNotFound))
 	cityRegister(sm, huma.Operation{
@@ -353,6 +359,10 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	cityPost(sm, "/session/{id}/rename", (*Server).humaHandleSessionRename, errorStatuses(http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable))
 	cityGet(sm, "/session/{id}/agents", (*Server).humaHandleSessionAgentList, errorStatuses(http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable))
 	cityGet(sm, "/session/{id}/agents/{agentId}", (*Server).humaHandleSessionAgentGet, errorStatuses(http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable))
+
+	// Durable session waits (session coordination-class).
+	cityGet(sm, "/waits", (*Server).humaHandleWaitList, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
+	cityGet(sm, "/wait/{id}", (*Server).humaHandleWaitGet, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
 
 	// Session SSE stream.
 	registerSSE(sm.humaAPI, huma.Operation{

@@ -6,11 +6,17 @@ import "github.com/gastownhall/gascity/internal/api/apierr"
 // giving create endpoints safe retries via the Idempotency-Key header.
 //
 // The scoped key is "POST:<path>:<key>" — namespaced by path so the same
-// Idempotency-Key value on two different endpoints (or two different cities,
-// when the caller folds the city into path) can't collide. On a repeat with a
-// completed reservation it replays the cached typed body value; an in-flight
-// repeat returns apierr.IdempotencyInFlight (409); a same-key/different-body
-// repeat returns apierr.IdempotencyMismatch (422).
+// Idempotency-Key value on two different endpoints within one city can't
+// collide. Every city-scoped caller passes a static endpoint path (e.g.
+// "/v0/agents"), so this scoping is intra-city only; cross-city isolation does
+// NOT come from the key. It comes from each city owning a separate *Server,
+// and therefore a separate idem cache, built per city by getCityServer via
+// New(state). A future refactor that hoisted a per-city cache to a
+// process-wide scope would silently reintroduce cross-city key collisions
+// despite this scoping. On a repeat with a completed reservation it replays
+// the cached typed body value; an in-flight repeat returns
+// apierr.IdempotencyInFlight (409); a same-key/different-body repeat returns
+// apierr.IdempotencyMismatch (422).
 //
 // It ALWAYS releases the pending reservation when create() returns an error OR
 // panics (via defer), so no caller can leak a reservation — the defect the
@@ -22,9 +28,9 @@ import "github.com/gastownhall/gascity/internal/api/apierr"
 // response envelope after withIdempotency returns, so envelope fields derived
 // from live state (e.g. the X-GC-Index event sequence) stay fresh on replay.
 //
-// idem is the owning cache: per-city handlers pass s.idem (one cache per city
-// Server, so static paths cannot collide across cities); supervisor-scope
-// handlers pass sm.idem.
+// idem is the owning cache: per-city handlers pass s.idem (the per-city cache
+// described above); supervisor-scope handlers (POST /v0/city, where no per-city
+// Server exists yet) pass sm.idem, the SupervisorMux's own process-wide cache.
 func withIdempotency[T any](idem *idempotencyCache, path, key string, body any, create func() (T, error)) (T, error) {
 	var zero T
 	if key == "" {
