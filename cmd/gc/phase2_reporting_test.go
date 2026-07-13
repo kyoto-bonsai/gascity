@@ -46,9 +46,9 @@ func startupCommandMaterializationResult(tc phase2ProviderCase, tp TemplateParam
 	case tc.wantCommandPrefix != "" && !strings.HasPrefix(tp.Command, tc.wantCommandPrefix):
 		return workertest.Fail(tc.profileID, workertest.RequirementStartupCommandMaterialization,
 			fmt.Sprintf("Command = %q, want prefix %q", tp.Command, tc.wantCommandPrefix)).WithEvidence(evidence)
-	case !containsOrderedArgs(tp.Command, tp.ResolvedProvider.ResolveDefaultArgs()):
+	case !containsOrderedArgs(tp.Command, resolvedDefaultArgsForTest(tp.ResolvedProvider)):
 		return workertest.Fail(tc.profileID, workertest.RequirementStartupCommandMaterialization,
-			fmt.Sprintf("Command = %q, want default args %v", tp.Command, tp.ResolvedProvider.ResolveDefaultArgs())).WithEvidence(evidence)
+			fmt.Sprintf("Command = %q, want default args %v", tp.Command, resolvedDefaultArgsForTest(tp.ResolvedProvider))).WithEvidence(evidence)
 	case tc.wantSettingsArg:
 		settingsPath, ok := commandFlagValue(tp.Command, "--settings")
 		if !ok {
@@ -286,11 +286,23 @@ func resumeRestartPromptResult(tc phase2ProviderCase, prepared *preparedStart, r
 	}
 }
 
+// resolvedDefaultArgsForTest unwraps ResolveDefaultArgs for fixture
+// providers whose defaults are always declared choices; a resolution error
+// here would surface as a command-materialization mismatch in the assertion
+// that consumes the args.
+func resolvedDefaultArgsForTest(provider *config.ResolvedProvider) []string {
+	if provider == nil {
+		return nil
+	}
+	args, _ := provider.ResolveDefaultArgs()
+	return args
+}
+
 func defaultArgsExceptOption(provider *config.ResolvedProvider, optionKey string) []string {
 	if provider == nil {
 		return nil
 	}
-	defaultArgs := provider.ResolveDefaultArgs()
+	defaultArgs := resolvedDefaultArgsForTest(provider)
 	defaultValue := provider.EffectiveDefaults[optionKey]
 	for _, opt := range provider.OptionsSchema {
 		if opt.Key == optionKey && defaultValue == "" {
@@ -342,7 +354,7 @@ func phase2TemplateEvidence(tc phase2ProviderCase, tp TemplateParams) map[string
 	if tp.ResolvedProvider != nil {
 		evidence["resolved_provider"] = tp.ResolvedProvider.Name
 		evidence["prompt_mode"] = tp.ResolvedProvider.PromptMode
-		evidence["default_args"] = strings.Join(tp.ResolvedProvider.ResolveDefaultArgs(), " ")
+		evidence["default_args"] = strings.Join(resolvedDefaultArgsForTest(tp.ResolvedProvider), " ")
 		evidence["supports_hooks"] = strconv.FormatBool(tp.ResolvedProvider.SupportsHooks)
 	}
 	return evidence
@@ -450,7 +462,7 @@ func phase2PreparedEvidence(tc phase2ProviderCase, prepared *preparedStart) map[
 
 	if prepared.candidate.tp.ResolvedProvider != nil {
 		evidence["resolved_provider"] = prepared.candidate.tp.ResolvedProvider.Name
-		evidence["resolved_default_args"] = strings.Join(prepared.candidate.tp.ResolvedProvider.ResolveDefaultArgs(), " ")
+		evidence["resolved_default_args"] = strings.Join(resolvedDefaultArgsForTest(prepared.candidate.tp.ResolvedProvider), " ")
 		evidence["supports_hooks"] = strconv.FormatBool(prepared.candidate.tp.ResolvedProvider.SupportsHooks)
 	}
 

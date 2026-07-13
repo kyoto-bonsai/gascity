@@ -119,7 +119,7 @@ func TestResolveProviderAgentProvider(t *testing.T) {
 	if cs != "claude" {
 		t.Errorf("CommandString() = %q, want %q", cs, "claude")
 	}
-	defaultArgs := rp.ResolveDefaultArgs()
+	defaultArgs := mustDefaultArgs(t, rp)
 	wantArgs := []string{"--dangerously-skip-permissions", "--effort", "max"}
 	if len(defaultArgs) != len(wantArgs) {
 		t.Errorf("ResolveDefaultArgs() = %v, want %v", defaultArgs, wantArgs)
@@ -146,7 +146,7 @@ func TestResolveProviderWorkspaceProvider(t *testing.T) {
 	if rp.CommandString() != "codex" {
 		t.Errorf("CommandString() = %q, want %q", rp.CommandString(), "codex")
 	}
-	defaultArgs := rp.ResolveDefaultArgs()
+	defaultArgs := mustDefaultArgs(t, rp)
 	codexWantArgs := []string{
 		"--dangerously-bypass-approvals-and-sandbox",
 		"--model", "gpt-5.5",
@@ -246,8 +246,8 @@ func TestResolveProviderWorkspaceStartCommandWithProvider(t *testing.T) {
 		t.Errorf("CommandString() = %q, want %q (Args should be nil)", rp.CommandString(), "claude --auto")
 	}
 	// Schema-managed defaults must be cleared so they aren't appended.
-	if len(rp.ResolveDefaultArgs()) != 0 {
-		t.Errorf("ResolveDefaultArgs() = %v, want nil (start_command is complete command)", rp.ResolveDefaultArgs())
+	if len(mustDefaultArgs(t, rp)) != 0 {
+		t.Errorf("ResolveDefaultArgs() = %v, want nil (start_command is complete command)", mustDefaultArgs(t, rp))
 	}
 	// Provider settings should be preserved.
 	if rp.Name != "claude" {
@@ -626,7 +626,7 @@ func TestResolveProviderKiroOptionsSchemaResolveDefaultArgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveProvider: %v", err)
 	}
-	defaultArgs := rp.ResolveDefaultArgs()
+	defaultArgs := mustDefaultArgs(t, rp)
 	wantArgs := []string{"--trust-mode", "full"}
 	if !reflect.DeepEqual(defaultArgs, wantArgs) {
 		t.Errorf("ResolveDefaultArgs() = %v, want %v", defaultArgs, wantArgs)
@@ -667,7 +667,7 @@ func TestResolveProviderKiroAgentOptionDefaultsOverride(t *testing.T) {
 	if rp.EffectiveDefaults["permission_mode"] != "default" {
 		t.Errorf("EffectiveDefaults[permission_mode] = %q, want %q (agent override)", rp.EffectiveDefaults["permission_mode"], "default")
 	}
-	defaultArgs := rp.ResolveDefaultArgs()
+	defaultArgs := mustDefaultArgs(t, rp)
 	wantArgs := []string{"--trust-mode", "default"}
 	if !reflect.DeepEqual(defaultArgs, wantArgs) {
 		t.Errorf("ResolveDefaultArgs() = %v, want %v", defaultArgs, wantArgs)
@@ -1064,7 +1064,7 @@ func TestResolveProviderBaseChainEmitsDangerousBypass(t *testing.T) {
 	if len(resolved.OptionsSchema) == 0 {
 		t.Fatal("OptionsSchema empty — built-in inheritance did not reach ResolvedProvider")
 	}
-	args := resolved.ResolveDefaultArgs()
+	args := mustDefaultArgs(t, resolved)
 	want := "--dangerously-bypass-approvals-and-sandbox"
 	found := false
 	for _, a := range args {
@@ -1109,7 +1109,7 @@ func TestResolveProviderBaseChainStripsCodexAliases(t *testing.T) {
 		t.Fatalf("EffectiveDefaults[effort] = %q, want xhigh", got)
 	}
 	command := resolved.CommandString()
-	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
+	if defaultArgs := mustDefaultArgs(t, resolved); len(defaultArgs) > 0 {
 		command = command + " " + strings.Join(defaultArgs, " ")
 	}
 	if strings.Count(command, "gpt-5.5") != 1 {
@@ -1174,7 +1174,7 @@ func TestResolveProviderChainLeafArgsOverrideInheritedCodexDefaults(t *testing.T
 		t.Fatalf("EffectiveDefaults[effort] = %q, want medium", got)
 	}
 	command := resolved.CommandString()
-	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
+	if defaultArgs := mustDefaultArgs(t, resolved); len(defaultArgs) > 0 {
 		command = command + " " + strings.Join(defaultArgs, " ")
 	}
 	if strings.Contains(command, "model_reasoning_effort=xhigh") {
@@ -1218,12 +1218,12 @@ func TestResolveProviderExplicitBaseArgsOverrideSameLayerOptionDefaults(t *testi
 	if got := resolved.EffectiveDefaults["model"]; got != "gpt-5.3-codex-spark" {
 		t.Fatalf("EffectiveDefaults[model] = %q, want args-inferred gpt-5.3-codex-spark", got)
 	}
-	defaultLine := strings.Join(resolved.ResolveDefaultArgs(), " ")
+	defaultLine := strings.Join(mustDefaultArgs(t, resolved), " ")
 	if strings.Contains(defaultLine, "gpt-5.5") {
-		t.Fatalf("ResolveDefaultArgs() = %v, preserved stale same-layer option_defaults", resolved.ResolveDefaultArgs())
+		t.Fatalf("ResolveDefaultArgs() = %v, preserved stale same-layer option_defaults", mustDefaultArgs(t, resolved))
 	}
 	if !strings.Contains(defaultLine, "gpt-5.3-codex-spark") {
-		t.Fatalf("ResolveDefaultArgs() = %v, missing args-inferred model", resolved.ResolveDefaultArgs())
+		t.Fatalf("ResolveDefaultArgs() = %v, missing args-inferred model", mustDefaultArgs(t, resolved))
 	}
 }
 
@@ -1253,8 +1253,8 @@ func TestResolveProviderChainChildOptionDefaultsBeatInheritedArgs(t *testing.T) 
 	if got := resolved.EffectiveDefaults["model"]; got != "gpt-5.3-codex-spark" {
 		t.Fatalf("EffectiveDefaults[model] = %q, want child option default gpt-5.3-codex-spark", got)
 	}
-	if strings.Contains(strings.Join(resolved.ResolveDefaultArgs(), " "), "gpt-5.5") {
-		t.Fatalf("ResolveDefaultArgs() = %v, inherited parent arg overrode child option_defaults", resolved.ResolveDefaultArgs())
+	if strings.Contains(strings.Join(mustDefaultArgs(t, &resolved), " "), "gpt-5.5") {
+		t.Fatalf("ResolveDefaultArgs() = %v, inherited parent arg overrode child option_defaults", mustDefaultArgs(t, &resolved))
 	}
 }
 
@@ -1287,9 +1287,9 @@ func TestResolveProviderChainArgsAppendInfersSchemaDefaults(t *testing.T) {
 	if got := resolved.EffectiveDefaults["model"]; got != "gpt-5.3-codex-spark" {
 		t.Fatalf("EffectiveDefaults[model] = %q, want gpt-5.3-codex-spark", got)
 	}
-	defaultLine := strings.Join(resolved.ResolveDefaultArgs(), " ")
+	defaultLine := strings.Join(mustDefaultArgs(t, &resolved), " ")
 	if !strings.Contains(defaultLine, "--model gpt-5.3-codex-spark") {
-		t.Fatalf("ResolveDefaultArgs() = %v, missing args_append-inferred model", resolved.ResolveDefaultArgs())
+		t.Fatalf("ResolveDefaultArgs() = %v, missing args_append-inferred model", mustDefaultArgs(t, &resolved))
 	}
 	optKeys := resolved.Provenance.MapKeyLayer["option_defaults"]
 	if optKeys == nil {
@@ -1362,7 +1362,7 @@ func TestResolveProviderChainCodexSuggestArgsReplaceInheritedUnrestricted(t *tes
 	if got := resolved.EffectiveDefaults["permission_mode"]; got != "suggest" {
 		t.Fatalf("EffectiveDefaults[permission_mode] = %q, want suggest", got)
 	}
-	defaultArgs := resolved.ResolveDefaultArgs()
+	defaultArgs := mustDefaultArgs(t, &resolved)
 	defaultLine := strings.Join(defaultArgs, " ")
 	if strings.Contains(defaultLine, "--dangerously-bypass-approvals-and-sandbox") {
 		t.Fatalf("ResolveDefaultArgs() = %v, preserved inherited unrestricted flag", defaultArgs)
@@ -1408,9 +1408,9 @@ func TestResolveProviderAgentOptionDefaultsUpdateWrappedResumeDefaults(t *testin
 	if strings.Contains(resumeCommand, "model_reasoning_effort=medium") {
 		t.Fatalf("resolved resume command = %q, retained provider effort default after agent override", resumeCommand)
 	}
-	defaultArgs := strings.Join(resolved.ResolveDefaultArgs(), " ")
+	defaultArgs := strings.Join(mustDefaultArgs(t, resolved), " ")
 	if !strings.Contains(defaultArgs, "model_reasoning_effort=high") {
-		t.Fatalf("ResolveDefaultArgs() = %v, missing agent effort default", resolved.ResolveDefaultArgs())
+		t.Fatalf("ResolveDefaultArgs() = %v, missing agent effort default", mustDefaultArgs(t, resolved))
 	}
 }
 

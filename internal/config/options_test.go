@@ -617,7 +617,10 @@ func TestResolveDefaultArgs_ClaudeSchema(t *testing.T) {
 		EffectiveDefaults: ComputeEffectiveDefaults(claude.OptionsSchema, claude.OptionDefaults, nil),
 	}
 
-	args := rp.ResolveDefaultArgs()
+	args, err := rp.ResolveDefaultArgs()
+	if err != nil {
+		t.Fatalf("ResolveDefaultArgs() error = %v", err)
+	}
 
 	// Claude effective defaults: permission_mode=unrestricted, effort=max (from OptionDefaults).
 	// Should produce --dangerously-skip-permissions --effort max.
@@ -643,7 +646,10 @@ func TestResolveDefaultArgs_EmptyDefaults(t *testing.T) {
 		EffectiveDefaults: map[string]string{},
 	}
 
-	args := rp.ResolveDefaultArgs()
+	args, err := rp.ResolveDefaultArgs()
+	if err != nil {
+		t.Fatalf("ResolveDefaultArgs() error = %v", err)
+	}
 	if len(args) != 0 {
 		t.Errorf("empty defaults should produce no args, got %v", args)
 	}
@@ -1224,7 +1230,7 @@ func TestValidateOptionDefaults_InvalidValue(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid value")
 	}
-	if !strings.Contains(err.Error(), "not a valid choice") {
+	if !strings.Contains(err.Error(), "not a declared choice") {
 		t.Errorf("unexpected error: %v", err)
 	}
 }

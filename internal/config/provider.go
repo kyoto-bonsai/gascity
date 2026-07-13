@@ -362,21 +362,27 @@ func (rp *ResolvedProvider) TitleModelFlagArgs() []string {
 // ResolveDefaultArgs produces CLI flag args from EffectiveDefaults.
 // For each schema option with an effective default, the corresponding
 // FlagArgs are emitted. Options with no effective default (or whose
-// default is "") are skipped.
-// Args are emitted in schema declaration order for deterministic output.
-func (rp *ResolvedProvider) ResolveDefaultArgs() []string {
+// default is "") are skipped. Undeclared values pass through verbatim when
+// the option's flag shape allows it; a value that resolves to no args is a
+// hard error — this is the managed-agent launch path, and silently dropping
+// a configured pin downgraded seats to the fleet default with zero warning
+// (ga-b0flc8). Args are emitted in schema declaration order for
+// deterministic output.
+func (rp *ResolvedProvider) ResolveDefaultArgs() ([]string, error) {
 	var args []string
-	for _, opt := range rp.OptionsSchema {
+	for i := range rp.OptionsSchema {
+		opt := &rp.OptionsSchema[i]
 		value := rp.EffectiveDefaults[opt.Key]
 		if value == "" {
 			continue
 		}
-		choice := findChoice(opt.Choices, value)
-		if choice != nil {
-			args = append(args, choice.FlagArgs...)
+		choiceArgs, err := resolveChoiceFlagArgs(opt, value)
+		if err != nil {
+			return nil, err
 		}
+		args = append(args, choiceArgs...)
 	}
-	return args
+	return args, nil
 }
 
 // pathCheckBinary returns the binary name to use for PATH detection.

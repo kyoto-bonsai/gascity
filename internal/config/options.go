@@ -7,28 +7,34 @@ import (
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
-// ValidateOptionsSchema checks that every option default resolves to a declared choice.
-// Call at config load time to catch misconfigured providers early.
+// ValidateOptionsSchema checks that every option default resolves to launch
+// args — either a declared choice or a verbatim pass-through value (see
+// resolveChoiceFlagArgs). Call at config load time to catch misconfigured
+// providers early.
 func ValidateOptionsSchema(schema []ProviderOption) error {
-	for _, opt := range schema {
-		if opt.Default != "" && findChoice(opt.Choices, opt.Default) == nil {
+	for i := range schema {
+		opt := &schema[i]
+		if opt.Default == "" {
+			continue
+		}
+		if _, err := resolveChoiceFlagArgs(opt, opt.Default); err != nil {
 			return fmt.Errorf("option %q: default %q is not a valid choice", opt.Key, opt.Default)
 		}
 	}
 	return nil
 }
 
-// ValidateOptionDefaults checks that every value in the defaults map resolves to a
-// declared choice in the schema. Call at config load time to catch typos in
-// option_defaults early.
+// ValidateOptionDefaults checks that every value in the defaults map resolves
+// to launch args — a declared choice or a verbatim pass-through value. Call at
+// config load time to catch typos in option_defaults early.
 func ValidateOptionDefaults(schema []ProviderOption, defaults map[string]string) error {
 	for key, value := range defaults {
 		opt := findOption(schema, key)
 		if opt == nil {
 			return fmt.Errorf("option_defaults key %q is not in the options schema", key)
 		}
-		if findChoice(opt.Choices, value) == nil {
-			return fmt.Errorf("option_defaults key %q: value %q is not a valid choice", key, value)
+		if _, err := resolveChoiceFlagArgs(opt, value); err != nil {
+			return fmt.Errorf("option_defaults key %q: %w", key, err)
 		}
 	}
 	return nil
@@ -72,22 +78,28 @@ func ComputeEffectiveDefaults(schema []ProviderOption, providerDefaults, agentDe
 func ResolveOptions(schema []ProviderOption, options map[string]string, effectiveDefaults map[string]string) (extraArgs []string, metadata map[string]string, err error) {
 	metadata = make(map[string]string)
 
-	// Validate user-specified option keys and values up front.
+	// Validate user-specified option keys and values up front. Undeclared
+	// values that qualify for verbatim pass-through are accepted (see
+	// resolveChoiceFlagArgs).
 	for key, value := range options {
 		opt := findOption(schema, key)
 		if opt == nil {
 			return nil, nil, fmt.Errorf("%w: %s", ErrUnknownOption, key)
 		}
-		if findChoice(opt.Choices, value) == nil {
-			return nil, nil, fmt.Errorf("invalid value for %s: %s", key, value)
+		if _, err := resolveChoiceFlagArgs(opt, value); err != nil {
+			return nil, nil, err
 		}
 	}
 
 	// Iterate in schema declaration order for deterministic arg ordering.
-	for _, opt := range schema {
+	for i := range schema {
+		opt := &schema[i]
 		if value, ok := options[opt.Key]; ok {
-			choice := findChoice(opt.Choices, value)
-			extraArgs = append(extraArgs, choice.FlagArgs...)
+			args, err := resolveChoiceFlagArgs(opt, value)
+			if err != nil {
+				return nil, nil, err
+			}
+			extraArgs = append(extraArgs, args...)
 			metadata["opt_"+opt.Key] = value
 		} else {
 			// Use effective default, falling back to schema default.
@@ -96,10 +108,14 @@ func ResolveOptions(schema []ProviderOption, options map[string]string, effectiv
 				defValue = opt.Default
 			}
 			if defValue != "" {
-				choice := findChoice(opt.Choices, defValue)
-				if choice != nil {
-					extraArgs = append(extraArgs, choice.FlagArgs...)
+				// A default that resolves to no args is a hard error, not a
+				// skip: silently dropping a configured pin downgraded seats
+				// to the fleet default with zero warning (ga-b0flc8).
+				args, err := resolveChoiceFlagArgs(opt, defValue)
+				if err != nil {
+					return nil, nil, err
 				}
+				extraArgs = append(extraArgs, args...)
 			}
 			// Defaults are NOT written to metadata -- only explicit choices are persisted.
 		}
@@ -120,25 +136,30 @@ func ResolveExplicitOptions(schema []ProviderOption, overrides map[string]string
 		return nil, nil
 	}
 
-	// Validate override keys and values up front.
+	// Validate override keys and values up front. Undeclared values that
+	// qualify for verbatim pass-through are accepted (see resolveChoiceFlagArgs).
 	for key, value := range overrides {
 		opt := findOption(schema, key)
 		if opt == nil {
 			return nil, fmt.Errorf("%w: %s", ErrUnknownOption, key)
 		}
-		if findChoice(opt.Choices, value) == nil {
-			return nil, fmt.Errorf("invalid value for %s: %s", key, value)
+		if _, err := resolveChoiceFlagArgs(opt, value); err != nil {
+			return nil, err
 		}
 	}
 
 	// Iterate in schema declaration order for deterministic arg ordering.
-	for _, opt := range schema {
+	for i := range schema {
+		opt := &schema[i]
 		value, ok := overrides[opt.Key]
 		if !ok {
 			continue
 		}
-		choice := findChoice(opt.Choices, value)
-		extraArgs = append(extraArgs, choice.FlagArgs...)
+		args, err := resolveChoiceFlagArgs(opt, value)
+		if err != nil {
+			return nil, err
+		}
+		extraArgs = append(extraArgs, args...)
 	}
 
 	return extraArgs, nil
@@ -192,8 +213,9 @@ func subcommandResumeInsertIndex(tokens []string, resumeFlag string) int {
 func missingDefaultArgsForCommand(command string, schema []ProviderOption, effectiveDefaults map[string]string) []string {
 	tokens := shellquote.Split(command)
 	var missing []string
-	for _, opt := range schema {
-		if commandContainsOption(tokens, opt) {
+	for i := range schema {
+		opt := &schema[i]
+		if commandContainsOption(tokens, *opt) {
 			continue
 		}
 		value := effectiveDefaults[opt.Key]
@@ -203,11 +225,15 @@ func missingDefaultArgsForCommand(command string, schema []ProviderOption, effec
 		if value == "" {
 			continue
 		}
-		choice := findChoice(opt.Choices, value)
-		if choice == nil || len(choice.FlagArgs) == 0 {
+		// Best-effort completion: resume-command templating runs inside
+		// provider resolution, which has no error path. A value that cannot
+		// resolve here (neither declared nor pass-through-eligible) is
+		// skipped; the launch-side resolvers reject it loudly instead.
+		args, err := resolveChoiceFlagArgs(opt, value)
+		if err != nil || len(args) == 0 {
 			continue
 		}
-		missing = append(missing, choice.FlagArgs...)
+		missing = append(missing, args...)
 	}
 	return missing
 }
@@ -666,4 +692,73 @@ func findChoice(choices []OptionChoice, value string) *OptionChoice {
 		}
 	}
 	return nil
+}
+
+// uniformChoiceFlagWord returns the shared leading flag token when every
+// declared choice that emits args has the exact two-token shape
+// [flag, value] with one common flag word (e.g. every model choice is
+// ["--model", <id>]). Choices with no FlagArgs (the "Default" entries with
+// Value "") do not count against uniformity. It returns "" when shapes
+// differ, any emitting choice has a different arity, or no choice emits.
+func uniformChoiceFlagWord(choices []OptionChoice) string {
+	flag := ""
+	for i := range choices {
+		args := choices[i].FlagArgs
+		if len(args) == 0 {
+			continue
+		}
+		if len(args) != 2 || !strings.HasPrefix(args[0], "-") || strings.HasPrefix(args[1], "-") {
+			return ""
+		}
+		switch flag {
+		case "":
+			flag = args[0]
+		case args[0]:
+		default:
+			return ""
+		}
+	}
+	return flag
+}
+
+// passthroughValueOK restricts verbatim pass-through to plain value tokens:
+// alphanumeric start, then alphanumerics plus . _ : @ / -. This admits every
+// real model id shape (fable, claude-fable-5, gpt-5.6-sol, opencode/big-pickle)
+// while rejecting anything that could smuggle extra argv tokens or flags.
+func passthroughValueOK(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, r := range value {
+		alnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if i == 0 {
+			if !alnum {
+				return false
+			}
+			continue
+		}
+		if !alnum && r != '.' && r != '_' && r != ':' && r != '@' && r != '/' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveChoiceFlagArgs maps an option value to the CLI args it should emit.
+// A declared choice emits its FlagArgs. An undeclared value passes through
+// verbatim as [flag, value] when the option has a uniform two-token flag
+// shape and the value is a plain token — so a model pin newer than the
+// built-in choice table (e.g. "fable") still reaches the provider instead of
+// being dropped. Anything else is a hard error: the launch resolver must
+// never silently discard a configured option value (ga-b0flc8 — a silent
+// model-pin drop downgraded frontier seats to the fleet default with zero
+// warning; ga-1qirw5 is the same class).
+func resolveChoiceFlagArgs(opt *ProviderOption, value string) ([]string, error) {
+	if choice := findChoice(opt.Choices, value); choice != nil {
+		return choice.FlagArgs, nil
+	}
+	if flag := uniformChoiceFlagWord(opt.Choices); flag != "" && passthroughValueOK(value) {
+		return []string{flag, value}, nil
+	}
+	return nil, fmt.Errorf("invalid value for %s: %q is not a declared choice and the option's flag shape does not support verbatim pass-through", opt.Key, value)
 }

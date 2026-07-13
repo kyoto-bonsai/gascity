@@ -220,7 +220,10 @@ func TestBuildPreparedStartInitialMessageOnlyMatchesDriftHash(t *testing.T) {
 	store := beads.NewMemStore()
 	candidate := newOptionSessionCandidate(t, store, nil, map[string]string{"initial_message": "hello"})
 	resolved := claudeEffortResolvedProvider()
-	defaultArgs := resolved.ResolveDefaultArgs()
+	defaultArgs, err := resolved.ResolveDefaultArgs()
+	if err != nil {
+		t.Fatalf("ResolveDefaultArgs() error = %v", err)
+	}
 	if len(defaultArgs) == 0 {
 		t.Fatal("claude provider default args are empty")
 	}
