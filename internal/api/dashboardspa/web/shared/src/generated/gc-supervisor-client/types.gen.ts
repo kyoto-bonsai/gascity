@@ -2692,6 +2692,141 @@ export type RotatedPayload = {
     prior_last_seq: number;
 };
 
+export type Run = {
+    /**
+     * Formula name driving the run, when known.
+     */
+    formula?: string;
+    /**
+     * Structured failure reason for a terminal run.
+     */
+    last_error?: RunLastError;
+    /**
+     * Stable run identifier (the run root bead id).
+     */
+    run_id: string;
+    /**
+     * Resolved run scope.
+     */
+    scope: RunScope;
+    /**
+     * RFC3339 run start time (root creation).
+     */
+    started_at?: string;
+    /**
+     * Closed lifecycle status.
+     */
+    status: RunStatus;
+    /**
+     * Where the run is routed (rig/target), when known.
+     */
+    target?: string;
+    /**
+     * Human-readable run title.
+     */
+    title: string;
+    /**
+     * RFC3339 time of the run's most recent activity.
+     */
+    updated_at?: string;
+};
+
+export type RunLastError = {
+    /**
+     * Machine-readable outcome code (e.g. fail, skipped, canceled).
+     */
+    code: string;
+    /**
+     * Human-readable failure detail, when available.
+     */
+    message?: string;
+};
+
+export type RunRef = {
+    /**
+     * Launch mechanism that produced the run.
+     */
+    kind: 'sling' | 'order';
+    /**
+     * Run identifier; GET /v0/city/{cityName}/runs/{run_id} for detail.
+     */
+    run_id: string;
+    /**
+     * Closed lifecycle status at response time (a just-launched run is pending).
+     */
+    status: RunStatus;
+};
+
+export type RunScope = {
+    /**
+     * Scope kind (city or rig), when resolved.
+     */
+    kind?: string;
+    /**
+     * Scope reference within the kind, when resolved.
+     */
+    ref?: string;
+};
+
+/**
+ * Closed lifecycle state of a run.
+ */
+export type RunStatus = 'pending' | 'active' | 'waiting' | 'canceling' | 'completed' | 'failed' | 'canceled' | 'skipped';
+
+export type RunStep = {
+    /**
+     * Current assignee, when set.
+     */
+    assignee?: string;
+    /**
+     * Step (child bead) identifier.
+     */
+    id: string;
+    /**
+     * Step kind (bead type).
+     */
+    kind?: string;
+    /**
+     * Closed step lifecycle status.
+     */
+    status: RunStepStatus;
+    /**
+     * Step title.
+     */
+    title: string;
+};
+
+/**
+ * Closed lifecycle state of a run step.
+ */
+export type RunStepStatus = 'pending' | 'active' | 'blocked' | 'completed' | 'failed' | 'skipped';
+
+export type RunStepsOutputBody = {
+    /**
+     * Run identifier the steps belong to.
+     */
+    run_id: string;
+    /**
+     * Steps of the run.
+     */
+    steps: Array<RunStep> | null;
+};
+
+export type RunsListOutputBody = {
+    /**
+     * True when some runs could not be fully projected.
+     */
+    partial?: boolean;
+    /**
+     * Reasons the projection was partial.
+     */
+    partial_errors?: Array<string> | null;
+    /**
+     * Runs in the city, newest activity first.
+     */
+    runs: Array<Run> | null;
+};
+
 export type ScopeGroup = {
     [key: string]: never;
 };
@@ -3152,6 +3287,10 @@ export type SlingResponse = {
     formula?: string;
     mode?: string;
     root_bead_id?: string;
+    /**
+     * Reference to the launched run resource, present only when a graph workflow was launched (the same run the Location header addresses).
+     */
+    run?: RunRef;
     status: string;
     target: string;
     warnings?: Array<string> | null;
@@ -6606,6 +6745,88 @@ export type UnboundEventPayload = {
     session_id: string;
 };
 
+export type WaitListBody = {
+    /**
+     * True when the lookup hit the per-scope cap and the list is partial.
+     */
+    capped: boolean;
+    /**
+     * True when a backing store returned a partial result and the list may be incomplete.
+     */
+    partial?: boolean;
+    /**
+     * Human-readable errors from the degraded wait lookup when partial is true.
+     */
+    partial_errors?: Array<string> | null;
+    /**
+     * Durable session waits, newest first.
+     */
+    waits: Array<WaitView> | null;
+};
+
+export type WaitView = {
+    /**
+     * Bead creation time (RFC3339, UTC).
+     */
+    created_at?: string;
+    /**
+     * Current delivery attempt counter.
+     */
+    delivery_attempt?: string;
+    /**
+     * Dependency bead IDs the wait watches.
+     */
+    dep_ids?: Array<string> | null;
+    /**
+     * all or any.
+     */
+    dep_mode?: string;
+    /**
+     * Raw RFC3339 expiry string, kept verbatim.
+     */
+    expires_at?: string;
+    /**
+     * Wait bead ID.
+     */
+    id: string;
+    /**
+     * Wait kind, e.g. deps.
+     */
+    kind: string;
+    /**
+     * Bead labels.
+     */
+    labels?: Array<string> | null;
+    /**
+     * Reminder text delivered when the wait is satisfied.
+     */
+    note?: string;
+    /**
+     * Shadow wait-nudge ID once dispatched.
+     */
+    nudge_id?: string;
+    /**
+     * Session continuation epoch at registration.
+     */
+    registered_epoch?: string;
+    /**
+     * Session bead ID the wait is registered against.
+     */
+    session_id: string;
+    /**
+     * Runtime session name recorded at registration.
+     */
+    session_name?: string;
+    /**
+     * Wait lifecycle state (pending/ready/closed/...).
+     */
+    state: string;
+    /**
+     * Persisted bead status (open/closed).
+     */
+    status: string;
+};
+
 export type WebhookReceivedPayload = {
     /**
      * Raw request body size in bytes (never the body itself).
@@ -7854,6 +8075,10 @@ export type CreateAgentData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -9175,6 +9400,10 @@ export type CreateConvoyData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -9203,6 +9432,10 @@ export type CreateConvoyErrors = {
      * Not Found
      */
     404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
     /**
      * Unprocessable Entity
      */
@@ -12182,6 +12415,10 @@ export type AddPackData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -13341,6 +13578,10 @@ export type CreateProviderData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -13788,6 +14029,10 @@ export type CreateRigData = {
          * Anti-CSRF header required on mutation requests. Any non-empty value is accepted; the header's presence is what the server checks.
          */
         'X-GC-Request': string;
+        /**
+         * Idempotency key for safe retries.
+         */
+        'Idempotency-Key'?: string;
     };
     path: {
         /**
@@ -13844,6 +14089,141 @@ export type CreateRigResponses = {
 };
 
 export type CreateRigResponse = CreateRigResponses[keyof CreateRigResponses];
+
+export type GetV0CityByCityNameRunsData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: {
+        /**
+         * Maximum runs to return (0 uses the server default).
+         */
+        limit?: number;
+    };
+    url: '/v0/city/{cityName}/runs';
+};
+
+export type GetV0CityByCityNameRunsErrors = {
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameRunsError = GetV0CityByCityNameRunsErrors[keyof GetV0CityByCityNameRunsErrors];
+
+export type GetV0CityByCityNameRunsResponses = {
+    /**
+     * OK
+     */
+    200: RunsListOutputBody;
+};
+
+export type GetV0CityByCityNameRunsResponse = GetV0CityByCityNameRunsResponses[keyof GetV0CityByCityNameRunsResponses];
+
+export type GetV0CityByCityNameRunsByRunIdData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Run identifier.
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/runs/{run_id}';
+};
+
+export type GetV0CityByCityNameRunsByRunIdErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameRunsByRunIdError = GetV0CityByCityNameRunsByRunIdErrors[keyof GetV0CityByCityNameRunsByRunIdErrors];
+
+export type GetV0CityByCityNameRunsByRunIdResponses = {
+    /**
+     * OK
+     */
+    200: Run;
+};
+
+export type GetV0CityByCityNameRunsByRunIdResponse = GetV0CityByCityNameRunsByRunIdResponses[keyof GetV0CityByCityNameRunsByRunIdResponses];
+
+export type GetV0CityByCityNameRunsByRunIdStepsData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Run identifier.
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/runs/{run_id}/steps';
+};
+
+export type GetV0CityByCityNameRunsByRunIdStepsErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameRunsByRunIdStepsError = GetV0CityByCityNameRunsByRunIdStepsErrors[keyof GetV0CityByCityNameRunsByRunIdStepsErrors];
+
+export type GetV0CityByCityNameRunsByRunIdStepsResponses = {
+    /**
+     * OK
+     */
+    200: RunStepsOutputBody;
+};
+
+export type GetV0CityByCityNameRunsByRunIdStepsResponse = GetV0CityByCityNameRunsByRunIdStepsResponses[keyof GetV0CityByCityNameRunsByRunIdStepsResponses];
 
 export type GetV0CityByCityNameServiceByNameData = {
     body?: never;
@@ -15374,6 +15754,103 @@ export type PostV0CityByCityNameUnregisterResponses = {
 };
 
 export type PostV0CityByCityNameUnregisterResponse = PostV0CityByCityNameUnregisterResponses[keyof PostV0CityByCityNameUnregisterResponses];
+
+export type GetV0CityByCityNameWaitByIdData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Wait bead ID.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/wait/{id}';
+};
+
+export type GetV0CityByCityNameWaitByIdErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameWaitByIdError = GetV0CityByCityNameWaitByIdErrors[keyof GetV0CityByCityNameWaitByIdErrors];
+
+export type GetV0CityByCityNameWaitByIdResponses = {
+    /**
+     * OK
+     */
+    200: WaitView;
+};
+
+export type GetV0CityByCityNameWaitByIdResponse = GetV0CityByCityNameWaitByIdResponses[keyof GetV0CityByCityNameWaitByIdResponses];
+
+export type GetV0CityByCityNameWaitsData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: {
+        /**
+         * Filter by wait state.
+         */
+        state?: string;
+        /**
+         * Filter by session ID.
+         */
+        session?: string;
+    };
+    url: '/v0/city/{cityName}/waits';
+};
+
+export type GetV0CityByCityNameWaitsErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameWaitsError = GetV0CityByCityNameWaitsErrors[keyof GetV0CityByCityNameWaitsErrors];
+
+export type GetV0CityByCityNameWaitsResponses = {
+    /**
+     * OK
+     */
+    200: WaitListBody;
+};
+
+export type GetV0CityByCityNameWaitsResponse = GetV0CityByCityNameWaitsResponses[keyof GetV0CityByCityNameWaitsResponses];
 
 export type DeleteV0CityByCityNameWorkflowByWorkflowIdData = {
     body?: never;
