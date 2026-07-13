@@ -192,8 +192,15 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		command = appendKimiHookConfigArg(command)
 	}
 	// Append schema-derived default args (e.g., --dangerously-skip-permissions
-	// from EffectiveDefaults["permission_mode"] = "unrestricted").
-	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
+	// from EffectiveDefaults["permission_mode"] = "unrestricted"). A default
+	// that cannot resolve to args fails the spawn here rather than launching
+	// the seat without the configured flag (ga-b0flc8: a silently dropped
+	// model pin fell back to the fleet default with zero warning).
+	defaultArgs, err := resolved.ResolveDefaultArgs()
+	if err != nil {
+		return TemplateParams{}, fmt.Errorf("agent %q: resolving option defaults: %w", qualifiedName, err)
+	}
+	if len(defaultArgs) > 0 {
 		command = command + " " + shellquote.Join(defaultArgs)
 	}
 	sa, err := ensureClaudeSettingsArgs(p.fs, p.cityPath, providerFamily, p.stderr)
