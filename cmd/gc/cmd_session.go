@@ -1534,7 +1534,16 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 		command := resolved.CommandString()
 		resumeCommand := resolved.ResumeCommand
 		appendDefaultArgs := func() {
-			if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
+			// Attach is best-effort: a default that cannot resolve must not
+			// lock the operator out of an existing session, but it is never
+			// dropped silently (ga-b0flc8) — the strict guard is the
+			// reconciler/create path.
+			defaultArgs, err := resolved.ResolveDefaultArgs()
+			if err != nil {
+				fmt.Fprintf(stderr, "warning: session %s: option default not applied to resume command: %v\n", info.ID, err)
+				return
+			}
+			if len(defaultArgs) > 0 {
 				command = command + " " + shellquote.Join(defaultArgs)
 			}
 		}
