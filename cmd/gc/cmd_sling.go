@@ -72,6 +72,7 @@ func newSlingCmd(stdout, stderr io.Writer) *cobra.Command {
 	var scopeKind string
 	var scopeRef string
 	var jsonOutput bool
+	var forceDegraded bool
 	cmd := &cobra.Command{
 		Use:   "sling [target] <bead-or-formula-or-text>",
 		Short: "Route work to a session config or agent",
@@ -132,13 +133,14 @@ Examples:
 			}
 			code := 0
 			if jsonOutput {
-				code = cmdSlingWithJSON(args, formula, nudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, true, stdout, stderr)
+				code = cmdSlingWithJSON(args, formula, nudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, true, stdout, stderr, forceDegraded)
 			} else {
-				code = cmdSling(args, formula, nudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, stdout, stderr)
+				code = cmdSling(args, formula, nudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, stdout, stderr, forceDegraded)
 			}
 			return exitForCode(code)
 		},
 	}
+	cmd.Flags().BoolVar(&forceDegraded, "force-degraded", false, "bypass the spawn preflight gate (stale supervisor binary / aged pending-creates) — use only when you understand the risk")
 	cmd.Flags().BoolVarP(&formula, "formula", "f", false, "treat argument as formula name")
 	cmd.Flags().BoolVar(&nudge, "nudge", false, "nudge target after routing")
 	cmd.Flags().BoolVar(&force, "force", false, "suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store")
@@ -199,11 +201,18 @@ func shellSlingRunner(dir, command string, env map[string]string) (string, error
 }
 
 // cmdSling is the CLI entry point for gc sling.
-func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars []string, merge string, noConvoy, owned, reassign bool, onFormula string, noFormula, fromStdin, dryRun bool, scopeKind, scopeRef string, stdout, stderr io.Writer) int {
-	return cmdSlingWithJSON(args, isFormula, doNudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, false, stdout, stderr)
+//
+// forceDegraded is variadic (rather than a plain bool) so the many existing
+// cmdSling/cmdSlingWithJSON call sites — production and the ~27 in
+// cmd_sling_test.go — keep compiling unchanged after the ga-6l32x0 spawn
+// preflight gate was added; omitting it means false, matching their pre-gate
+// behavior exactly. See cmdSessionNew for the same pattern on session new.
+func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars []string, merge string, noConvoy, owned, reassign bool, onFormula string, noFormula, fromStdin, dryRun bool, scopeKind, scopeRef string, stdout, stderr io.Writer, forceDegraded ...bool) int {
+	return cmdSlingWithJSON(args, isFormula, doNudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, false, stdout, stderr, forceDegraded...)
 }
 
-func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title string, vars []string, merge string, noConvoy, owned, reassign bool, onFormula string, noFormula, fromStdin, dryRun bool, scopeKind, scopeRef string, jsonOutput bool, stdout, stderr io.Writer) int {
+func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title string, vars []string, merge string, noConvoy, owned, reassign bool, onFormula string, noFormula, fromStdin, dryRun bool, scopeKind, scopeRef string, jsonOutput bool, stdout, stderr io.Writer, forceDegraded ...bool) int {
+	fd := len(forceDegraded) > 0 && forceDegraded[0]
 	humanStdout := stdout
 	if jsonOutput {
 		humanStdout = io.Discard
@@ -332,6 +341,14 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 			return fail("store_open_failed", fmt.Sprintf("gc sling: %v", err))
 		}
 	}
+	// P2 fail-closed spawn preflight (ga-6l32x0): refuse before dispatching a
+	// create if the supervisor is on a stale binary or the pending-create
+	// queue already has entries past their lease — the exact wrong-sequencing
+	// this gate exists to make impossible to hit silently (ga-ptm6dm).
+	if res := checkSpawnPreflightGate(store, fd); res.Blocked {
+		return fail("spawn_preflight_refused", spawnPreflightRefusalMessage("gc sling", res))
+	}
+
 	storeRef := workflowStoreRefForDir(storeDir, cityPath, cityName, cfg)
 	storeEnv, err := slingStoreEnvWithError(cfg, cityPath, storeDir)
 	if err != nil {
