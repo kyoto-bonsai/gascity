@@ -2583,6 +2583,7 @@ func executePlannedStartsTraced(
 		if wakeCount >= maxWakes {
 			for _, candidate := range waveCandidates {
 				logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "deferred_by_wake_budget", time.Time{}, time.Time{}, nil)
+				refreshPendingCreateLeaseOnDeferral(sessFront, candidate.info, clk, stderr)
 			}
 			continue
 		}
@@ -2607,6 +2608,7 @@ func executePlannedStartsTraced(
 			if wakeCount >= maxWakes {
 				for _, candidate := range ready[offset:] {
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "deferred_by_wake_budget", time.Time{}, time.Time{}, nil)
+					refreshPendingCreateLeaseOnDeferral(sessFront, candidate.info, clk, stderr)
 				}
 				break
 			}
@@ -3381,4 +3383,43 @@ func stopSessionsBounded(
 	stdout, stderr io.Writer,
 ) int {
 	return stopTargetsBounded(stopTargetsForNames(names, cfg, store, stderr), cfg, store, sp, rec, actor, stdout, stderr)
+}
+
+// refreshPendingCreateLeaseOnDeferral re-anchors the never-started
+// pending-create lease when a wake-budget deferral leaves the create parked
+// (ga-ptm6dm). Deferral is lifecycle activity, so it must count against the
+// lease: without this, a create deferred across ticks for longer than
+// pendingCreateNeverStartedTimeout is silently rolled back by the reconciler
+// even though it is still queued behind the budget (19 rollbacks on
+// 2026-07-13; explicit `gc session new` creates have no re-driver and are
+// permanently lost). Throttled to half the lease window so a busy tick adds
+// at most one metadata write per deferred create per half-lease — unthrottled,
+// per-tick writes on every deferred candidate would blow the tick budget the
+// same way rollback storms do (bd write ≈2s).
+func refreshPendingCreateLeaseOnDeferral(sessFront *sessionpkg.Store, info sessionpkg.Info, clk clock.Clock, stderr io.Writer) {
+	if sessFront == nil || !info.PendingCreateClaim {
+		return
+	}
+	if strings.TrimSpace(info.LastWokeAt) != "" {
+		// A start was already attempted; the attempt-stale lease governs, and
+		// re-anchoring the never-started lease would be dead metadata.
+		return
+	}
+	now := time.Now()
+	if clk != nil {
+		now = clk.Now()
+	}
+	anchor := info.CreatedAt
+	if started, ok := parseRFC3339Metadata(info.PendingCreateStartedAt); ok {
+		anchor = started
+	}
+	if !anchor.IsZero() && now.Sub(anchor) < pendingCreateNeverStartedTimeout/2 {
+		return
+	}
+	patch := sessionpkg.MetadataPatch{"pending_create_started_at": pendingCreateStartedAtNow(now)}
+	if err := sessFront.ApplyPatch(info.ID, patch); err != nil {
+		fmt.Fprintf(stderr, "session lifecycle: WARN could not refresh pending-create lease for %s after wake-budget deferral: %v\n", info.ID, err) //nolint:errcheck
+		return
+	}
+	fmt.Fprintf(stderr, "session lifecycle: refreshed pending-create lease for %s (deferred_by_wake_budget)\n", info.ID) //nolint:errcheck
 }
