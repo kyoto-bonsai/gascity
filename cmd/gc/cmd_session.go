@@ -114,6 +114,7 @@ func newSessionNewCmd(stdout, stderr io.Writer) *cobra.Command {
 	var noAttach bool
 	var jsonOutput bool
 	var waitTimeout time.Duration
+	var forceDegraded bool
 	cmd := &cobra.Command{
 		Use:   "new <template>",
 		Short: "Create a new chat session from an agent template",
@@ -134,7 +135,7 @@ session_name. --alias still sets the public command and mail alias.`,
   gc session new helper --no-attach`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdSessionNew(args, alias, title, titleHint, noAttach, jsonOutput, waitTimeout, stdout, stderr) != 0 {
+			if cmdSessionNew(args, alias, title, titleHint, noAttach, jsonOutput, waitTimeout, stdout, stderr, forceDegraded) != 0 {
 				return errExit
 			}
 			return nil
@@ -146,6 +147,7 @@ session_name. --alias still sets the public command and mail alias.`,
 	cmd.Flags().BoolVar(&noAttach, "no-attach", false, "create session without attaching")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
 	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", defaultSessionNewWaitTimeout, "max time to wait for the reconciler to start the session before attaching")
+	cmd.Flags().BoolVar(&forceDegraded, "force-degraded", false, "bypass the spawn preflight gate (stale supervisor binary / aged pending-creates) — use only when you understand the risk")
 	return cmd
 }
 
@@ -161,10 +163,15 @@ const defaultSessionNewWaitTimeout = 120 * time.Second
 // Phase 2: creates a session bead and pokes the controller. The reconciler
 // handles process lifecycle (start). If the controller is not running,
 // falls back to direct process start via the session manager.
-func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, jsonOutput bool, waitTimeout time.Duration, stdout, stderr io.Writer) int {
+// forceDegraded is variadic (rather than a plain bool) so the many existing
+// call sites — production and test — that predate the ga-6l32x0 spawn
+// preflight gate keep compiling unchanged; omitting it means false, matching
+// their pre-gate behavior exactly.
+func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, jsonOutput bool, waitTimeout time.Duration, stdout, stderr io.Writer, forceDegraded ...bool) int {
 	if waitTimeout <= 0 {
 		waitTimeout = defaultSessionNewWaitTimeout
 	}
+	fd := len(forceDegraded) > 0 && forceDegraded[0]
 	templateName := args[0]
 	if jsonOutput && !noAttach {
 		fmt.Fprintln(stderr, "gc session new: --json requires --no-attach because attaching is interactive") //nolint:errcheck // best-effort stderr
@@ -223,6 +230,15 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	// and the start-wait front door), so route the whole flow through the session
 	// coordination-class store for relocation-safety.
 	sessStore := cliSessionStore(store, cfg, cityPath)
+
+	// P2 fail-closed spawn preflight (ga-6l32x0): refuse before dispatching a
+	// create if the supervisor is on a stale binary or the pending-create
+	// queue already has entries past their lease — the exact wrong-sequencing
+	// this gate exists to make impossible to hit silently (ga-ptm6dm).
+	if res := checkSpawnPreflightGate(store, fd); res.Blocked {
+		fmt.Fprintln(stderr, spawnPreflightRefusalMessage("gc session new", res)) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 
 	sp, err := newSessionProvider()
 	if err != nil {
