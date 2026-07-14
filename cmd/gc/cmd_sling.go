@@ -461,7 +461,7 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 	// create if the supervisor is on a stale binary or the pending-create
 	// queue already has entries past their lease — the exact wrong-sequencing
 	// this gate exists to make impossible to hit silently (ga-ptm6dm).
-	if res := checkSpawnPreflightGate(store, fd); res.Blocked {
+	if res := checkSpawnPreflightGate(cliSessionStore(store, cfg, cityPath), fd); res.Blocked {
 		return fail("spawn_preflight_refused", spawnPreflightRefusalMessage("gc sling", res))
 	}
 
