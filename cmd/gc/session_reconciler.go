@@ -1453,7 +1453,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			return nil
 		}
 		rollbacksThisTick++
-		fmt.Fprintf(stderr, "session reconciler: rolling back pending create %s: %s\n", name, detail) //nolint:errcheck
+		fmt.Fprintf(stderr, "session reconciler: WARN rolling back pending create %s: %s\n", name, detail) //nolint:errcheck
+		recordPendingCreateRollbackEvent(rec, name, templateName, action, detail)
 		if trace != nil {
 			trace.RecordDecision(TraceSiteReconcilerPendingCreate, TraceReasonCode(action), TraceOutcomeRollback, templateName, name, nil)
 		}
@@ -5605,4 +5606,31 @@ func resolveResumeCommand(command, sessionKey string, rp *config.ResolvedProvide
 	default: // "flag"
 		return command + " " + rp.ResumeFlag + " " + sessionKey
 	}
+}
+
+// recordPendingCreateRollbackEvent surfaces a pending-create rollback on the
+// city event bus (ga-ptm6dm). Before this, a rolled-back create was visible
+// only as a supervisor stderr line — no event, no mail, no error to the
+// creator — so explicitly-created sessions vanished with no observable trace.
+// Best-effort: nil recorders (tests, detached ticks) and marshal failures are
+// skipped, matching the bus's best-effort contract.
+func recordPendingCreateRollbackEvent(rec events.Recorder, name, templateName, action, detail string) {
+	if rec == nil {
+		return
+	}
+	payload, err := json.Marshal(map[string]string{
+		"template": templateName,
+		"reason":   action,
+		"detail":   detail,
+	})
+	if err != nil {
+		return
+	}
+	rec.Record(events.Event{
+		Type:    "session.create_rolled_back",
+		Actor:   "session-reconciler",
+		Subject: name,
+		Message: detail,
+		Payload: payload,
+	})
 }
