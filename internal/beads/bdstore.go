@@ -657,6 +657,10 @@ type bdIssue struct {
 	// legacy bd here (both decode to 0), so a key-name mismatch would fail there,
 	// not silently.
 	Revision int64 `json:"revision,omitempty"`
+	// CloseReason is a top-level field in the bd CLI JSON for closed beads.
+	// Gas City surfaces it through Metadata["close_reason"] for consistency with
+	// the native store read path and the events pipeline (bead.closed payload).
+	CloseReason string `json:"close_reason,omitempty"`
 }
 
 type bdIssueDep struct {
@@ -788,6 +792,17 @@ func (b *bdIssue) toBead() Bead {
 			}
 		}
 	}
+	metadata := b.Metadata
+	if b.CloseReason != "" && metadata["close_reason"] == "" {
+		if metadata == nil {
+			metadata = make(StringMap)
+		} else {
+			clone := make(StringMap, len(metadata)+1)
+			maps.Copy(clone, metadata)
+			metadata = clone
+		}
+		metadata["close_reason"] = b.CloseReason
+	}
 	return Bead{
 		ID:           b.ID,
 		Title:        b.Title,
@@ -803,7 +818,7 @@ func (b *bdIssue) toBead() Bead {
 		Needs:        b.Needs,
 		Description:  b.Description,
 		Labels:       b.Labels,
-		Metadata:     b.Metadata,
+		Metadata:     metadata,
 		Dependencies: deps,
 		Ephemeral:    b.Ephemeral,
 		NoHistory:    b.NoHistory,

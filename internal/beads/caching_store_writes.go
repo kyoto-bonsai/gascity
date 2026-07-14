@@ -3,6 +3,8 @@ package beads
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"strings"
 	"time"
 )
 
@@ -206,9 +208,16 @@ func (c *CachingStore) Close(id string) error {
 	var closed Bead
 	var found bool
 	var refreshed bool
+	var closeReason string
 	if fresh, err := c.backing.Get(id); err == nil {
 		closed = fresh
 		closed.Status = "closed"
+		// The post-close refresh carries close_reason (folded into Metadata by
+		// the store read path); the cached copy below predates the close and
+		// does not. Capture it so the bead.closed notification keeps it even
+		// when the cached copy wins (ga-xvwsdw: events never carried
+		// close_reason, so downstream gate-verdict classification was dead).
+		closeReason = strings.TrimSpace(fresh.Metadata["close_reason"])
 		found = true
 		refreshed = true
 	} else if !errors.Is(err, ErrNotFound) {
@@ -225,6 +234,12 @@ func (c *CachingStore) Close(id string) error {
 		})
 	} else if b, ok := c.beads[id]; ok {
 		b.Status = "closed"
+		if closeReason != "" && b.Metadata["close_reason"] == "" {
+			meta := make(StringMap, len(b.Metadata)+1)
+			maps.Copy(meta, b.Metadata)
+			meta["close_reason"] = closeReason
+			b.Metadata = meta
+		}
 		c.absorbFreshLocked(id, b, time.Now(), absorbOpts{
 			depsMode:   depsKeepCached,
 			seqMode:    seqKeep,
