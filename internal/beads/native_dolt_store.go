@@ -1851,6 +1851,14 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 	if err != nil {
 		return Bead{}, fmt.Errorf("parsing metadata for bead %q: %w", issue.ID, err)
 	}
+	// Bridge the beads library's first-class CloseReason field into
+	// Metadata["close_reason"] so the bead.closed event payload carries it.
+	if issue.CloseReason != "" && metadata["close_reason"] == "" {
+		if metadata == nil {
+			metadata = make(StringMap)
+		}
+		metadata["close_reason"] = issue.CloseReason
+	}
 	b := Bead{
 		ID:          issue.ID,
 		Title:       issue.Title,
