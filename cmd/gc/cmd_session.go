@@ -235,7 +235,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	// create if the supervisor is on a stale binary or the pending-create
 	// queue already has entries past their lease — the exact wrong-sequencing
 	// this gate exists to make impossible to hit silently (ga-ptm6dm).
-	if res := checkSpawnPreflightGate(store, fd); res.Blocked {
+	if res := checkSpawnPreflightGate(sessStore, fd); res.Blocked {
 		fmt.Fprintln(stderr, spawnPreflightRefusalMessage("gc session new", res)) //nolint:errcheck // best-effort stderr
 		return 1
 	}
