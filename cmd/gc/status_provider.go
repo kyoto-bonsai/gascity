@@ -12,7 +12,14 @@ import (
 )
 
 var (
-	statusProviderCallTimeout    = 50 * time.Millisecond
+	// 50ms was tighter than even a healthy round trip (14-72ms observed
+	// directly against the supervisor API, ga-qkcb92) and tighter than the
+	// 750ms budget statusObservationTimeout (cmd_citystatus.go) grants each
+	// target — this probe was swallowing that whole budget and reporting
+	// "partial status" on ordinary latency, not just genuine slow-start/
+	// degradation. 500ms keeps real margin over the healthy case while
+	// staying under the outer per-target ceiling.
+	statusProviderCallTimeout    = 500 * time.Millisecond
 	statusProviderTimeoutWarning = func() {
 		fmt.Fprintln(os.Stderr, "gc status: runtime status probe timed out; using partial status")
 	}
