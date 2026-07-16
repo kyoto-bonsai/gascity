@@ -284,6 +284,25 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Already-closed guard (ga-11quqf): bd close on an issue that is already
+	// closed currently succeeds silently and overwrites the prior
+	// close_reason/verdict with no record a conflicting close ever happened --
+	// exactly the shape that let two concurrent same-persona sessions each
+	// successfully close ga-e1y5k8 with different verdicts and never notice
+	// (second caller wins, first caller's verdict vanishes silently). Mirrors
+	// bd's own existing unsatisfied-dependency-gate refusal (refuse by
+	// default, -f/--force to override) rather than inventing a new UX shape.
+	// Deliberately narrow per officer triage (2026-07-15 00:59): a compare-
+	// and-swap on the single already-closed condition, not a general claim-
+	// lock/mutex across all consequential actions -- that question is tracked
+	// separately and left unrouted pending its own ADR (ga-7funca).
+	if ids, ok := bdAlreadyClosedCheckTargets(bdArgs); ok {
+		if closed := bdAlreadyClosedIDs(ids, target.ScopeRoot, cityPath); len(closed) > 0 {
+			fmt.Fprintf(stderr, "gc bd: %s already closed; refusing to re-close (this would silently overwrite the existing close_reason with no record a conflicting close occurred). Pass -f/--force to override.\n", strings.Join(closed, ", ")) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
+
 	// Work-record close gate (ADR-0009): a close routed through the SDK seam
 	// must satisfy the typed work-record contract (gc.work_outcome present;
 	// shipped ⇒ gc.work_commit reachable on gc.work_branch). Warn-only by default;
@@ -357,7 +376,166 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return bdSilentFallbackExitCode
 	}
 
+	// bd has been observed to persist the status transition on `bd close`
+	// while silently dropping a long/multi-paragraph --reason value from
+	// close_reason (ga-ntd4x4). This is a distinct failure from the
+	// managed-Dolt silent-fallback checked above: status itself persists
+	// correctly here, so no stderr marker fires. Root cause is inside the
+	// bd binary, not this passthrough, so there is nothing to fix in the
+	// write path — verify the read-back instead of trusting bd's exit code
+	// for this one field.
+	if ids, ok := bdCloseReasonCheckTargets(bdArgs); ok {
+		verifyBdCloseReasonPersisted(ids, target.ScopeRoot, cityPath, stderr)
+	}
+
 	return 0
+}
+
+// bdCloseReasonCheckTargets reports the bead IDs to verify and whether a
+// non-empty --reason/-r/--reason-file was supplied on a `bd close` command,
+// so the caller can confirm close_reason actually persisted (ga-ntd4x4).
+// Only "close" is checked: "update" does not accept --reason at all — it is
+// absent from bdSubcmdValueFlags("update"), so a --reason on update trips
+// the ambiguous-flag guard above and never reaches bd's write path in the
+// first place (a confusing error, but not a persistence bug).
+func bdCloseReasonCheckTargets(args []string) (ids []string, ok bool) {
+	if len(args) == 0 || args[0] != "close" {
+		return nil, false
+	}
+	writeIDs, writeOK, ambiguous := bdMutationWriteIDs(args)
+	if !writeOK || ambiguous || len(writeIDs) == 0 {
+		return nil, false
+	}
+	if !bdCloseReasonSupplied(args) {
+		return nil, false
+	}
+	return writeIDs, true
+}
+
+// bdCloseReasonSupplied reports whether a `bd close` argument list carries a
+// non-empty -r/--reason/--reason-file value. Callers must have already
+// confirmed (via bdMutationWriteIDs) that every flag in args is a recognized
+// "close" flag, so every "-"-prefixed token here is a known flag from
+// bdSubcmdValueFlags("close") or bdSubcmdBoolFlags("close").
+func bdCloseReasonSupplied(args []string) bool {
+	valueFlags := bdSubcmdValueFlags("close")
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "-r" || arg == "--reason" {
+			return i+1 < len(args) && strings.TrimSpace(args[i+1]) != ""
+		}
+		if rest, isReasonEq := strings.CutPrefix(arg, "--reason="); isReasonEq {
+			return strings.TrimSpace(rest) != ""
+		}
+		if arg == "--reason-file" || strings.HasPrefix(arg, "--reason-file=") {
+			return true
+		}
+		if strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") {
+			flagName := strings.TrimLeft(arg, "-")
+			longForm, shortForm := "--"+flagName, "-"+flagName
+			if valueFlags[longForm] || (len(flagName) == 1 && valueFlags[shortForm]) {
+				i++ // skip this flag's value argument
+			}
+		}
+	}
+	return false
+}
+
+// verifyBdCloseReasonPersisted re-reads each closed bead and warns (does not
+// block — this runs after bd has already exited 0) if a supplied --reason
+// did not end up in close_reason. Store-unavailable or per-id read errors
+// are silently skipped: this is a best-effort audit check, not a gate, and
+// must never turn a healthy close into a false alarm over an unrelated
+// read-path hiccup.
+func verifyBdCloseReasonPersisted(ids []string, scopeRoot, cityPath string, stderr io.Writer) {
+	store, err := openStoreAtForCity(scopeRoot, cityPath)
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		b, err := store.Get(id)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(b.Metadata["close_reason"]) == "" {
+			fmt.Fprintf(stderr, "gc bd: warning: --reason was supplied for %s but close_reason did not persist; verify manually via `gc bd show %s` (see ga-ntd4x4)\n", id, id) //nolint:errcheck // best-effort stderr
+		}
+	}
+}
+
+// bdCloseForceSupplied reports whether a `bd close` argument list carries the
+// -f/--force boolean flag. Callers must have already confirmed (via
+// bdMutationWriteIDs) that every flag in args is a recognized "close" flag,
+// so every "-"-prefixed token here is a known flag from
+// bdSubcmdValueFlags("close") or bdSubcmdBoolFlags("close") -- same
+// precondition as bdCloseReasonSupplied.
+func bdCloseForceSupplied(args []string) bool {
+	valueFlags := bdSubcmdValueFlags("close")
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "-f" || arg == "--force" {
+			return true
+		}
+		if strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") {
+			flagName := strings.TrimLeft(arg, "-")
+			longForm, shortForm := "--"+flagName, "-"+flagName
+			if valueFlags[longForm] || (len(flagName) == 1 && valueFlags[shortForm]) {
+				i++ // skip this flag's value argument
+			}
+		}
+	}
+	return false
+}
+
+// bdAlreadyClosedCheckTargets reports the bead IDs to verify and whether the
+// already-closed guard should run at all (ga-11quqf): only for a `bd close`
+// invocation that did not supply -f/--force. bd already refuses to close a
+// bead with unresolved dependencies -- this mirrors that same refuse-by-
+// default/--force-to-override shape for the different hazard of re-closing a
+// bead that is already closed, which the dependency gate does not catch
+// (there is no unresolved dependency the second time around; the bead is
+// just already closed).
+func bdAlreadyClosedCheckTargets(args []string) (ids []string, ok bool) {
+	if len(args) == 0 || args[0] != "close" {
+		return nil, false
+	}
+	if bdCloseForceSupplied(args) {
+		return nil, false
+	}
+	writeIDs, writeOK, ambiguous := bdMutationWriteIDs(args)
+	if !writeOK || ambiguous || len(writeIDs) == 0 {
+		return nil, false
+	}
+	return writeIDs, true
+}
+
+// bdAlreadyClosedIDs re-reads each candidate bead and returns the subset that
+// is already closed -- the set doBd must refuse to re-close. Store-
+// unavailable or per-id read errors are treated as "cannot verify, do not
+// block": this guard exists to prevent a KNOWN silent overwrite, not to add a
+// new way for an unrelated read-path hiccup to block a legitimate close.
+func bdAlreadyClosedIDs(ids []string, scopeRoot, cityPath string) []string {
+	store, err := openStoreAtForCity(scopeRoot, cityPath)
+	if err != nil {
+		return nil
+	}
+	var closed []string
+	for _, id := range ids {
+		b, err := store.Get(id)
+		if err != nil {
+			continue
+		}
+		if b.Status == "closed" {
+			closed = append(closed, id)
+		}
+	}
+	return closed
 }
 
 func parseBdReleaseIfCurrentArgs(args []string) (id, expectedAssignee string, ok bool, err error) {
