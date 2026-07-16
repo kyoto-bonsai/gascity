@@ -2203,6 +2203,7 @@ func TestMergeProviderOverBuiltinFieldSync(t *testing.T) {
 		ProcessNames:           []string{"custom"},
 		EmitsPermissionWarning: boolPtr(true),
 		AcceptStartupDialogs:   boolPtr(true),
+		MaxSeats:               intPtr(8),
 		Env:                    map[string]string{"K": "V"},
 		PathCheck:              "custom-bin",
 		SupportsACP:            boolPtr(true),
