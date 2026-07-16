@@ -2340,6 +2340,216 @@ func TestBdMutationWriteIDs(t *testing.T) {
 	}
 }
 
+// TestBdCloseReasonSupplied covers ga-ntd4x4's close-reason detection: the
+// scanner must find -r/--reason/--reason-file in every form bd accepts,
+// must not mistake another flag's value for a reason, must treat a
+// whitespace-only reason as absent (nothing to verify), and must stop at
+// "--" the same way bdMutationWriteIDs does.
+func TestBdCloseReasonSupplied(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "no flags at all", args: []string{"close", "gcy-dv7"}, want: false},
+		{name: "short -r with value", args: []string{"close", "-r", "done", "gcy-dv7"}, want: true},
+		{name: "long --reason with value", args: []string{"close", "--reason", "done", "gcy-dv7"}, want: true},
+		{name: "--reason=value form", args: []string{"close", "--reason=done", "gcy-dv7"}, want: true},
+		{name: "--reason-file bare flag", args: []string{"close", "--reason-file", "/tmp/r.txt", "gcy-dv7"}, want: true},
+		{name: "--reason-file=path form", args: []string{"close", "--reason-file=/tmp/r.txt", "gcy-dv7"}, want: true},
+		{name: "-r with whitespace-only value is treated as absent", args: []string{"close", "-r", "   ", "gcy-dv7"}, want: false},
+		{name: "-r as last token with no value", args: []string{"close", "gcy-dv7", "-r"}, want: false},
+		{name: "--reason=whitespace is treated as absent", args: []string{"close", "--reason=   ", "gcy-dv7"}, want: false},
+		{
+			name: "another value flag's value is not mistaken for -r",
+			args: []string{"close", "--session", "sess-id-abc", "gcy-dv7"},
+			want: false,
+		},
+		{
+			name: "-r found after skipping a preceding value flag",
+			args: []string{"close", "--session", "sess-id-abc", "-r", "done", "gcy-dv7"},
+			want: true,
+		},
+		{
+			name: "-r after -- terminator is positional, not a flag",
+			args: []string{"close", "--", "-r", "done"},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bdCloseReasonSupplied(tc.args); got != tc.want {
+				t.Errorf("bdCloseReasonSupplied(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBdCloseReasonCheckTargets covers the gating logic: only "close" is
+// checked (not "update" — bd rejects --reason on update before this ever
+// runs), ambiguous or ID-less commands yield nothing to verify, and a
+// close without --reason has nothing to verify either.
+func TestBdCloseReasonCheckTargets(t *testing.T) {
+	type result struct {
+		ids []string
+		ok  bool
+	}
+	cases := []struct {
+		name string
+		args []string
+		want result
+	}{
+		{
+			name: "close with reason and single id",
+			args: []string{"close", "-r", "done", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "close with reason and batch ids",
+			args: []string{"close", "--reason", "done", "id1", "id2"},
+			want: result{ids: []string{"id1", "id2"}, ok: true},
+		},
+		{
+			name: "close without reason has nothing to verify",
+			args: []string{"close", "gcy-dv7"},
+			want: result{ok: false},
+		},
+		{
+			name: "update is never checked, even with a reason-shaped flag",
+			args: []string{"update", "--status", "closed", "gcy-dv7"},
+			want: result{ok: false},
+		},
+		{
+			name: "ambiguous close (unknown flag) yields nothing to verify",
+			args: []string{"close", "--unknown-future-flag", "x", "-r", "done", "gcy-dv7"},
+			want: result{ok: false},
+		},
+		{
+			name: "close with reason but no id (last-touched fallback) yields nothing to verify",
+			args: []string{"close", "--reason", "done"},
+			want: result{ok: false},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids, ok := bdCloseReasonCheckTargets(tc.args)
+			if ok != tc.want.ok {
+				t.Errorf("ok = %v, want %v", ok, tc.want.ok)
+			}
+			if !bdTestSlicesEqual(ids, tc.want.ids) {
+				t.Errorf("ids = %v, want %v", ids, tc.want.ids)
+			}
+		})
+	}
+}
+
+// TestBdCloseForceSupplied covers ga-11quqf's force-flag detection: the
+// scanner must find -f/--force in either form bd accepts, must not mistake
+// another flag's value for -f/--force, and must stop at "--" the same way
+// bdMutationWriteIDs does.
+func TestBdCloseForceSupplied(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "no flags at all", args: []string{"close", "gcy-dv7"}, want: false},
+		{name: "short -f", args: []string{"close", "-f", "gcy-dv7"}, want: true},
+		{name: "long --force", args: []string{"close", "--force", "gcy-dv7"}, want: true},
+		{name: "-f as last token", args: []string{"close", "gcy-dv7", "-f"}, want: true},
+		{
+			name: "a reason value that reads as -f is not mistaken for the flag",
+			args: []string{"close", "--reason", "-f", "gcy-dv7"},
+			want: false,
+		},
+		{
+			name: "-f found after skipping a preceding value flag's value",
+			args: []string{"close", "--reason", "not the flag", "-f", "gcy-dv7"},
+			want: true,
+		},
+		{
+			name: "-f after -- terminator is positional, not a flag",
+			args: []string{"close", "--", "-f"},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bdCloseForceSupplied(tc.args); got != tc.want {
+				t.Errorf("bdCloseForceSupplied(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBdAlreadyClosedCheckTargets covers the gating logic for ga-11quqf's
+// already-closed guard: only "close" is checked (not "update"), a close that
+// already supplied -f/--force is never checked (force means the caller has
+// already opted in to overriding the guard), and ambiguous or ID-less
+// commands yield nothing to verify.
+func TestBdAlreadyClosedCheckTargets(t *testing.T) {
+	type result struct {
+		ids []string
+		ok  bool
+	}
+	cases := []struct {
+		name string
+		args []string
+		want result
+	}{
+		{
+			name: "close without force, single id",
+			args: []string{"close", "gcy-dv7"},
+			want: result{ids: []string{"gcy-dv7"}, ok: true},
+		},
+		{
+			name: "close without force, batch ids",
+			args: []string{"close", "id1", "id2"},
+			want: result{ids: []string{"id1", "id2"}, ok: true},
+		},
+		{
+			name: "close with -f is never checked",
+			args: []string{"close", "-f", "gcy-dv7"},
+			want: result{ok: false},
+		},
+		{
+			name: "close with --force is never checked",
+			args: []string{"close", "--force", "gcy-dv7"},
+			want: result{ok: false},
+		},
+		{
+			name: "update is never checked, even without force",
+			args: []string{"update", "--status", "closed", "gcy-dv7"},
+			want: result{ok: false},
+		},
+		{
+			name: "ambiguous close (unknown flag) yields nothing to verify",
+			args: []string{"close", "--unknown-future-flag", "x", "gcy-dv7"},
+			want: result{ok: false},
+		},
+		{
+			name: "close with no id (last-touched fallback) yields nothing to verify",
+			args: []string{"close"},
+			want: result{ok: false},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids, ok := bdAlreadyClosedCheckTargets(tc.args)
+			if ok != tc.want.ok {
+				t.Errorf("ok = %v, want %v", ok, tc.want.ok)
+			}
+			if !bdTestSlicesEqual(ids, tc.want.ids) {
+				t.Errorf("ids = %v, want %v", ids, tc.want.ids)
+			}
+		})
+	}
+}
+
 func bdTestSlicesEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
