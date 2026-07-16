@@ -151,5 +151,15 @@ func ValidateSemantics(cfg *City, source string) []string {
 		}
 	}
 
+	// Validate max_seats grammar (mirrors agent max_active_sessions: -1 =
+	// unlimited, >= 0 = literal cap).
+	for name, spec := range cfg.Providers {
+		if spec.MaxSeats != nil && *spec.MaxSeats < -1 {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: [providers.%s] max_seats must be >= -1 (use -1 for unlimited), got %d",
+				source, name, *spec.MaxSeats))
+		}
+	}
+
 	return warnings
 }
