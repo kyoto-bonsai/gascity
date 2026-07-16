@@ -457,11 +457,19 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 	if errCode != "" {
 		return fail(errCode, errMsg)
 	}
-	// P2 fail-closed spawn preflight (ga-6l32x0): refuse before dispatching a
-	// create if the supervisor is on a stale binary or the pending-create
-	// queue already has entries past their lease — the exact wrong-sequencing
-	// this gate exists to make impossible to hit silently (ga-ptm6dm).
-	if res := checkSpawnPreflightGate(cliSessionStore(store, cfg, cityPath), fd); res.Blocked {
+	// P2 fail-closed spawn preflight (ga-6l32x0 + ga-mpb0xu): refuse before
+	// dispatching a create if the supervisor is on a stale binary, the
+	// pending-create queue already has entries past their lease, or the
+	// resolved provider is at its ratified seat cap — the exact
+	// wrong-sequencing this gate exists to make impossible to hit silently
+	// (ga-ptm6dm). Provider resolution failure here fails open on check (c)
+	// only — same posture checkProviderSeatCap already applies for "" — the
+	// other two checks still run.
+	slingProviderName := ""
+	if resolved, err := config.ResolveProvider(&a, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {
+		slingProviderName = resolved.Name
+	}
+	if res := checkSpawnPreflightGate(cliSessionStore(store, cfg, cityPath), fd, cfg, slingProviderName); res.Blocked {
 		return fail("spawn_preflight_refused", spawnPreflightRefusalMessage("gc sling", res))
 	}
 
