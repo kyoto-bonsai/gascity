@@ -18,7 +18,7 @@ func TestCheckSpawnPreflightGate_HealthyStateProceeds(t *testing.T) {
 	supervisorAliveHook = func() int { return 0 }
 
 	store := beads.NewMemStore()
-	res := checkSpawnPreflightGate(store, false)
+	res := checkSpawnPreflightGate(store, false, nil, "")
 	if res.Blocked {
 		t.Fatalf("healthy state blocked: reason=%q fixCmd=%q", res.Reason, res.FixCmd)
 	}
@@ -31,7 +31,7 @@ func TestCheckSpawnPreflightGate_StaleBinaryBlocks(t *testing.T) {
 	setCommit("local-build-id") // differs from the supervisor's reported build_id
 
 	store := beads.NewMemStore()
-	res := checkSpawnPreflightGate(store, false)
+	res := checkSpawnPreflightGate(store, false, nil, "")
 	if !res.Blocked {
 		t.Fatal("stale binary did not trip the gate")
 	}
@@ -68,7 +68,7 @@ func TestCheckSpawnPreflightGate_AgedPendingCreatesBlocks(t *testing.T) {
 		t.Fatalf("seed aged pending-create bead: %v", err)
 	}
 
-	res := checkSpawnPreflightGate(store, false)
+	res := checkSpawnPreflightGate(store, false, nil, "")
 	if !res.Blocked {
 		t.Fatal("aged pending-create did not trip the gate")
 	}
@@ -101,15 +101,15 @@ func TestCheckSpawnPreflightGate_FreshPendingCreateProceeds(t *testing.T) {
 		t.Fatalf("seed fresh pending-create bead: %v", err)
 	}
 
-	res := checkSpawnPreflightGate(store, false)
+	res := checkSpawnPreflightGate(store, false, nil, "")
 	if res.Blocked {
 		t.Fatalf("fresh pending-create blocked: reason=%q", res.Reason)
 	}
 }
 
 // TestCheckSpawnPreflightGate_ForceDegradedBypassesBoth pins the escape
-// hatch: --force-degraded must skip both checks even when both would
-// otherwise trip.
+// hatch: --force-degraded must skip all three checks even when more than
+// one would otherwise trip.
 func TestCheckSpawnPreflightGate_ForceDegradedBypassesBoth(t *testing.T) {
 	_, setCommit := driftCheckEnv(t, "supervisor-build-id")
 	setCommit("local-build-id")
@@ -130,7 +130,7 @@ func TestCheckSpawnPreflightGate_ForceDegradedBypassesBoth(t *testing.T) {
 		t.Fatalf("seed aged pending-create bead: %v", err)
 	}
 
-	res := checkSpawnPreflightGate(store, true)
+	res := checkSpawnPreflightGate(store, true, nil, "")
 	if res.Blocked {
 		t.Fatalf("--force-degraded did not bypass the gate: reason=%q", res.Reason)
 	}

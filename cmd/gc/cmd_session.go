@@ -231,11 +231,13 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	// coordination-class store for relocation-safety.
 	sessStore := cliSessionStore(store, cfg, cityPath)
 
-	// P2 fail-closed spawn preflight (ga-6l32x0): refuse before dispatching a
-	// create if the supervisor is on a stale binary or the pending-create
-	// queue already has entries past their lease — the exact wrong-sequencing
-	// this gate exists to make impossible to hit silently (ga-ptm6dm).
-	if res := checkSpawnPreflightGate(sessStore, fd); res.Blocked {
+	// P2 fail-closed spawn preflight (ga-6l32x0 + ga-mpb0xu): refuse before
+	// dispatching a create if the supervisor is on a stale binary, the
+	// pending-create queue already has entries past their lease, or the
+	// resolved provider is at its ratified seat cap — the exact
+	// wrong-sequencing this gate exists to make impossible to hit silently
+	// (ga-ptm6dm).
+	if res := checkSpawnPreflightGate(sessStore, fd, cfg, resolved.Name); res.Blocked {
 		fmt.Fprintln(stderr, spawnPreflightRefusalMessage("gc session new", res)) //nolint:errcheck // best-effort stderr
 		return 1
 	}

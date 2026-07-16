@@ -13,6 +13,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/config"
 )
 
 // spawnPreflightResult reports whether a create/sling dispatch should be
@@ -23,20 +24,27 @@ type spawnPreflightResult struct {
 	FixCmd  string
 }
 
-// checkSpawnPreflightGate runs both P2 checks: (a) supervisor binary
+// checkSpawnPreflightGate runs all three P2 checks: (a) supervisor binary
 // staleness via the same BuildID comparison gc start's drift check uses,
 // (b) count of pending-create sessions already past
-// pendingCreateNeverStartedTimeout (one full lease). Either trips the gate
-// unless forceDegraded is set. Read-only: never mutates session or store
-// state — repair stays the reconciler's/watchdog's job.
-func checkSpawnPreflightGate(store beads.Store, forceDegraded bool) spawnPreflightResult {
+// pendingCreateNeverStartedTimeout (one full lease), (c) the dispatching
+// provider's ratified seat cap (ga-mpb0xu). Any one trips the gate unless
+// forceDegraded is set. cfg and providerName are the resolved target of
+// this dispatch attempt; providerName == "" skips (c) only, same fail-open
+// posture checkProviderSeatCap already applies internally. Read-only: never
+// mutates session or store state — repair stays the reconciler's/
+// watchdog's job.
+func checkSpawnPreflightGate(store beads.Store, forceDegraded bool, cfg *config.City, providerName string) spawnPreflightResult {
 	if forceDegraded {
 		return spawnPreflightResult{}
 	}
 	if res := checkSupervisorBinaryStaleness(); res.Blocked {
 		return res
 	}
-	return checkAgedPendingCreates(store)
+	if res := checkAgedPendingCreates(store); res.Blocked {
+		return res
+	}
+	return checkProviderSeatCap(store, cfg, providerName)
 }
 
 // checkSupervisorBinaryStaleness compares the running supervisor's reported
