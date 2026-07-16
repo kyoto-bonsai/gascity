@@ -55,6 +55,15 @@ type ProviderSpec struct {
 	//   ""                - explicit standalone opt-out
 	//   nil               - field absent; no explicit declaration
 	Base *string `toml:"base,omitempty"`
+	// MaxSeats caps the number of concurrent active sessions attributed to
+	// this provider (via each session's template->provider resolution),
+	// enforced by the spawn preflight gate (ga-mpb0xu). Semantics mirror
+	// Agent.MaxActiveSessions: nil = not configured (gate fails open, no
+	// cap enforced), -1 = explicitly unlimited, 0 or positive = literal
+	// seat cap. Distinct from Agent/pool-level MaxActiveSessions, which
+	// caps one template's own session count, not the provider's aggregate
+	// across all templates that resolve to it.
+	MaxSeats *int `toml:"max_seats,omitempty"`
 	// ArgsAppend accumulates extra args after each layer's Args replacement.
 	ArgsAppend []string `toml:"args_append,omitempty"`
 	// OptionsSchemaMerge controls OptionsSchema merge mode across the
@@ -415,6 +424,10 @@ func (ps *ProviderSpec) pathCheckBinary() string {
 // boolPtr returns a pointer to the given bool for tri-state capability fields.
 func boolPtr(b bool) *bool { return &b }
 
+// intPtr returns a pointer to the given int for tri-state capacity fields
+// (e.g. MaxSeats: nil = unconfigured, pointer value = explicit setting).
+func intPtr(n int) *int { return &n }
+
 // derefBool safely dereferences a *bool, returning false for nil.
 func derefBool(p *bool) bool {
 	if p == nil {
@@ -531,6 +544,14 @@ func cloneStringMap(values map[string]string) map[string]string {
 }
 
 func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneIntPtr(value *int) *int {
 	if value == nil {
 		return nil
 	}

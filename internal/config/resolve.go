@@ -277,6 +277,9 @@ func MergeProviderOverBuiltin(base, city ProviderSpec) ProviderSpec {
 	if city.AcceptStartupDialogs != nil {
 		result.AcceptStartupDialogs = cloneBoolPtr(city.AcceptStartupDialogs)
 	}
+	if city.MaxSeats != nil {
+		result.MaxSeats = cloneIntPtr(city.MaxSeats)
+	}
 	if city.PathCheck != "" {
 		result.PathCheck = city.PathCheck
 	}

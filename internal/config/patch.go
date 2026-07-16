@@ -250,6 +250,10 @@ type ProviderPatch struct {
 	ReadyDelayMs *int `toml:"ready_delay_ms,omitempty" jsonschema:"minimum=0"`
 	// AcceptStartupDialogs overrides startup dialog acceptance behavior.
 	AcceptStartupDialogs *bool `toml:"accept_startup_dialogs,omitempty"`
+	// MaxSeats overrides the provider's concurrent active-session cap
+	// (nil = patch does not touch max_seats; same nil/-1/N semantics as
+	// ProviderSpec.MaxSeats once applied).
+	MaxSeats *int `toml:"max_seats,omitempty"`
 	// Env adds or overrides environment variables.
 	Env map[string]string `toml:"env,omitempty"`
 	// EnvRemove lists env var keys to remove.
@@ -772,6 +776,9 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 		if patch.AcceptStartupDialogs != nil {
 			newSpec.AcceptStartupDialogs = cloneBoolPtr(patch.AcceptStartupDialogs)
 		}
+		if patch.MaxSeats != nil {
+			newSpec.MaxSeats = cloneIntPtr(patch.MaxSeats)
+		}
 		if len(patch.Env) > 0 {
 			newSpec.Env = make(map[string]string, len(patch.Env))
 			for k, v := range patch.Env {
@@ -817,6 +824,9 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 	}
 	if patch.AcceptStartupDialogs != nil {
 		spec.AcceptStartupDialogs = cloneBoolPtr(patch.AcceptStartupDialogs)
+	}
+	if patch.MaxSeats != nil {
+		spec.MaxSeats = cloneIntPtr(patch.MaxSeats)
 	}
 	// Env: additive merge.
 	if len(patch.Env) > 0 {
