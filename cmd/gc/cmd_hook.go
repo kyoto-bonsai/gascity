@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strings"
@@ -417,7 +418,7 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			os.Getenv("GC_SESSION_ID"), failureTemplate, command, err)
 	}
 	runner := func(command, _ string) (string, error) {
-		out, _, err := firstStoreWithWork(command, stores, stores[0], shellWorkQueryWithEnv)
+		out, _, err := firstStoreWithWork(command, stores, stores[0], shellWorkQueryWithRetry)
 		emitQueryFailure(command, err)
 		return out, err
 	}
@@ -584,7 +585,7 @@ func hookClaimSessionEligibility(info session.Info, instanceToken string) (hookC
 // set, binding the production shell work-query runner and real claim ops. See
 // claimHookWorkWithRunner for the federation and lost-claim-race semantics.
 func claimHookWork(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
-	return claimHookWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, hookClaimOps{}, shellWorkQueryWithEnv, emitFailure, stdout, stderr)
+	return claimHookWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, hookClaimOps{}, shellWorkQueryWithRetry, emitFailure, stdout, stderr)
 }
 
 // claimHookWorkWithRunner is claimHookWork with the work-query runner and claim
@@ -773,6 +774,108 @@ func shellWorkQueryWithEnv(command, dir string, env []string) (string, error) {
 		return "", fmt.Errorf("running work query %q: %w", command, err)
 	}
 	return string(out), nil
+}
+
+// hookWorkQueryMaxAttempts bounds the number of shellWorkQueryWithEnv attempts
+// shellWorkQueryWithRetry makes for one logical work query. Package-level var
+// so tests can clamp it (mirrors hookWorkQueryTimeout).
+var hookWorkQueryMaxAttempts = 3
+
+// hookWorkQueryBackoffBase and hookWorkQueryBackoffCap bound the decorrelated
+// jitter delay shellWorkQueryWithRetry inserts between attempts.
+var (
+	hookWorkQueryBackoffBase = 250 * time.Millisecond
+	hookWorkQueryBackoffCap  = 4 * time.Second
+)
+
+// hookWorkQueryOverallDeadline bounds total wall-clock time across every retry
+// attempt and backoff sleep in one shellWorkQueryWithRetry call, independent
+// of hookWorkQueryTimeout (which bounds a single attempt). Retries only ever
+// fire for fast (non-timeout) failures — see shellWorkQueryWithRetry — so in
+// practice this ceiling is a safety backstop rather than a budget retries are
+// expected to approach.
+var hookWorkQueryOverallDeadline = 30 * time.Second
+
+// hookWorkQuerySleep is the backoff seam for shellWorkQueryWithRetry; tests
+// override it to a no-op so retry/jitter tests don't actually sleep. A test
+// that reassigns this package-level var must not run in parallel with the
+// retry path and must restore it via t.Cleanup (mirrors the beads package's
+// conditionalWriteSleep seam).
+var hookWorkQuerySleep = func(d time.Duration) { time.Sleep(d) }
+
+// shellWorkQueryWithRetry wraps shellWorkQueryWithEnv with a bounded, jittered
+// retry for the `gc hook` / `gc hook --claim` CLI path, where many concurrent
+// gc sessions each poll independently on their own external cadence
+// (ga-t2brh8, daedalus-v2-audit candidate 1, 2026-07-19).
+//
+// A hang that exhausts the full hookWorkQueryTimeout is NEVER retried here: at
+// that point Dolt itself is slow, and re-issuing the same expensive
+// multi-round-trip probe immediately would hold server resources longer under
+// the exact saturation this bead is about (daedalus-v2-audit: "longer retry
+// windows hold server resources LONGER under saturation"). Only a FAST
+// failure — the subprocess returning well inside hookWorkQueryTimeout via a
+// dropped connection, a circuit breaker fast-failing, or any other non-
+// deadline error — is retried, since those are cheap and plausibly resolved
+// by the next attempt.
+//
+// This is deliberately NOT folded into shellWorkQueryWithEnv itself: that
+// function is shared with the control-dispatcher's
+// workflowServeControlReadyQuery path (dispatch_control_ready.go,
+// dispatch_runtime.go), which has its own tested fail-fast-on-error contract
+// (TestWorkflowServeControlReadyQueryFailsFastOnBDReadyError) and its own
+// outer-loop backoff (runWorkflowServeFollow's followSleepDuration) — adding a
+// second, inner retry layer inside shellWorkQueryWithEnv would double up on
+// backoff there and break that contract. Bounded by hookWorkQueryMaxAttempts
+// and hookWorkQueryOverallDeadline so a pathological repeated-fast-failure
+// sequence cannot retry indefinitely.
+func shellWorkQueryWithRetry(command, dir string, env []string) (string, error) {
+	deadline := time.Now().Add(hookWorkQueryOverallDeadline)
+	var out string
+	var err error
+	var prevBackoff time.Duration
+	for attempt := 1; ; attempt++ {
+		out, err = shellWorkQueryWithEnv(command, dir, env)
+		if err == nil || errors.Is(err, context.DeadlineExceeded) || attempt >= hookWorkQueryMaxAttempts {
+			return out, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return out, err
+		}
+		backoff := decorrelatedJitterBackoff(prevBackoff, hookWorkQueryBackoffBase, hookWorkQueryBackoffCap)
+		prevBackoff = backoff
+		if backoff > remaining {
+			backoff = remaining
+		}
+		hookWorkQuerySleep(backoff)
+		if time.Now().After(deadline) {
+			return out, err
+		}
+	}
+}
+
+// decorrelatedJitterBackoff returns the next retry delay using the
+// "decorrelated jitter" formula from the AWS Architecture Blog post
+// "Exponential Backoff And Jitter": min(cap, random_between(base, prev*3)).
+// Unlike equal/full jitter (which randomizes relative to the attempt count),
+// each delay randomizes relative to the PREVIOUS delay, spreading concurrent
+// retriers further apart over successive attempts instead of converging back
+// toward a shared ceiling — the property that matters when ~40+ gc sessions
+// each run their own gc hook independently (this bead's root cause). prev < base
+// (including the zero value, for the first backoff) is treated as base.
+func decorrelatedJitterBackoff(prev, base, maxDelay time.Duration) time.Duration {
+	if prev < base {
+		prev = base
+	}
+	spread := int64(prev)*3 - int64(base)
+	if spread <= 0 {
+		return base
+	}
+	next := base + time.Duration(rand.Int63n(spread+1)) //nolint:gosec // jitter spacing, not security-critical
+	if next > maxDelay {
+		return maxDelay
+	}
+	return next
 }
 
 // workQueryEnvForDir ensures the subprocess environment does not carry a
