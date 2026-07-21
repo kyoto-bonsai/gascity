@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strings"
@@ -731,18 +732,45 @@ func hookQueryEnv(cityPath string, cfg *config.City, a *config.Agent) (map[strin
 // dir sets the command's working directory.
 type WorkQueryRunner func(command, dir string) (string, error)
 
-// hookWorkQueryTimeout caps the work-query subprocess that `gc hook` and the
-// workflow serve loop run via shellWorkQueryWithEnv. The default work-probe
-// issues ~6 sequential bd/store round-trips before the pool-demand tier that
-// finds routed work; on a multi-rig dolt city under concurrent load the probe
-// intermittently exceeded the prior 30s cap, so shellWorkQueryWithEnv killed it
-// and pool operators were starved of routed work. Raised to 60s to cover the
-// realistic loaded cost. This is independent of defaultHookRunTimeout, which
-// bounds the `gc hook run` managed-hook wrapper (around nudge drain / mail
-// check) and does not enclose this work query. The package-level var lets us
-// lower it again once the probe's round-trip count is reduced and the slow
-// per-rig `bd ready`/`gc ready` paths are optimized.
+// hookWorkQueryTimeout caps each work-query subprocess attempt that `gc hook`
+// and the workflow serve loop run via shellWorkQueryWithEnv. The default
+// work-probe issues ~6 sequential bd/store round-trips before the pool-demand
+// tier that finds routed work; on a multi-rig dolt city under concurrent load
+// the probe intermittently exceeded the prior 30s cap, so shellWorkQueryWithEnv
+// killed it and pool operators were starved of routed work. Raised to 60s to
+// cover the realistic loaded cost. This is independent of defaultHookRunTimeout,
+// which bounds the `gc hook run` managed-hook wrapper (around nudge drain /
+// mail check) and does not enclose this work query. The package-level var
+// lets us lower it again once the probe's round-trip count is reduced and the
+// slow per-rig `bd ready`/`gc ready` paths are optimized.
 var hookWorkQueryTimeout = 60 * time.Second
+
+// hookWorkQueryMaxAttempts bounds how many times shellWorkQueryWithEnv retries
+// a work-query subprocess that failed with ITS OWN context deadline (transient,
+// load-related) before giving up. 2 means one retry. Non-deadline failures
+// (bad command, non-zero exit) are never retried — they're deterministic, so
+// retrying would only add load to an already-saturated store without changing
+// the outcome. Package-level var so ops/tests can clamp it, matching
+// hookWorkQueryTimeout's existing seam (ga-t2brh8 candidate 1).
+var hookWorkQueryMaxAttempts = 2
+
+// hookWorkQueryOverallDeadline caps total wall-clock across every attempt plus
+// inter-attempt jitter sleep combined, independent of hookWorkQueryTimeout's
+// per-attempt budget. Each attempt's context is derived from this overall
+// deadline, so a later attempt gets whatever budget remains rather than a
+// fresh full timeout — a retrying call cannot hold an already-saturated store
+// open-ended (ga-t2brh8 candidate 1, constraint (a)).
+var hookWorkQueryOverallDeadline = 100 * time.Second
+
+// hookWorkQueryRetryBaseDelay is the base for the equal-jittered backoff
+// between attempts (see shellWorkQueryRetryDelay). Mirrors the
+// double-then-equal-jitter shape beads.conditionalWriteBackoff already uses in
+// this codebase rather than introducing a second jitter algorithm for what is,
+// by default, a single-retry loop. Kept small: the goal here is only to
+// desynchronize this invocation's own retry from its first attempt, not to
+// solve cross-session poll-cadence contention — that's a separate,
+// caller-layer concern (ga-t2brh8 constraint (c); candidate 2's cadence half).
+var hookWorkQueryRetryBaseDelay = 100 * time.Millisecond
 
 // shellWorkQueryWithEnv runs a work query command via sh -c and returns
 // stdout. If env is non-nil it is used as the subprocess environment
@@ -750,8 +778,45 @@ var hookWorkQueryTimeout = 60 * time.Second
 // the child inherits the parent process environment. Times out after a
 // short bounded interval so startup hooks cannot strand sessions behind a
 // wedged data-plane command.
+//
+// Retries (hookWorkQueryMaxAttempts) when an attempt fails with its own
+// context deadline, since that failure mode is transient store load rather
+// than a deterministic command error. All attempts and the jittered
+// inter-attempt sleep share one overall deadline (hookWorkQueryOverallDeadline)
+// so a retrying call cannot hold an already-saturated store open-ended
+// (ga-t2brh8).
 func shellWorkQueryWithEnv(command, dir string, env []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), hookWorkQueryTimeout)
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), hookWorkQueryOverallDeadline)
+	defer overallCancel()
+
+	var out string
+	var err error
+	for attempt := 1; ; attempt++ {
+		out, err = shellWorkQueryAttempt(overallCtx, command, dir, env)
+		if err == nil || attempt >= hookWorkQueryMaxAttempts || !errors.Is(err, context.DeadlineExceeded) {
+			return out, err
+		}
+		select {
+		case <-time.After(shellWorkQueryRetryDelay(attempt)):
+		case <-overallCtx.Done():
+			return out, err
+		}
+	}
+}
+
+// shellWorkQueryRetryDelay returns the equal-jittered backoff before the
+// (attempt+1)-th try: hookWorkQueryRetryBaseDelay doubled per attempt, then
+// equal-jittered. math/rand is fine here (banned only in Workflow scripts);
+// its global source is safe for concurrent use.
+func shellWorkQueryRetryDelay(attempt int) time.Duration {
+	base := hookWorkQueryRetryBaseDelay << (attempt - 1)
+	return base/2 + time.Duration(rand.Int63n(int64(base)/2+1))
+}
+
+// shellWorkQueryAttempt runs a single work-query subprocess attempt, bounded
+// by the lesser of hookWorkQueryTimeout and the parent's remaining deadline.
+func shellWorkQueryAttempt(parent context.Context, command, dir string, env []string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, hookWorkQueryTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.WaitDelay = 2 * time.Second
