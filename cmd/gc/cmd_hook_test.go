@@ -2651,3 +2651,188 @@ func TestFilterUnreadyHookCandidatesExcludesClosedBeadsFromReworkDrift(t *testin
 		t.Fatalf("filterUnreadyHookCandidates returned %d items for closed bead, want 0; got %q", len(items), got)
 	}
 }
+
+// stubHookWorkQueryRetrySleep replaces hookWorkQuerySleep with a no-op for the
+// duration of the test so retry/jitter tests don't actually sleep. Mirrors the
+// beads package's conditionalWriteSleep test seam.
+func stubHookWorkQueryRetrySleep(t *testing.T) {
+	t.Helper()
+	prev := hookWorkQuerySleep
+	hookWorkQuerySleep = func(time.Duration) {}
+	t.Cleanup(func() { hookWorkQuerySleep = prev })
+}
+
+// TestShellWorkQueryWithRetryDoesNotRetryOnTimeout guards the core safety
+// property of shellWorkQueryWithRetry (ga-t2brh8, daedalus-v2-audit candidate
+// 1): a hang that exhausts the full hookWorkQueryTimeout must be surfaced
+// immediately, never retried. Retrying an already-expensive full-timeout hang
+// would hold Dolt resources longer under the exact saturation this bead is
+// about.
+func TestShellWorkQueryWithRetryDoesNotRetryOnTimeout(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	oldTimeout := hookWorkQueryTimeout
+	hookWorkQueryTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { hookWorkQueryTimeout = oldTimeout })
+	stubHookWorkQueryRetrySleep(t)
+
+	counter := filepath.Join(t.TempDir(), "calls")
+	command := fmt.Sprintf(`echo x >> %q; sleep 5`, counter)
+
+	_, err := shellWorkQueryWithRetry(command, "", nil)
+	if err == nil {
+		t.Fatal("shellWorkQueryWithRetry(hang) err = nil, want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want errors.Is(err, context.DeadlineExceeded)", err)
+	}
+	if !dispatch.IsTransientControllerError(err) {
+		t.Fatalf("dispatch.IsTransientControllerError(%v) = false, want true", err)
+	}
+	data, _ := os.ReadFile(counter)
+	if calls := strings.Count(string(data), "x"); calls != 1 {
+		t.Fatalf("underlying attempts = %d, want exactly 1 (a hang must never retry)", calls)
+	}
+}
+
+// TestShellWorkQueryWithRetryRetriesFastFailureThenSucceeds guards the actual
+// value of the retry: a FAST failure (returns well inside hookWorkQueryTimeout,
+// e.g. a dropped connection) is cheap to retry and should succeed once the
+// transient condition clears.
+func TestShellWorkQueryWithRetryRetriesFastFailureThenSucceeds(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	stubHookWorkQueryRetrySleep(t)
+	oldMax := hookWorkQueryMaxAttempts
+	hookWorkQueryMaxAttempts = 5
+	t.Cleanup(func() { hookWorkQueryMaxAttempts = oldMax })
+
+	counter := filepath.Join(t.TempDir(), "calls")
+	command := fmt.Sprintf(`
+n=$(wc -l < %[1]q 2>/dev/null || echo 0)
+echo x >> %[1]q
+n=$((n+1))
+if [ "$n" -lt 3 ]; then
+  echo "connection reset by peer" >&2
+  exit 1
+fi
+printf '[]'
+`, counter)
+
+	out, err := shellWorkQueryWithRetry(command, "", nil)
+	if err != nil {
+		t.Fatalf("shellWorkQueryWithRetry() error = %v, want success by 3rd attempt", err)
+	}
+	if out != "[]" {
+		t.Fatalf("out = %q, want []", out)
+	}
+	data, _ := os.ReadFile(counter)
+	if calls := strings.Count(string(data), "x"); calls != 3 {
+		t.Fatalf("attempts = %d, want exactly 3", calls)
+	}
+}
+
+// TestShellWorkQueryWithRetryStopsAtMaxAttempts guards the bounded-attempt-
+// budget constraint: a persistently fast-failing query must stop at
+// hookWorkQueryMaxAttempts, not retry indefinitely.
+func TestShellWorkQueryWithRetryStopsAtMaxAttempts(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	stubHookWorkQueryRetrySleep(t)
+	oldMax := hookWorkQueryMaxAttempts
+	hookWorkQueryMaxAttempts = 3
+	t.Cleanup(func() { hookWorkQueryMaxAttempts = oldMax })
+
+	counter := filepath.Join(t.TempDir(), "calls")
+	command := fmt.Sprintf(`echo x >> %q; echo "connection reset by peer" >&2; exit 1`, counter)
+
+	_, err := shellWorkQueryWithRetry(command, "", nil)
+	if err == nil {
+		t.Fatal("shellWorkQueryWithRetry() error = nil, want persistent fast-failure error")
+	}
+	if !strings.Contains(err.Error(), "connection reset by peer") {
+		t.Fatalf("err = %v, want to contain final attempt's stderr", err)
+	}
+	if !dispatch.IsTransientControllerError(err) {
+		t.Fatalf("dispatch.IsTransientControllerError(%v) = false, want true (connection reset is a known transient needle)", err)
+	}
+	data, _ := os.ReadFile(counter)
+	if calls := strings.Count(string(data), "x"); calls != 3 {
+		t.Fatalf("attempts = %d, want exactly hookWorkQueryMaxAttempts=3", calls)
+	}
+}
+
+// TestShellWorkQueryWithRetryRespectsOverallDeadline guards the overall-
+// deadline-cap constraint: even with a large max-attempts budget, a
+// persistently fast-failing query must stop once hookWorkQueryOverallDeadline
+// elapses, not retry hookWorkQueryMaxAttempts times unconditionally. Uses real
+// (tiny) sleeps rather than the stubbed seam so the deadline race is genuine.
+func TestShellWorkQueryWithRetryRespectsOverallDeadline(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	oldDeadline := hookWorkQueryOverallDeadline
+	hookWorkQueryOverallDeadline = 30 * time.Millisecond
+	t.Cleanup(func() { hookWorkQueryOverallDeadline = oldDeadline })
+	oldBase := hookWorkQueryBackoffBase
+	hookWorkQueryBackoffBase = 20 * time.Millisecond
+	t.Cleanup(func() { hookWorkQueryBackoffBase = oldBase })
+	oldCap := hookWorkQueryBackoffCap
+	hookWorkQueryBackoffCap = 20 * time.Millisecond
+	t.Cleanup(func() { hookWorkQueryBackoffCap = oldCap })
+	oldMax := hookWorkQueryMaxAttempts
+	hookWorkQueryMaxAttempts = 1000
+	t.Cleanup(func() { hookWorkQueryMaxAttempts = oldMax })
+
+	counter := filepath.Join(t.TempDir(), "calls")
+	command := fmt.Sprintf(`echo x >> %q; echo "connection reset by peer" >&2; exit 1`, counter)
+
+	start := time.Now()
+	_, err := shellWorkQueryWithRetry(command, "", nil)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("shellWorkQueryWithRetry() error = nil, want persistent fast-failure error")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("shellWorkQueryWithRetry elapsed %s, want bounded near hookWorkQueryOverallDeadline", elapsed)
+	}
+	data, _ := os.ReadFile(counter)
+	if calls := strings.Count(string(data), "x"); calls >= 1000 {
+		t.Fatalf("attempts = %d, want well under hookWorkQueryMaxAttempts=1000 (overall deadline should cut it off first)", calls)
+	}
+}
+
+// TestDecorrelatedJitterBackoffStaysWithinBounds guards that every draw from
+// decorrelatedJitterBackoff falls within [base, maxDelay] regardless of prev.
+func TestDecorrelatedJitterBackoffStaysWithinBounds(t *testing.T) {
+	base := 100 * time.Millisecond
+	maxDelay := 2 * time.Second
+	prev := time.Duration(0)
+	for i := 0; i < 200; i++ {
+		next := decorrelatedJitterBackoff(prev, base, maxDelay)
+		if next < base {
+			t.Fatalf("iteration %d: next = %s, want >= base %s", i, next, base)
+		}
+		if next > maxDelay {
+			t.Fatalf("iteration %d: next = %s, want <= maxDelay %s", i, next, maxDelay)
+		}
+		prev = next
+	}
+}
+
+// TestDecorrelatedJitterBackoffCapsAtMaxDelay guards the cap: even when prev
+// is large enough to push random_between(base, prev*3) well past maxDelay,
+// every draw must clamp to maxDelay.
+func TestDecorrelatedJitterBackoffCapsAtMaxDelay(t *testing.T) {
+	base := 100 * time.Millisecond
+	maxDelay := 150 * time.Millisecond
+	prev := 10 * time.Second
+	for i := 0; i < 50; i++ {
+		if got := decorrelatedJitterBackoff(prev, base, maxDelay); got > maxDelay {
+			t.Fatalf("decorrelatedJitterBackoff(%s, %s, %s) = %s, want <= maxDelay", prev, base, maxDelay, got)
+		}
+	}
+}
