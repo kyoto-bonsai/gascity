@@ -126,6 +126,12 @@ const (
 	MissingRootBeadIDMetadataKey         = "gc.missing_root_bead_id"
 	ModelMetadataKey                     = "gc.model"
 	NextAttemptMetadataKey               = "gc.next_attempt"
+	// OfficerOfRecordMetadataKey pins the accountable department officer (or
+	// "operator") for a staff-persona-routed bead. Required by the gc sling
+	// hard gate (rigs/personas/ariadne-plan-persona-standards-2026-07-25.md
+	// phase_2_slinggate, ruling a) for any routing target not in the city's
+	// config.RoutingPolicy exempt set — see internal/sling checkOfficerOfRecord.
+	OfficerOfRecordMetadataKey           = "gc.officer_of_record"
 	OnExhaustedMetadataKey               = "gc.on_exhausted"
 	OnFailMetadataKey                    = "gc.on_fail"
 	OriginalKindMetadataKey              = "gc.original_kind"
@@ -367,6 +373,7 @@ var KnownMetadataKeys = []string{
 	MissingRootBeadIDMetadataKey,
 	ModelMetadataKey,
 	NextAttemptMetadataKey,
+	OfficerOfRecordMetadataKey,
 	OnExhaustedMetadataKey,
 	OnFailMetadataKey,
 	OriginalKindMetadataKey,
