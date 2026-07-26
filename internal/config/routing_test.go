@@ -24,6 +24,16 @@ func TestRoutingPolicyConfigConfigured(t *testing.T) {
 			RoutingPolicyConfig{RoutingExempt: []RoutingExemptGroup{}},
 			false,
 		},
+		{
+			"reports-to only",
+			RoutingPolicyConfig{ReportsTo: map[string]string{"persona-kieran": "persona-marcus"}},
+			true,
+		},
+		{
+			"empty reports-to map (declared but no entries)",
+			RoutingPolicyConfig{ReportsTo: map[string]string{}},
+			false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -65,5 +75,43 @@ func TestRoutingPolicyConfigExemptOnZeroValue(t *testing.T) {
 	var policy RoutingPolicyConfig
 	if policy.Exempt("persona-marcus") {
 		t.Error("zero-value RoutingPolicyConfig should exempt nobody")
+	}
+}
+
+func TestRoutingPolicyConfigDeriveOfficerOfRecord(t *testing.T) {
+	policy := RoutingPolicyConfig{
+		ReportsTo: map[string]string{
+			"persona-kieran": "persona-marcus",
+			"persona-cass":   "persona-dan",
+			"blank-entry":    "",
+		},
+	}
+
+	tests := []struct {
+		persona   string
+		wantValue string
+		wantOK    bool
+	}{
+		{"persona-kieran", "persona-marcus", true},
+		{"persona-cass", "persona-dan", true},
+		{"blank-entry", "", false},
+		{"persona-unmapped", "", false},
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.persona, func(t *testing.T) {
+			got, ok := policy.DeriveOfficerOfRecord(tt.persona)
+			if got != tt.wantValue || ok != tt.wantOK {
+				t.Errorf("DeriveOfficerOfRecord(%q) = (%q, %v), want (%q, %v)",
+					tt.persona, got, ok, tt.wantValue, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestRoutingPolicyConfigDeriveOfficerOfRecordOnZeroValue(t *testing.T) {
+	var policy RoutingPolicyConfig
+	if v, ok := policy.DeriveOfficerOfRecord("persona-kieran"); ok || v != "" {
+		t.Errorf("zero-value RoutingPolicyConfig should derive nothing, got (%q, %v)", v, ok)
 	}
 }
