@@ -4,8 +4,11 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 type partialSessionLister struct {
@@ -148,5 +151,75 @@ func TestPoolInstanceName(t *testing.T) {
 	}
 	if got := PoolInstanceName("polecat", 1, a3); got != "alpha" {
 		t.Errorf("namepool: got %q, want alpha", got)
+	}
+}
+
+// seedSessionBead creates a session bead with the BARE metadata keys
+// internal/session actually writes (template, session_name) — not the
+// beadmeta gc.-prefixed constants findSessionNameByTemplate used to read.
+// This is the real shape ga-8jgfy0 found production beads never matched.
+func seedSessionBead(t *testing.T, store beads.Store, template, sessionName string) beads.Bead {
+	t.Helper()
+	b, err := store.Create(beads.Bead{
+		Title:  "session for " + template,
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"template":     template,
+			"session_name": sessionName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("seeding session bead: %v", err)
+	}
+	return b
+}
+
+func TestFindSessionNameByTemplateMatchesRealSessionBead(t *testing.T) {
+	store := beads.NewMemStore()
+	seedSessionBead(t, store, "myrig/worker-1", "city--myrig--worker-1")
+
+	if got := findSessionNameByTemplate(store, "myrig/worker-1"); got != "city--myrig--worker-1" {
+		t.Errorf("got %q, want city--myrig--worker-1", got)
+	}
+}
+
+func TestFindSessionNameByTemplateNoMatchReturnsEmpty(t *testing.T) {
+	store := beads.NewMemStore()
+	seedSessionBead(t, store, "myrig/other-1", "city--myrig--other-1")
+
+	if got := findSessionNameByTemplate(store, "myrig/worker-1"); got != "" {
+		t.Errorf("got %q, want empty (no session bead for this template)", got)
+	}
+}
+
+func TestFindSessionNameByTemplateIgnoresClosedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	b := seedSessionBead(t, store, "myrig/worker-1", "city--myrig--worker-1-old")
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("closing session bead: %v", err)
+	}
+
+	if got := findSessionNameByTemplate(store, "myrig/worker-1"); got != "" {
+		t.Errorf("got %q, want empty (closed session must not be returned)", got)
+	}
+}
+
+func TestLookupSessionNamePrefersBeadDerivedName(t *testing.T) {
+	store := beads.NewMemStore()
+	seedSessionBead(t, store, "myrig/worker-1", "custom-bead-derived-name")
+
+	if got := LookupSessionName(store, "city", "myrig/worker-1", ""); got != "custom-bead-derived-name" {
+		t.Errorf("got %q, want custom-bead-derived-name", got)
+	}
+}
+
+func TestLookupSessionNameFallsBackToSynthesisWhenNoBeadFound(t *testing.T) {
+	store := beads.NewMemStore()
+
+	got := LookupSessionName(store, "city", "myrig/worker-1", "")
+	want := agent.SessionNameFor("city", "myrig/worker-1", "")
+	if got != want {
+		t.Errorf("got %q, want synthesis fallback %q", got, want)
 	}
 }

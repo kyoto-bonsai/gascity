@@ -5,9 +5,9 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/agent"
-	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // ScaleParams holds resolved scaling parameters for an agent.
@@ -44,23 +44,28 @@ func LookupSessionName(store beads.Store, cityName, qualifiedName, sessionTempla
 
 // findSessionNameByTemplate queries the store for a session bead
 // matching the qualified agent name and returns its session_name metadata.
+//
+// Uses session.ListAllSessionBeads rather than a hand-rolled Type/Label
+// query: session beads are written by internal/session with bare,
+// unprefixed metadata keys (template, session_name, ...), not the
+// beadmeta "gc."-namespaced constants, and carry the session.LabelSession
+// label ("gc:session", colon) rather than a literal dotted "gc.session".
+// A direct query against the wrong key or label silently matches zero
+// session beads.
 func findSessionNameByTemplate(store beads.Store, qualifiedName string) string {
 	if store == nil {
 		return ""
 	}
-	beadList, err := store.List(beads.ListQuery{
-		Type:   "session",
-		Label:  "gc.session",
-		Status: "open",
-	})
+	beadList, err := session.ListAllSessionBeads(store, beads.ListQuery{Status: "open"})
 	if err != nil {
 		return ""
 	}
 	for _, b := range beadList {
-		if b.Metadata[beadmeta.TemplateMetadataKey] == qualifiedName {
-			if sn := b.Metadata["session_name"]; sn != "" {
-				return sn
-			}
+		if b.Metadata["template"] != qualifiedName {
+			continue
+		}
+		if sn := b.Metadata["session_name"]; sn != "" {
+			return sn
 		}
 	}
 	return ""
