@@ -297,6 +297,11 @@ type City struct {
 	// notably allow_public grants). Authored only in the root city.toml; never
 	// merged from packs or fragments so a pack cannot grant itself exposure.
 	WebhookPolicy WebhookPolicyConfig `toml:"webhooks,omitempty"`
+	// RoutingPolicy holds city-level staff-routing governance (the [routing]
+	// table: officer-of-record exempt set + value domain). Authored only in
+	// the root city.toml; never merged from packs or fragments so a pack
+	// cannot grant itself a routing exemption. See RoutingPolicyConfig.
+	RoutingPolicy RoutingPolicyConfig `toml:"routing,omitempty"`
 	// GitHub configures GitHub-facing repository monitors.
 	GitHub GitHubConfig `toml:"github,omitempty"`
 	// ExtMsg configures the external-messaging fabric (default routes
