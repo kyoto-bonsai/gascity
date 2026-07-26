@@ -1503,15 +1503,54 @@ func TestProviderTerminalErrorReason(t *testing.T) {
 		{name: "codex model not found code", content: "model_not_found: gpt-5.3-codex-spark", want: "model_not_found"},
 		{name: "model not found text", content: "Error: model gpt-x was not found", want: "model_not_found"},
 		{name: "model and not-found on different lines is not terminal", content: "loading model weights\n... file path not found", want: ""},
-		{name: "quota exceeded", content: "Error: quota exceeded", want: "quota_exceeded"},
-		{name: "insufficient quota", content: "insufficient_quota: billing required", want: "quota_exceeded"},
-		{name: "disk quota is not provider quota", content: "disk quota exceeded while writing log", want: ""},
 		{name: "generic rate limit remains transient", content: "Rate limit reached\n1. Keep trying\n2. Stop", want: ""},
+		// quota exceeded / insufficient quota / credit exhaustion are NOT
+		// terminal as of ga-5gsyts — moved to ProviderResourceExhaustionReason
+		// below, since these are retryable resource limits, not a permanent
+		// config problem like a wrong model id. Kept here as explicit negative
+		// cases so a future edit can't silently re-merge the two classes.
+		{name: "quota exceeded is not terminal (moved to resource-exhaustion)", content: "Error: quota exceeded", want: ""},
+		{name: "insufficient quota is not terminal (moved to resource-exhaustion)", content: "insufficient_quota: billing required", want: ""},
+		{name: "credit balance is not terminal", content: "Your credit balance is too low to access the Claude API.", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := ProviderTerminalErrorReason(tt.content); got != tt.want {
 				t.Errorf("ProviderTerminalErrorReason(%q) = %q, want %q", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProviderResourceExhaustionReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "quota exceeded", content: "Error: quota exceeded", want: "quota_exceeded"},
+		{name: "insufficient quota", content: "insufficient_quota: billing required", want: "quota_exceeded"},
+		{name: "quota_exceeded code", content: "error.type=quota_exceeded", want: "quota_exceeded"},
+		{name: "disk quota is not provider quota", content: "disk quota exceeded while writing log", want: ""},
+		{
+			name:    "anthropic credit balance too low",
+			content: "API Error: Your credit balance is too low to access the Claude API. Please go to Plans & Billing to upgrade or purchase credits.",
+			want:    "credit_exhausted",
+		},
+		{name: "credit balance match is case-insensitive", content: "CREDIT BALANCE IS TOO LOW", want: "credit_exhausted"},
+		{
+			name:    "spend-limit modal is not credit exhaustion (already routes via rate-limit)",
+			content: "Usage credit balance\nAdjust monthly spend limit\nWait for limit to reset",
+			want:    "",
+		},
+		{name: "model not found is not resource exhaustion", content: "model_not_found: gpt-5.3-codex-spark", want: ""},
+		{name: "generic rate limit is not resource exhaustion", content: "Rate limit reached\n1. Keep trying\n2. Stop", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ProviderResourceExhaustionReason(tt.content); got != tt.want {
+				t.Errorf("ProviderResourceExhaustionReason(%q) = %q, want %q", tt.content, got, tt.want)
 			}
 		})
 	}
