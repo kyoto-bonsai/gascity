@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -663,6 +664,86 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 	}
 	if !strings.Contains(result.Message, "order history lookup timed out after 20ms") {
 		t.Fatalf("message = %q, want timeout diagnostic", result.Message)
+	}
+}
+
+// TestLatestOrderFiredAt_LastRunTimeout_ReturnsTailDataWithSentinelError pins
+// the ga-17ow3v follow-up: on a live city, c.lastRun (the Dolt/beads-store
+// fallback) can itself stall for well over a minute under known Dolt
+// contention (ga-t2brh8) even though the query it issues is already bounded
+// (Limit:1). A single stalled call must not block latestOrderFiredAt
+// indefinitely; it should return the tail-derived value plus a distinguishable
+// sentinel error so the caller can degrade gracefully instead of discarding
+// this (and every other) order's result.
+func TestLatestOrderFiredAt_LastRunTimeout_ReturnsTailDataWithSentinelError(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	expected := 4 * time.Hour
+	order := orders.Order{Name: "mol-dog-stale-db", Trigger: "cron"}
+	// Event age (13h) exceeds expected*1.5 (6h), so the fast path must not
+	// apply and the (stalled) fallback must be consulted.
+	staleEvent := now.Add(-13 * time.Hour)
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	check := &OrderFiringCurrentCheck{
+		lastRunTimeout: 20 * time.Millisecond,
+		lastRun: func(orders.Order) (time.Time, error) {
+			<-release // simulates a stalled Dolt/beads round trip (ga-t2brh8)
+			return now, nil
+		},
+	}
+
+	got, err := check.latestOrderFiredAt(
+		[]events.Event{{Type: events.OrderFired, Subject: order.ScopedName(), Ts: staleEvent}},
+		order, expected, now,
+	)
+	if !errors.Is(err, errOrderHistoryLookupTimedOut) {
+		t.Fatalf("err = %v, want errOrderHistoryLookupTimedOut", err)
+	}
+	if !got.Equal(staleEvent) {
+		t.Fatalf("latest = %v, want %v (tail-derived fallback value)", got, staleEvent)
+	}
+}
+
+// TestOrderFiringCurrent_LastRunTimeout_DegradesOneOrder_OthersUnaffected pins
+// the actual value of the per-order bound: before this fix, ANY one order's
+// stalled c.lastRun call blew the whole-check timeout and discarded every
+// other order's already-computed result (the exact "blinds the order-staleness
+// gate" symptom in ga-17ow3v's title). new-order has no tail history at all
+// (forcing the fallback attempt) while healthy-cooldown resolves entirely from
+// the in-memory tail and must never touch the stalled mock.
+func TestOrderFiringCurrent_LastRunTimeout_DegradesOneOrder_OthersUnaffected(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "new-order", "cooldown", "1h")
+	writeOrderFiringTestOrder(t, cityPath, "healthy-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-5 * time.Minute)},
+		events.Event{Type: events.OrderFired, Subject: "healthy-cooldown", Ts: now.Add(-10 * time.Minute)},
+	)
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+		<-release // simulates ga-t2brh8 Dolt contention
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	check.lastRunTimeout = 20 * time.Millisecond
+
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	details := strings.Join(result.Details, "\n")
+	if !strings.Contains(details, "confirmation timed out") {
+		t.Fatalf("details = %v, want a confirmation-timed-out note for new-order", result.Details)
+	}
+	if !strings.Contains(details, "healthy-cooldown: last fired 10m ago") {
+		t.Fatalf("details = %v, want healthy-cooldown resolved normally, unaffected by new-order's stalled lookup", result.Details)
+	}
+	// Tail data alone says new-order is still within its first cycle (clean
+	// OK), but confirmation timed out — must not be silently reported clean.
+	if result.Status != StatusWarning {
+		t.Fatalf("status = %v, want warning (degraded confirmation must stay visible, not silently OK); msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
 }
 
