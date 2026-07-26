@@ -522,6 +522,13 @@ func checkRateLimitStability(info sessionpkg.Info, cfg *config.City, alive bool,
 	for dec == sessionpkg.ExitGatherScreen {
 		facts.Screen = sessionpkg.ScreenOther
 		if content, err := peek(rateLimitPeekLines); err == nil {
+			if reason := runtime.ProviderResourceExhaustionReason(content); reason != "" {
+				next, quarantineErr := recordProviderResourceExhaustionQuarantine(info, sessFront, clk, reason)
+				if quarantineErr != nil {
+					return info, false, quarantineErr
+				}
+				return next, true, nil
+			}
 			if reason := runtime.ProviderTerminalErrorReason(content); reason != "" {
 				next, markErr := markProviderTerminalError(info, sessFront, clk, reason)
 				if markErr != nil {
@@ -592,6 +599,26 @@ func recordRateLimitQuarantine(info sessionpkg.Info, sessFront *sessionpkg.Store
 	next, err := sessFront.ApplyPatchInfo(info, batch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "recordRateLimitQuarantine: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck
+		return info, err
+	}
+	return next, nil
+}
+
+// recordProviderResourceExhaustionQuarantine backs off a session that exited
+// into a detected quota/credit exhaustion condition, same shape as
+// recordRateLimitQuarantine: not treated as a crash, conversation metadata
+// preserved (see ProviderResourceExhaustionQuarantinePatch's own doc — a
+// topped-up account should resume the same conversation, not restart from
+// zero, which is exactly what "seats died and were mass-replaced" cost
+// tonight's outage). reason is the specific detected condition
+// (quota_exceeded, credit_exhausted), recorded alongside the broad
+// sleep_reason class label.
+func recordProviderResourceExhaustionQuarantine(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Clock, reason string) (sessionpkg.Info, error) {
+	batch := sessionpkg.ProviderResourceExhaustionQuarantinePatch(
+		clk.Now().Add(defaultProviderResourceExhaustionQuarantineDuration), reason)
+	next, err := sessFront.ApplyPatchInfo(info, batch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "recordProviderResourceExhaustionQuarantine: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck
 		return info, err
 	}
 	return next, nil

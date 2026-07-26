@@ -30,11 +30,21 @@ const (
 	SleepReasonRateLimit             SleepReason = "rate_limit"
 	SleepReasonFailedCreate          SleepReason = "failed-create"
 	SleepReasonProviderTerminalError SleepReason = "provider-terminal-error"
-	SleepReasonRuntimeMissing        SleepReason = SleepReason(LifecycleReasonRuntimeMissing)
-	SleepReasonQuarantine            SleepReason = "quarantine"
-	SleepReasonContextChurn          SleepReason = "context-churn"
-	SleepReasonMaxSessionAge         SleepReason = "max-session-age"
-	SleepReasonAssignedWorkExhausted SleepReason = "assigned-work-exhausted"
+	// SleepReasonProviderResourceExhausted marks a temporary provider resource
+	// limit (API quota or account credit balance) — unlike
+	// SleepReasonProviderTerminalError, this is expected to self-resolve, so
+	// the session quarantines-and-retries (RateLimitQuarantinePatch-shaped
+	// metadata via quarantined_until) instead of being marked
+	// unhealthy/drainable. The specific detected reason (quota_exceeded,
+	// credit_exhausted — see runtime.ProviderResourceExhaustionReason) is
+	// recorded separately, mirroring provider_terminal_error's own
+	// class-label-plus-specific-reason split.
+	SleepReasonProviderResourceExhausted SleepReason = "provider-resource-exhausted"
+	SleepReasonRuntimeMissing            SleepReason = SleepReason(LifecycleReasonRuntimeMissing)
+	SleepReasonQuarantine                SleepReason = "quarantine"
+	SleepReasonContextChurn              SleepReason = "context-churn"
+	SleepReasonMaxSessionAge             SleepReason = "max-session-age"
+	SleepReasonAssignedWorkExhausted     SleepReason = "assigned-work-exhausted"
 )
 
 // IsDeliberateSleepReason reports whether a sleep_reason records an
@@ -54,7 +64,8 @@ func IsDeliberateSleepReason(reason string) bool {
 	case SleepReasonIdle, SleepReasonIdleTimeout, SleepReasonNoWakeReason,
 		SleepReasonConfigDrift, SleepReasonDrained, SleepReasonCityStop,
 		SleepReasonUserHold, SleepReasonWaitHold, SleepReasonRateLimit,
-		SleepReasonFailedCreate, SleepReasonProviderTerminalError:
+		SleepReasonFailedCreate, SleepReasonProviderTerminalError,
+		SleepReasonProviderResourceExhausted:
 		return true
 	default:
 		return false

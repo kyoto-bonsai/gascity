@@ -1333,7 +1333,11 @@ func containsClaudeSpendLimitModal(content string) bool {
 }
 
 // ProviderTerminalErrorReason classifies high-confidence provider errors that
-// require operator/config intervention rather than immediate retry.
+// require operator/config intervention rather than immediate retry — a
+// genuinely permanent condition (wrong model id, bad config) that will not
+// self-resolve, unlike a resource-exhaustion condition (see
+// ProviderResourceExhaustionReason) which typically clears on its own once
+// quota/credits refill.
 func ProviderTerminalErrorReason(content string) string {
 	lower := strings.ToLower(content)
 	switch {
@@ -1345,6 +1349,33 @@ func ProviderTerminalErrorReason(content string) string {
 		// landing on unrelated scrollback lines (which would permanently and
 		// wrongly mark the session terminal with no self-heal).
 		return "model_not_found"
+	default:
+		return ""
+	}
+}
+
+// ProviderResourceExhaustionReason classifies provider errors that reflect a
+// temporary resource limit — API quota or account credit balance — rather
+// than a permanent config problem. Unlike ProviderTerminalErrorReason, these
+// are expected to self-resolve (quota window rolls over, credits are topped
+// up) and the caller should quarantine-and-retry rather than mark the session
+// terminal/drainable. Moved here from ProviderTerminalErrorReason 2026-07-26
+// (ga-5gsyts): quota_exceeded was previously misclassified as terminal, which
+// is the root cause the operator traced tonight's "seats died and were
+// mass-replaced" outage back to — a quota/credit condition is not the same
+// class of failure as a wrong model id.
+//
+// creditExhausted matches Anthropic's actual credit-balance API error text
+// ("Your credit balance is too low to access the Claude API...") — distinct
+// from containsClaudeSpendLimitModal's self-imposed monthly spend-limit
+// modal (a configured cap the operator can raise, already routed through the
+// rate-limit retry path); this is the account having no purchased credits
+// left to spend at all.
+func ProviderResourceExhaustionReason(content string) string {
+	lower := strings.ToLower(content)
+	switch {
+	case strings.Contains(lower, "credit balance is too low"):
+		return "credit_exhausted"
 	case strings.Contains(lower, "insufficient_quota"):
 		return "quota_exceeded"
 	case strings.Contains(lower, "quota_exceeded"):

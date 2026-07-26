@@ -307,6 +307,27 @@ func TestRateLimitQuarantinePatch(t *testing.T) {
 	})
 }
 
+func TestProviderResourceExhaustionQuarantinePatch(t *testing.T) {
+	until := time.Date(2026, 3, 8, 13, 0, 0, 0, time.UTC)
+	assertPatch(t, ProviderResourceExhaustionQuarantinePatch(until, "credit_exhausted"), MetadataPatch{
+		"state":                               string(StateAsleep),
+		"quarantined_until":                   "2026-03-08T13:00:00Z",
+		"sleep_reason":                        "provider-resource-exhausted",
+		"provider_resource_exhaustion_reason": "credit_exhausted",
+		"last_woke_at":                        "",
+		"pending_create_claim":                "",
+		"pending_create_started_at":           "",
+	})
+}
+
+func TestProviderResourceExhaustionQuarantinePatchTrimsReason(t *testing.T) {
+	until := time.Date(2026, 3, 8, 13, 0, 0, 0, time.UTC)
+	patch := ProviderResourceExhaustionQuarantinePatch(until, "  quota_exceeded  ")
+	if got := patch["provider_resource_exhaustion_reason"]; got != "quota_exceeded" {
+		t.Errorf("provider_resource_exhaustion_reason = %q, want trimmed %q", got, "quota_exceeded")
+	}
+}
+
 func assertPatch(t *testing.T, got, want MetadataPatch) {
 	t.Helper()
 	if len(got) != len(want) {
