@@ -8985,3 +8985,197 @@ func TestCmdSlingMultiDefaultTargetsEmptyEntryRejected(t *testing.T) {
 		t.Errorf("stderr = %q, want to mention 'empty entry'", stderr.String())
 	}
 }
+
+// --- Wake-on-dispatch default tests (doctrine R3, ga-ih41e3) ---
+//
+// gc sling previously left a parked/asleep target sitting on newly-routed
+// work until a human or orchestrator noticed and ran `gc session nudge` by
+// hand (the only production caller of the session package's asleep->awake
+// wake transition was, until this fix, gated behind an opt-in --nudge flag
+// nobody passed by default). These tests prove wake-on-dispatch is now the
+// default and --no-nudge is the opt-out, without touching internal/sling's
+// own already-exhaustive SlingOpts.Nudge test coverage.
+
+func TestEffectiveSlingNudge(t *testing.T) {
+	cases := []struct {
+		nudge, noNudge, want bool
+	}{
+		{false, false, true}, // no flags: wake-on-dispatch is the default
+		{true, false, true},  // --nudge: redundant with the default, still true
+		{false, true, false}, // --no-nudge: explicit opt-out
+	}
+	for _, tc := range cases {
+		if got := effectiveSlingNudge(tc.nudge, tc.noNudge); got != tc.want {
+			t.Errorf("effectiveSlingNudge(%v, %v) = %v, want %v", tc.nudge, tc.noNudge, got, tc.want)
+		}
+	}
+}
+
+func TestNoNudgeFlagExists(t *testing.T) {
+	cmd := newSlingCmd(&bytes.Buffer{}, &bytes.Buffer{})
+	if cmd.Flags().Lookup("no-nudge") == nil {
+		t.Fatal("missing --no-nudge flag")
+	}
+}
+
+// Mirrors TestRunReportsMutuallyExclusiveFlagViolations's pattern for the new
+// --nudge/--no-nudge pair.
+func TestNudgeAndNoNudgeMutuallyExclusive(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"sling", "target", "bd-1", "--nudge", "--no-nudge"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("run returned 0; expected non-zero. stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "nudge") || !strings.Contains(stderr.String(), "no-nudge") {
+		t.Fatalf("stderr did not name the conflicting flags; got %q", stderr.String())
+	}
+}
+
+// setupCmdSlingSingleFixedAgentFixture creates a city with one fixed
+// (non-pool) worker agent in the "foundations" rig and pre-seeds the bead
+// fo-1 in the rig store. Mirrors setupCmdSlingMultiDefaultTargetsFixture but
+// with an explicit single target, for tests that sling by name rather than
+// relying on default_sling_targets.
+func setupCmdSlingSingleFixedAgentFixture(t *testing.T) (cityDir, rigDir string) {
+	t.Helper()
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir = t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_CITY_ROOT", "")
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
+	rigDir = filepath.Join(cityDir, "foundations")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(rig): %v", err)
+	}
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatalf("ensureScopedFileStoreLayout: %v", err)
+	}
+	for _, dir := range []string{cityDir, rigDir} {
+		if err := ensurePersistedScopeLocalFileStore(dir); err != nil {
+			t.Fatalf("ensurePersistedScopeLocalFileStore(%s): %v", dir, err)
+		}
+	}
+	writeTestFileStoreBeads(t, rigDir, []beads.Bead{{
+		ID:       "fo-1",
+		Title:    "wake-on-dispatch test bead",
+		Type:     "task",
+		Status:   "open",
+		Metadata: map[string]string{},
+	}})
+
+	cityToml := `[workspace]
+name = "demo"
+
+[[rigs]]
+name = "foundations"
+path = "foundations"
+prefix = "fo"
+
+[[agent]]
+name = "worker-a"
+dir = "foundations"
+max_active_sessions = 1
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Chdir(cityDir)
+	return cityDir, rigDir
+}
+
+// TestCmdSlingDefaultAttemptsNudgeWithoutFlag proves the actual defect this
+// bead (ga-ih41e3, doctrine R3 "wake-on-dispatch") fixes: a plain, flagless
+// `gc sling <target> <bead>` now attempts to wake the target -- the same
+// queued-nudge outcome TestDoSlingNudgeFixedAgent/TestDoSlingNudgeNoSession
+// already prove for an explicit opts.Nudge=true, reached here through no
+// --nudge flag at all.
+func TestCmdSlingDefaultAttemptsNudgeWithoutFlag(t *testing.T) {
+	cityDir, rigDir := setupCmdSlingSingleFixedAgentFixture(t)
+
+	prevPoller := startNudgePoller
+	startNudgePoller = func(_, _, _ string) error { return nil }
+	t.Cleanup(func() { startNudgePoller = prevPoller })
+
+	var stdout, stderr bytes.Buffer
+	noNudgeFlagNotPassed := false
+	nudgeFlagNotPassed := false
+	code := cmdSling(
+		[]string{"foundations/worker-a", "fo-1"},
+		false, effectiveSlingNudge(nudgeFlagNotPassed, noNudgeFlagNotPassed), false,
+		"", nil, "",
+		false, false, false, "",
+		false, false, false,
+		"", "",
+		&stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	rigStore, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	routed, err := rigStore.Get("fo-1")
+	if err != nil {
+		t.Fatalf("rigStore.Get(fo-1): %v", err)
+	}
+	if routed.Metadata["gc.routed_to"] != "foundations/worker-a" {
+		t.Fatalf("gc.routed_to = %q, want foundations/worker-a", routed.Metadata["gc.routed_to"])
+	}
+
+	t.Logf("DIAGNOSTIC stdout=%q stderr=%q", stdout.String(), stderr.String())
+	pending, _, dead, err := listQueuedNudges(cityDir, "foundations/worker-a", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 1 || len(dead) != 0 {
+		t.Fatalf("pending=%d dead=%d, want 1/0 -- default sling should wake the target without --nudge", len(pending), len(dead))
+	}
+}
+
+// TestCmdSlingNoNudgeSuppressesWake proves --no-nudge opts back out of the
+// new default, preserving the old route-only behavior for callers that want
+// it (e.g. a batch caller nudging once at the end itself).
+func TestCmdSlingNoNudgeSuppressesWake(t *testing.T) {
+	cityDir, rigDir := setupCmdSlingSingleFixedAgentFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	noNudgeFlagPassed := true
+	code := cmdSling(
+		[]string{"foundations/worker-a", "fo-1"},
+		false, effectiveSlingNudge(false, noNudgeFlagPassed), false,
+		"", nil, "",
+		false, false, false, "",
+		false, false, false,
+		"", "",
+		&stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	rigStore, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	routed, err := rigStore.Get("fo-1")
+	if err != nil {
+		t.Fatalf("rigStore.Get(fo-1): %v", err)
+	}
+	if routed.Metadata["gc.routed_to"] != "foundations/worker-a" {
+		t.Fatalf("gc.routed_to = %q, want foundations/worker-a (routing must still happen)", routed.Metadata["gc.routed_to"])
+	}
+
+	pending, _, _, err := listQueuedNudges(cityDir, "foundations/worker-a", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending=%d, want 0 -- --no-nudge must suppress the wake attempt", len(pending))
+	}
+}
