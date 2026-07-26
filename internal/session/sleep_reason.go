@@ -40,10 +40,18 @@ const (
 	// recorded separately, mirroring provider_terminal_error's own
 	// class-label-plus-specific-reason split.
 	SleepReasonProviderResourceExhausted SleepReason = "provider-resource-exhausted"
-	SleepReasonRuntimeMissing            SleepReason = SleepReason(LifecycleReasonRuntimeMissing)
-	SleepReasonQuarantine                SleepReason = "quarantine"
-	SleepReasonContextChurn              SleepReason = "context-churn"
-	SleepReasonMaxSessionAge             SleepReason = "max-session-age"
+	// SleepReasonLoginExpired marks a detected login/auth-expiry prompt
+	// (runtime.ContainsLoginExpiredDialog) — kept distinct from
+	// SleepReasonProviderResourceExhausted (a different failure class: no
+	// credentials, not "the account ran out of quota/credits") specifically so
+	// S-metrics can track match quality/false-positive rate per the operator's
+	// ruling on ga-5gsyts, ahead of a real captured transcript to validate
+	// against. Same quarantine-and-retry shape as the other two.
+	SleepReasonLoginExpired   SleepReason = "login_expired"
+	SleepReasonRuntimeMissing SleepReason = SleepReason(LifecycleReasonRuntimeMissing)
+	SleepReasonQuarantine     SleepReason = "quarantine"
+	SleepReasonContextChurn   SleepReason = "context-churn"
+	SleepReasonMaxSessionAge  SleepReason = "max-session-age"
 )
 
 // IsDeliberateSleepReason reports whether a sleep_reason records an
@@ -64,7 +72,7 @@ func IsDeliberateSleepReason(reason string) bool {
 		SleepReasonConfigDrift, SleepReasonDrained, SleepReasonCityStop,
 		SleepReasonUserHold, SleepReasonWaitHold, SleepReasonRateLimit,
 		SleepReasonFailedCreate, SleepReasonProviderTerminalError,
-		SleepReasonProviderResourceExhausted:
+		SleepReasonProviderResourceExhausted, SleepReasonLoginExpired:
 		return true
 	default:
 		return false

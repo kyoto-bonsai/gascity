@@ -381,7 +381,7 @@ func lifecycleDisplayReasonFromView(view LifecycleView, metadata map[string]stri
 	}
 	if raw := strings.TrimSpace(metadata["sleep_reason"]); raw != "" {
 		reason := SleepReason(raw)
-		staleTimedQuarantine := (reason == SleepReasonQuarantine || reason == SleepReasonContextChurn || reason == SleepReasonRateLimit || reason == SleepReasonProviderResourceExhausted) &&
+		staleTimedQuarantine := (reason == SleepReasonQuarantine || reason == SleepReasonContextChurn || reason == SleepReasonRateLimit || reason == SleepReasonProviderResourceExhausted || reason == SleepReasonLoginExpired) &&
 			strings.TrimSpace(metadata["quarantined_until"]) != "" &&
 			!view.HasBlocker(BlockerQuarantined)
 		staleTimedHold := reason == SleepReasonUserHold &&
@@ -420,7 +420,7 @@ func lifecycleDisplayReasonFromViewInfo(view LifecycleView, info Info) string {
 	}
 	if raw := strings.TrimSpace(info.SleepReason); raw != "" {
 		reason := SleepReason(raw)
-		staleTimedQuarantine := (reason == SleepReasonQuarantine || reason == SleepReasonContextChurn || reason == SleepReasonRateLimit || reason == SleepReasonProviderResourceExhausted) &&
+		staleTimedQuarantine := (reason == SleepReasonQuarantine || reason == SleepReasonContextChurn || reason == SleepReasonRateLimit || reason == SleepReasonProviderResourceExhausted || reason == SleepReasonLoginExpired) &&
 			strings.TrimSpace(info.QuarantinedUntil) != "" &&
 			!view.HasBlocker(BlockerQuarantined)
 		staleTimedHold := reason == SleepReasonUserHold &&
@@ -811,7 +811,7 @@ func shouldResetContinuation(base BaseState, input LifecycleInput, sleepReason s
 	case SleepReasonIdle, SleepReasonIdleTimeout, SleepReasonNoWakeReason,
 		SleepReasonConfigDrift, SleepReasonDrained, SleepReasonCityStop,
 		SleepReasonUserHold, SleepReasonWaitHold, SleepReasonRateLimit,
-		SleepReasonRuntimeMissing, SleepReasonProviderResourceExhausted:
+		SleepReasonRuntimeMissing, SleepReasonProviderResourceExhausted, SleepReasonLoginExpired:
 		return false
 	}
 	return base == BaseStateActive || base == BaseStateCreating
