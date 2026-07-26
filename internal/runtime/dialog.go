@@ -1384,6 +1384,48 @@ func ProviderResourceExhaustionReason(content string) string {
 	}
 }
 
+// loginExpiredDialogPatterns are the known pane-content shapes for a login/
+// auth-expiry prompt. A plain var, not inlined into ContainsLoginExpiredDialog,
+// so it is trivially extended when a real transcript is captured — per the
+// operator's ruling on ga-5gsyts, fix 4's heartbeat + FROZEN tier is expected
+// to surface the next real occurrence; append the exact matched text here
+// then, rather than reworking the detector.
+//
+// Shipped best-effort WITHOUT a captured transcript (operator ruling
+// 2026-07-26, ga-5gsyts) — the forensic search came up empty (the one
+// candidate incident, ga-6ud310, turned out to be an unrelated orphaned bead,
+// not a frozen pane). Safe to ship best-effort because of the failure
+// asymmetry: a false-positive match only pauses a seat into quarantine
+// (resumable, visible on the dashboard, self-clears on the quarantine
+// timer); a false negative is today's status quo (the session dies and its
+// replacement restarts from zero). Neither direction is worse than not
+// shipping this at all.
+var loginExpiredDialogPatterns = []string{
+	"/login",
+	"session expired",
+	"please log in",
+	"please run /login",
+	"authentication expired",
+	"re-authenticate to continue",
+	"oauth token expired",
+	"oauth token refresh failed",
+	"failed to refresh token",
+	"failed to refresh access token",
+}
+
+// ContainsLoginExpiredDialog reports whether pane content shows a login/auth
+// expiry prompt. See loginExpiredDialogPatterns' doc for the best-effort
+// rationale and how to extend it once a real transcript is captured.
+func ContainsLoginExpiredDialog(content string) bool {
+	lower := strings.ToLower(content)
+	for _, pattern := range loginExpiredDialogPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // lineContainsAll reports whether any single line of content contains every
 // substring in subs. It bounds loose multi-token matches to one line so the
 // tokens must co-occur in the same message rather than anywhere in scrollback.
