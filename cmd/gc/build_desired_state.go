@@ -2667,6 +2667,7 @@ func realizePoolDesiredSessions(
 				switch {
 				case errors.Is(err, errPoolSessionCreateBudgetExhausted):
 					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (fresh create deferred)\n", qualifiedName, err) //nolint:errcheck
+					recordPoolCreateBudgetExhaustion(bp.cityPath, qualifiedName, bp.beaconTime, stderr)
 				case errors.Is(err, errPoolSessionCreatePartial):
 					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (partial demand read, fresh create blocked)\n", qualifiedName, err) //nolint:errcheck
 				case errors.Is(err, errPoolSessionCreateProviderRed):

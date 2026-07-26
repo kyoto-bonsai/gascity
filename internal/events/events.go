@@ -223,6 +223,16 @@ const (
 	// the next episode fires independently. (ADR-0013 A1 M3a)
 	ProviderHealthGateAlert = "provider.health_gate_alert"
 
+	// PoolCreateBudgetGateAlert fires when the reconciler's shared pool
+	// session-create budget (poolplan.CreateBudget, sized by
+	// daemon.max_wakes_per_tick) is exhausted and a fresh pool session create
+	// is deferred. Debounced to at most one alert per cooldown window per
+	// pool template (see pool_create_budget_gate.go) so a sustained
+	// exhaustion does not spam the event log. Before this event existed, the
+	// condition was logged to stderr only — no bead, event, or other
+	// operator-visible signal (ga-stpvzg).
+	PoolCreateBudgetGateAlert = "pool.create_budget_gate_alert"
+
 	// Emergency events are dolt-independent escalation records written to
 	// .gc/emergency and mirrored into the city event log.
 	EmergencySignaled = "emergency.signaled"
@@ -288,6 +298,10 @@ var KnownEventTypes = []string{
 	// yet registered in internal/api (the payload registration lives in a
 	// follow-up that adds the full SSE projection). Until then, subscribers
 	// receive it via the custom-event envelope.
+	//
+	// PoolCreateBudgetGateAlert is intentionally omitted for the same reason:
+	// its typed SSE payload is not yet registered in internal/api. Subscribers
+	// receive it via the custom-event envelope until that follow-up lands.
 }
 
 // Event is a single recorded occurrence in the system.
