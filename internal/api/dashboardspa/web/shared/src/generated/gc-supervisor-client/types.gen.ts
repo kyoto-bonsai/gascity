@@ -2398,6 +2398,7 @@ export type ProviderPatch = {
         [key: string]: string;
     };
     EnvRemove: Array<string> | null;
+    MaxSeats: number | null;
     Name: string;
     OptionsSchemaMerge: string | null;
     PromptFlag: string | null;

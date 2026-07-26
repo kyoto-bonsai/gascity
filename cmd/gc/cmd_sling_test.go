@@ -865,6 +865,114 @@ func TestDoSlingSuspendedAgentForce(t *testing.T) {
 	}
 }
 
+// officerOfRecordTestCfg returns a City with [routing] configured (one
+// exempt group naming persona-marcus) — the "gate is opt-in, and this city
+// has opted in" fixture shared by the officer-of-record tests below.
+func officerOfRecordTestCfg() *config.City {
+	return &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		RoutingPolicy: config.RoutingPolicyConfig{
+			RoutingExempt: []config.RoutingExemptGroup{
+				{Name: "officers", Personas: []string{"persona-marcus"}},
+			},
+		},
+	}
+}
+
+func TestDoSlingRefusesMissingOfficerOfRecord(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(officerOfRecordTestCfg(), sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling returned 0, want non-zero (refused for missing officer_of_record)")
+	}
+	if !strings.Contains(stderr.String(), "gc.officer_of_record") {
+		t.Errorf("stderr = %q, want officer_of_record refusal", stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("got %d runner calls, want 0 — should refuse before dispatch", len(runner.calls))
+	}
+}
+
+func TestDoSlingRoutesWithOfficerOfRecord(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(officerOfRecordTestCfg(), sp, runner.run)
+	created, err := deps.Store.Create(beads.Bead{
+		Title: "has officer of record", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding bead: %v", err)
+	}
+	opts := testOpts(a, created.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 — officer_of_record is set: stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, created.ID, "worker")
+}
+
+func TestDoSlingOfficerOfRecordForceDoesNotBypass(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(officerOfRecordTestCfg(), sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	opts.Force = true
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling with --force returned 0, want non-zero — no bypass for officer_of_record (ruling a)")
+	}
+	if !strings.Contains(stderr.String(), "no --force override") {
+		t.Errorf("stderr = %q, want explicit no-force-override message", stderr.String())
+	}
+}
+
+func TestDoSlingOfficerOfRecordExemptTargetRoutesWithoutIt(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "persona-marcus", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(officerOfRecordTestCfg(), sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling to exempt target returned %d, want 0: stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "persona-marcus")
+}
+
+func TestDoSlingOfficerOfRecordNoopWhenPolicyUnconfigured(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	// No RoutingPolicy set at all — the zero-value default every OTHER test
+	// in this file uses. The gate must no-op here: a city (or a test fixture)
+	// that never authored [routing] in city.toml sees unchanged behavior.
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling with unconfigured RoutingPolicy returned %d, want 0 (opt-in gate must no-op): stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "worker")
+}
+
 func TestDoSlingSuspendedRigWarns(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

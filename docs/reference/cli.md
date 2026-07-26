@@ -4130,6 +4130,7 @@ gc session new helper --no-attach
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--alias` | string |  | human-friendly session identifier for commands and mail |
+| `--force-degraded` | bool |  | bypass the spawn preflight gate (stale supervisor binary / aged pending-creates) — use only when you understand the risk |
 | `--json` | bool |  | JSON output |
 | `--no-attach` | bool |  | create session without attaching |
 | `--title` | string |  | human-readable session title |
@@ -4461,6 +4462,7 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 |------|------|---------|-------------|
 | `-n`, `--dry-run` | bool |  | show what would be done without executing |
 | `--force` | bool |  | suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store |
+| `--force-degraded` | bool |  | bypass the spawn preflight gate (stale supervisor binary / aged pending-creates) — use only when you understand the risk |
 | `-f`, `--formula` | bool |  | treat argument as formula name |
 | `--json` | bool |  | Output dispatch result in JSON format |
 | `--merge` | string |  | merge strategy: direct, mr, or local |

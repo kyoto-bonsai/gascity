@@ -1190,6 +1190,7 @@ export const zProviderPatch = z.object({
     Command: z.string().nullable(),
     Env: z.record(z.string(), z.string()),
     EnvRemove: z.array(z.string()).nullable(),
+    MaxSeats: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }).nullable(),
     Name: z.string(),
     OptionsSchemaMerge: z.string().nullable(),
     PromptFlag: z.string().nullable(),

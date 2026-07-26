@@ -2993,6 +2993,7 @@ type ProviderPatch struct {
 	Command              *string           `json:"Command"`
 	Env                  map[string]string `json:"Env"`
 	EnvRemove            *[]string         `json:"EnvRemove"`
+	MaxSeats             *int64            `json:"MaxSeats"`
 	Name                 string            `json:"Name"`
 	OptionsSchemaMerge   *string           `json:"OptionsSchemaMerge"`
 	PromptFlag           *string           `json:"PromptFlag"`
