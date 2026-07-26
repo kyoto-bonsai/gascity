@@ -58,6 +58,7 @@ type BeadChildQuerier = sling.BeadChildQuerier
 func newSlingCmd(stdout, stderr io.Writer) *cobra.Command {
 	var formula bool
 	var nudge bool
+	var noNudge bool
 	var force bool
 	var title string
 	var vars []string
@@ -98,6 +99,12 @@ unless the compiled root is Ready-visible — a v2 workflow root or a
 root-only wisp. See docs/reference/specs/formula-spec-v2.md for the formula
 format and contract details.
 
+Wake-on-dispatch is the default: after routing, the target is nudged
+automatically so a parked/asleep session claims the work without waiting for
+a human or orchestrator to notice and nudge it by hand. Use --no-nudge to
+route only (the old default), e.g. for a batch caller that nudges once at
+the end itself.
+
 Examples:
   gc sling my-rig/claude BL-42              # route existing bead
   gc sling my-rig/claude "write a README"   # create bead from text, then route
@@ -131,18 +138,20 @@ Examples:
 			if scopeKind != "" && scopeKind != "city" && scopeKind != "rig" {
 				return argError("gc sling: --scope-kind must be city or rig")
 			}
+			effectiveNudge := effectiveSlingNudge(nudge, noNudge)
 			code := 0
 			if jsonOutput {
-				code = cmdSlingWithJSON(args, formula, nudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, true, stdout, stderr, forceDegraded)
+				code = cmdSlingWithJSON(args, formula, effectiveNudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, true, stdout, stderr, forceDegraded)
 			} else {
-				code = cmdSling(args, formula, nudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, stdout, stderr, forceDegraded)
+				code = cmdSling(args, formula, effectiveNudge, force, title, vars, merge, noConvoy, owned, reassign, onFormula, noFormula, fromStdin, dryRun, scopeKind, scopeRef, stdout, stderr, forceDegraded)
 			}
 			return exitForCode(code)
 		},
 	}
 	cmd.Flags().BoolVar(&forceDegraded, "force-degraded", false, "bypass the spawn preflight gate (stale supervisor binary / aged pending-creates) — use only when you understand the risk")
 	cmd.Flags().BoolVarP(&formula, "formula", "f", false, "treat argument as formula name")
-	cmd.Flags().BoolVar(&nudge, "nudge", false, "nudge target after routing")
+	cmd.Flags().BoolVar(&nudge, "nudge", false, "nudge target after routing (default behavior; kept for back-compat, see --no-nudge)")
+	cmd.Flags().BoolVar(&noNudge, "no-nudge", false, "skip the automatic wake-nudge after routing (opt out of wake-on-dispatch)")
 	cmd.Flags().BoolVar(&force, "force", false, "suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store")
 	cmd.Flags().StringVarP(&title, "title", "t", "", "wisp root bead title (with --formula or --on)")
 	cmd.Flags().StringArrayVar(&vars, "var", nil, "variable substitution for formula (key=value, repeatable)")
@@ -157,6 +166,7 @@ Examples:
 	cmd.Flags().StringVar(&scopeKind, "scope-kind", "", "logical workflow scope kind for formulas v2 launches")
 	cmd.Flags().StringVar(&scopeRef, "scope-ref", "", "logical workflow scope ref for formulas v2 launches")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output dispatch result in JSON format")
+	cmd.MarkFlagsMutuallyExclusive("nudge", "no-nudge")
 	cmd.MarkFlagsMutuallyExclusive("formula", "on")
 	cmd.MarkFlagsMutuallyExclusive("no-formula", "formula")
 	cmd.MarkFlagsMutuallyExclusive("no-formula", "on")
@@ -164,6 +174,22 @@ Examples:
 	_ = cmd.Flags().SetAnnotation("scope-kind", cobra.BashCompOneRequiredFlag, []string{"scope-ref"})
 	_ = cmd.Flags().SetAnnotation("scope-ref", cobra.BashCompOneRequiredFlag, []string{"scope-kind"})
 	return cmd
+}
+
+// effectiveSlingNudge computes whether `gc sling` should attempt to wake/
+// nudge the target after routing. Wake-on-dispatch is the default
+// (doctrine/plan-execution-parallelism R3): a parked/asleep target must not
+// sit on slung work waiting for a human or orchestrator to notice and nudge
+// it by hand. --no-nudge is the explicit opt-out for callers that
+// deliberately want the old route-only behavior (e.g. a batch convoy
+// expansion that nudges once at the end itself). --nudge is accepted for
+// back-compat with existing callers and muscle memory; --nudge and
+// --no-nudge are mutually exclusive (cmd.MarkFlagsMutuallyExclusive above),
+// so nudge's value never actually needs consulting here, but it is threaded
+// through for clarity and as a defensive no-op if that constraint ever
+// loosens.
+func effectiveSlingNudge(nudge, noNudge bool) bool {
+	return nudge || !noNudge
 }
 
 // slingOpts is an alias for sling.SlingOpts.
