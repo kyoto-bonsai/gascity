@@ -19,6 +19,15 @@ const (
 	orderFiringCurrentName    = "order-firing-current"
 	orderFiringInspectHintFmt = "Inspect with: gc order check && gc order history %s"
 	orderFiringHistoryTimeout = 15 * time.Second
+	// orderFiringEventTailLimit bounds the order.fired scan to the most
+	// recent N matching events instead of the full history (ga-17ow3v: on a
+	// live city this file plus its rotated archives can exceed 350MB and
+	// 40k+ matching lines, which reliably blew the 15s budget below). The
+	// tail read only ever opens the active file, never the gzip archives.
+	// Any order whose true last-fired time falls outside this window still
+	// gets a correct answer via the c.lastRun fallback in latestOrderFiredAt
+	// — this limit only bounds the fast path, not correctness.
+	orderFiringEventTailLimit = 20000
 )
 
 // OrderFiringCurrentLastRunFunc reports the newest persisted run time for an order.
@@ -121,7 +130,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	}
 
 	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
-	firedEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderFired})
+	firedEvents, err := events.ReadFilteredTail(eventPath, events.Filter{Type: events.OrderFired}, orderFiringEventTailLimit)
 	if err != nil {
 		result.Status = StatusError
 		result.Message = fmt.Sprintf("read order firing events: %v", err)
@@ -550,7 +559,10 @@ func cronRangeForDoctor(rangePart string, lowerBound, upperBound int) (int, int,
 }
 
 func latestControllerStartedAt(eventPath string) (time.Time, error) {
-	startEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.ControllerStarted})
+	// Only the single newest controller.started event matters here, so a
+	// tail read of 1 is sufficient — see orderFiringEventTailLimit above for
+	// why an unbounded scan of this file is worth avoiding.
+	startEvents, err := events.ReadFilteredTail(eventPath, events.Filter{Type: events.ControllerStarted}, 1)
 	if err != nil {
 		return time.Time{}, err
 	}
