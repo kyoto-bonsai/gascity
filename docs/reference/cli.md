@@ -2519,10 +2519,10 @@ gc mail read <id> [flags]
 Reply to a message. The reply is addressed to the original sender.
 
 Inherits the thread ID from the original message for conversation tracking.
-Use --notify to request a recipient turn after replying. In a managed city,
-it can request a wake for a non-running recipient.
-Unread mail alone does not request a wake.
-Use -s/--subject for the reply subject and -m/--message for the reply body.
+If the recipient is a currently-live session, it is nudged automatically --
+no flag required. Use -s/--subject for the reply subject and -m/--message
+for the reply body. --notify/--nudge are accepted for backward compatibility
+and have no additional effect.
 
 ```
 gc mail reply <id> [-s subject] [-m body] [flags]
@@ -2532,7 +2532,7 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | reply body text |
-| `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
+| `--notify` | bool |  | no-op, kept for backward compatibility -- live recipients are nudged automatically |
 | `-s`, `--subject` | string |  | reply subject line |
 
 ## gc mail send
@@ -2540,13 +2540,13 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to request
-a recipient turn after sending. In a managed city, it can request a wake for
-a non-running recipient. Unread mail alone does not request a wake.
-Use --from to override the sender identity.
-Use --to as an alternative to the positional &lt;to&gt; argument.
-Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". If the recipient is a
+currently-live session, it is nudged automatically -- no flag required.
+Use --from to override the sender identity. Use --to as an alternative to
+the positional &lt;to&gt; argument. Use -s/--subject for the summary line and
+-m/--message for the body text. Use --all to broadcast to all live sessions
+(excluding sender and "human"). --notify/--nudge are accepted for backward
+compatibility and have no additional effect.
 
 ```
 gc mail send [<to>] [<body>] [flags]
@@ -2560,7 +2560,6 @@ gc mail send mayor -s "Build is green"
 gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
 gc mail send --to mayor "Build is green"
 gc mail send human "Review needed for PR #42"
-gc mail send polecat "Priority task" --notify
 gc mail send --all "Status update: tests passing"
 ```
 
@@ -2570,7 +2569,7 @@ gc mail send --all "Status update: tests passing"
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
-| `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
+| `--notify` | bool |  | no-op, kept for backward compatibility -- live recipients are nudged automatically |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
@@ -4448,6 +4447,12 @@ unless the compiled root is Ready-visible — a v2 workflow root or a
 root-only wisp. See docs/reference/specs/formula-spec-v2.md for the formula
 format and contract details.
 
+Wake-on-dispatch is the default: after routing, the target is nudged
+automatically so a parked/asleep session claims the work without waiting for
+a human or orchestrator to notice and nudge it by hand. Use --no-nudge to
+route only (the old default), e.g. for a batch caller that nudges once at
+the end itself.
+
 Examples:
   gc sling my-rig/claude BL-42              # route existing bead
   gc sling my-rig/claude "write a README"   # create bead from text, then route
@@ -4468,7 +4473,8 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 | `--merge` | string |  | merge strategy: direct, mr, or local |
 | `--no-convoy` | bool |  | skip auto-convoy creation |
 | `--no-formula` | bool |  | suppress default formula (route raw bead) |
-| `--nudge` | bool |  | nudge target after routing |
+| `--no-nudge` | bool |  | skip the automatic wake-nudge after routing (opt out of wake-on-dispatch) |
+| `--nudge` | bool |  | nudge target after routing (default behavior; kept for back-compat, see --no-nudge) |
 | `--on` | string |  | attach wisp from formula to bead before routing |
 | `--owned` | bool |  | mark auto-convoy as owned (skip auto-close) |
 | `--reassign` | bool |  | clear any existing human assignee before routing (for human→pool handoff) |
