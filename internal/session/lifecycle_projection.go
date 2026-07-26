@@ -78,6 +78,9 @@ const (
 	RuntimeProjectionStaleCreating RuntimeProjection = "stale-creating"
 	// RuntimeProjectionStartRequested means a wake has been requested but not observed yet.
 	RuntimeProjectionStartRequested RuntimeProjection = "start-requested"
+	// RuntimeProjectionStaleStartPending means a start has been desired but no
+	// provider Start attempt began within the age-out window.
+	RuntimeProjectionStaleStartPending RuntimeProjection = "stale-start-pending"
 )
 
 // IdentityProjection describes whether a configured or concrete session
@@ -181,22 +184,23 @@ type LifecycleInput struct {
 	WakeRequest             string // "wake_request"
 
 	// External facts — not derived from persisted metadata.
-	Runtime            RuntimeFacts
-	NamedIdentity      NamedIdentityInput
-	WakeCauses         []WakeCause
-	PreserveIdentity   bool
-	ConfigMissing      bool
-	CreatedAt          time.Time
-	StaleCreatingAfter time.Duration
-	Now                time.Time
+	Runtime                RuntimeFacts
+	NamedIdentity          NamedIdentityInput
+	WakeCauses             []WakeCause
+	PreserveIdentity       bool
+	ConfigMissing          bool
+	CreatedAt              time.Time
+	StaleCreatingAfter     time.Duration
+	StaleStartPendingAfter time.Duration
+	Now                    time.Time
 }
 
 // LifecycleInputFromMetadata builds the status plus the thirteen
 // metadata-derived fields ProjectLifecycle reads from a raw session-bead
 // metadata map, keeping the metadata-key literals below the codec edge. Callers
 // set the remaining external-fact fields (Now, Runtime, NamedIdentity,
-// CreatedAt, StaleCreatingAfter, WakeCauses, PreserveIdentity, ConfigMissing)
-// afterward.
+// CreatedAt, StaleCreatingAfter, StaleStartPendingAfter, WakeCauses,
+// PreserveIdentity, ConfigMissing) afterward.
 func LifecycleInputFromMetadata(status string, meta map[string]string) LifecycleInput {
 	return LifecycleInput{
 		Status:                  status,
@@ -751,7 +755,10 @@ func projectRuntimeProjection(input LifecycleInput, base BaseState, compat State
 		return RuntimeProjectionMissing, compat, false
 	}
 	if base == BaseStateStartPending {
-		return RuntimeProjectionStartRequested, StateStartPending, false
+		if !startPendingStateIsStale(input) {
+			return RuntimeProjectionStartRequested, StateStartPending, false
+		}
+		return RuntimeProjectionStaleStartPending, StateAsleep, shouldResetContinuation(base, input, sleepReason)
 	}
 	// #1460: A creating bead with last_woke_at represents an in-flight provider
 	// Start attempt and must age out through the stale-creating path. Legacy
@@ -797,6 +804,33 @@ func creatingStateIsStale(input LifecycleInput) bool {
 		return true
 	}
 	return !now.Before(startedAt.Add(input.StaleCreatingAfter))
+}
+
+// startPendingStateIsStale mirrors creatingStateIsStale for the start-pending
+// sub-state: a wake has been requested (RequestWakePatch stamps
+// pending_create_started_at at the same time it sets state=start-pending) but
+// no provider Start attempt has begun within the age-out window. Unlike
+// creating, start-pending has no PendingCreateClaim/LastWokeAt short-circuit
+// to consider — those fields govern the creating branch's own legacy-row
+// fallback, not this one.
+func startPendingStateIsStale(input LifecycleInput) bool {
+	if input.StaleStartPendingAfter <= 0 {
+		return false
+	}
+	now := input.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	startedAt := input.CreatedAt
+	if v := strings.TrimSpace(input.PendingCreateStartedAt); v != "" {
+		if t, err := time.Parse(time.RFC3339, v); err == nil && !t.IsZero() {
+			startedAt = t
+		}
+	}
+	if startedAt.IsZero() {
+		return true
+	}
+	return !now.Before(startedAt.Add(input.StaleStartPendingAfter))
 }
 
 func shouldResetContinuation(base BaseState, input LifecycleInput, sleepReason string) bool {
