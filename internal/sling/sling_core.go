@@ -103,6 +103,11 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 			return result, err
 		}
 	}
+	if shouldCheckOfficerOfRecord(opts) {
+		if err := checkOfficerOfRecord(opts, deps); err != nil {
+			return result, err
+		}
+	}
 	if shouldGuardCrossRig(opts) {
 		if err := CrossRigRouteError(opts.BeadOrFormula, a, deps.Cfg); err != nil {
 			return result, err
@@ -248,6 +253,19 @@ func usesFormulaBackedRoute(opts SlingOpts) bool {
 	return opts.OnFormula != "" || (!opts.NoFormula && opts.Target.EffectiveDefaultSlingFormula() != "")
 }
 
+// shouldCheckOfficerOfRecord reports whether preflight should enforce the
+// gc.officer_of_record gate for this sling. Mirrors shouldValidateExistingBead's
+// applicability condition (a formula LAUNCH creates a fresh bead that cannot
+// carry pre-existing metadata; a dry-run inline-text preview never resolves a
+// real target bead either — there is nothing to check officer_of_record ON in
+// either case). This governs APPLICABILITY only. Unlike every other preflight
+// check, it is deliberately never additionally gated on !opts.Force: a --force
+// bypass is exactly what rigs/personas/ariadne-plan-persona-standards-2026-07-25.md
+// phase_2_slinggate ruling (a) retires ("no hotfix escape, no exceptions").
+func shouldCheckOfficerOfRecord(opts SlingOpts) bool {
+	return !opts.IsFormula && !(opts.DryRun && opts.InlineText)
+}
+
 func shouldCheckDepCycle(opts SlingOpts) bool {
 	// Only meaningful for plain-bead slinging where a bead ID is known.
 	// Formula slinging creates new molecules whose deps aren't bead-graph deps.
@@ -360,6 +378,60 @@ func validateExistingBeadInQuerier(beadID, storeRef string, querier BeadQuerier)
 		return nil
 	}
 	return &MissingBeadError{BeadID: beadID, StoreRef: storeRef}
+}
+
+// checkOfficerOfRecord enforces the hard officer-of-record gate: routing to
+// any target not in the city's RoutingPolicy exempt set (config.City.RoutingPolicy,
+// authored only in the root city.toml) requires the target bead to already
+// carry gc.officer_of_record metadata. There is NO --force override — see
+// shouldCheckOfficerOfRecord's doc comment.
+//
+// The gate itself is opt-in at the city-config level: if RoutingPolicy.Configured()
+// is false (no [routing] table authored in city.toml at all), this is a no-op.
+// Upgrading the gc binary alone must never silently change sling behavior for
+// a city — including every test fixture in this repo — that has not opted in.
+// "No exceptions" (ruling a) means no PER-DISPATCH bypass once a city has
+// opted in; it does not mean every city is enrolled by default.
+//
+// A bead that does not resolve (beads.ErrNotFound) is NOT refused here:
+// --force's documented "dispatch even if the bead does not resolve in the
+// local store" use case (a bead visible in a remote store not yet synced
+// locally) must keep working, and this check cannot verify metadata on a bead
+// it cannot see — a visibility limit, not a policy exception. A bead that DOES
+// resolve locally is held to the gate unconditionally, regardless of --force.
+// A genuine lookup failure (not not-found) surfaces as the same
+// BeadLookupError the existence check above already uses, rather than being
+// silently swallowed.
+func checkOfficerOfRecord(opts SlingOpts, deps SlingDeps) error {
+	a := opts.Target
+	if deps.Cfg == nil || !deps.Cfg.RoutingPolicy.Configured() {
+		return nil
+	}
+	if deps.Cfg.RoutingPolicy.Exempt(a.QualifiedName()) {
+		return nil
+	}
+	storeRef := strings.TrimSpace(deps.StoreRef)
+	if storeRef == "" {
+		storeRef = "local"
+	}
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	if querier == nil {
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: errors.New("store not configured")}
+	}
+	b, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: err}
+	}
+	if strings.TrimSpace(b.Metadata[beadmeta.OfficerOfRecordMetadataKey]) != "" {
+		return nil
+	}
+	return &MissingOfficerOfRecordError{BeadID: opts.BeadOrFormula, Target: a.QualifiedName()}
 }
 
 // slingFormula handles the --formula dispatch path.
