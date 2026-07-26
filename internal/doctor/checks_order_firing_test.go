@@ -665,3 +665,58 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 		t.Fatalf("message = %q, want timeout diagnostic", result.Message)
 	}
 }
+
+// TestOrderFiringCurrent_FindsRecentFiring_AmongLargeNoisyHistory pins the
+// ga-17ow3v fix: on a live city, events.jsonl plus its rotated archives can
+// carry 40k+ order.fired lines and exceed 350MB, and the old unconditional
+// events.ReadFiltered scan of the whole history (twice — once per event
+// type) reliably blew the 15s budget above. The fix switched both reads to
+// events.ReadFilteredTail, bounded to orderFiringEventTailLimit for
+// order.fired and to 1 for the single newest controller.started. This test
+// writes noisy history well past what a naive "just read the last line"
+// implementation would need, with the target order's real firing placed
+// before a run of newer, irrelevant events, to confirm the bounded tail
+// read still resolves the correct per-order last-fired time rather than
+// picking up the trailing noise or missing the match entirely.
+func TestOrderFiringCurrent_FindsRecentFiring_AmongLargeNoisyHistory(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "target-order", "cooldown", "1h")
+
+	evts := []events.Event{
+		{Type: events.ControllerStarted, Ts: now.Add(-48 * time.Hour)},
+	}
+	// Older noise from unrelated orders, oldest first.
+	for i := 500; i > 20; i-- {
+		evts = append(evts, events.Event{
+			Type:    events.OrderFired,
+			Subject: fmt.Sprintf("noise-order-%d", i),
+			Ts:      now.Add(-time.Duration(i) * time.Minute),
+		})
+	}
+	// The real, recent firing for the order under test — deliberately NOT
+	// the last line written, so a correct implementation must actually
+	// match on Subject within the tail window rather than assume position.
+	evts = append(evts, events.Event{
+		Type:    events.OrderFired,
+		Subject: "target-order",
+		Ts:      now.Add(-10 * time.Minute),
+	})
+	// More recent noise from unrelated orders after the real firing.
+	for i := 19; i > 0; i-- {
+		evts = append(evts, events.Event{
+			Type:    events.OrderFired,
+			Subject: fmt.Sprintf("noise-order-%d", i),
+			Ts:      now.Add(-time.Duration(i) * time.Minute),
+		})
+	}
+	writeOrderFiringTestEvents(t, cityPath, evts...)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "target-order: last fired 10m ago") {
+		t.Fatalf("details = %v, want target-order last-fired-10m-ago entry", result.Details)
+	}
+}
