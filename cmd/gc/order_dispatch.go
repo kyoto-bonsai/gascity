@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/closeorder"
@@ -596,6 +597,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				Actor:   "controller",
 				Subject: a.ScopedName(),
 				Message: msg,
+				Payload: orderEventPayload(a.ScopedName(), msg),
 			})
 			if spendDispatchBudget(idx) {
 				return
@@ -1172,6 +1174,7 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 			Actor:   "controller",
 			Subject: scoped,
 			Message: err.Error(),
+			Payload: orderEventPayload(scoped, err.Error()),
 		})
 		return
 	}
@@ -1184,6 +1187,7 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 		Type:    events.OrderFired,
 		Actor:   "controller",
 		Subject: scoped,
+		Payload: orderEventPayload(scoped, ""),
 	})
 
 	if a.IsExec() {
@@ -1337,6 +1341,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 				Actor:   "controller",
 				Subject: scoped,
 				Message: errMsg,
+				Payload: orderEventPayload(scoped, errMsg),
 			})
 			return
 		}
@@ -1354,6 +1359,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 				Actor:   "controller",
 				Subject: scoped,
 				Message: fmt.Sprintf("exec tracking bead %s event cursor label failed for seq=%d: %v", trackingID, headSeq, err),
+				Payload: orderEventPayload(scoped, fmt.Sprintf("exec tracking bead %s event cursor label failed for seq=%d: %v", trackingID, headSeq, err)),
 			})
 			return
 		}
@@ -1394,6 +1400,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 			Actor:   "controller",
 			Subject: scoped,
 			Message: msg,
+			Payload: orderEventPayload(scoped, msg),
 		})
 		return
 	}
@@ -1406,6 +1413,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 			Actor:   "controller",
 			Subject: scoped,
 			Message: execErrMsg,
+			Payload: orderEventPayload(scoped, execErrMsg),
 		})
 		return
 	}
@@ -1413,6 +1421,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 		Type:    events.OrderCompleted,
 		Actor:   "controller",
 		Subject: scoped,
+		Payload: orderEventPayload(scoped, ""),
 	})
 }
 
@@ -1500,6 +1509,21 @@ func redactOrderEnvError(err error, env []string) string {
 	return execenv.RedactText(err.Error(), env)
 }
 
+// orderEventPayload marshals an api.OrderEventPayload for an order.* event's
+// Payload field (ga-uagjsj). errMsg is the same text already passed to the
+// event's Message field at every call site -- duplicated into the typed
+// payload rather than re-derived, so the two never drift. A marshal failure
+// (never expected for two plain strings) degrades to a nil payload rather
+// than blocking the event write; the envelope's Subject/Message still carry
+// the same information as a fallback.
+func orderEventPayload(order, errMsg string) json.RawMessage {
+	data, err := json.Marshal(api.OrderEventPayload{Order: order, Error: errMsg})
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
 // dispatchWisp instantiates a wisp from the order's formula.
 func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars map[string]string) {
 	scoped := a.ScopedName()
@@ -1510,6 +1534,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 			Actor:   "controller",
 			Subject: scoped,
 			Message: err.Error(),
+			Payload: orderEventPayload(scoped, err.Error()),
 		})
 		orders.NewStore(beads.OrdersStore{Store: store}).SetOutcome(trackingID, orders.RunOutcomeWispCanceled) //nolint:errcheck // best-effort
 		return
@@ -1529,6 +1554,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 				Actor:   "controller",
 				Subject: scoped,
 				Message: errMsg,
+				Payload: orderEventPayload(scoped, errMsg),
 			})
 			m.markTrackingFailure(store, trackingID, scoped, a, 0)
 			return
@@ -1546,6 +1572,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 			Actor:   "controller",
 			Subject: scoped,
 			Message: err.Error(),
+			Payload: orderEventPayload(scoped, err.Error()),
 		})
 		m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
 		return
@@ -1556,6 +1583,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 			Actor:   "controller",
 			Subject: scoped,
 			Message: err.Error(),
+			Payload: orderEventPayload(scoped, err.Error()),
 		})
 		m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
 		return
@@ -1574,6 +1602,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 				Actor:   "controller",
 				Subject: scoped,
 				Message: err.Error(),
+				Payload: orderEventPayload(scoped, err.Error()),
 			})
 			m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
 			return
@@ -1589,6 +1618,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 			Actor:   "controller",
 			Subject: scoped,
 			Message: err.Error(),
+			Payload: orderEventPayload(scoped, err.Error()),
 		})
 		m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
 		return
@@ -1601,6 +1631,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 			Actor:   "controller",
 			Subject: scoped,
 			Message: err.Error(),
+			Payload: orderEventPayload(scoped, err.Error()),
 		})
 		m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
 		return
@@ -1628,6 +1659,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 			Actor:   "controller",
 			Subject: scoped,
 			Message: fmt.Sprintf("wisp %s created but label failed: %v", rootID, err),
+			Payload: orderEventPayload(scoped, fmt.Sprintf("wisp %s created but label failed: %v", rootID, err)),
 		})
 		m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
 		return
@@ -1637,6 +1669,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 		Type:    events.OrderCompleted,
 		Actor:   "controller",
 		Subject: scoped,
+		Payload: orderEventPayload(scoped, ""),
 	})
 
 	// Label tracking bead with outcome.

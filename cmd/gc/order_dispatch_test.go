@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -1990,6 +1992,98 @@ func TestOrderDispatchExecFailure(t *testing.T) {
 	}
 	if !strings.Contains(logs, "order exec fail-exec failed") {
 		t.Fatalf("logs = %q, want exec failure warning", logs)
+	}
+}
+
+// TestOrderDispatchExecFailureRecordsOrderPayload proves the acceptance floor
+// on ga-uagjsj directly: order.failed's structured Payload (not just its
+// Subject/Message envelope fields) names the order and carries the error, so
+// a consumer decoding the typed SSE payload stream can identify which order
+// failed without out-of-band inspection.
+func TestOrderDispatchExecFailureRecordsOrderPayload(t *testing.T) {
+	store := beads.NewMemStore()
+	var rec memRecorder
+	var stderr bytes.Buffer
+	tracking, err := store.Create(beads.Bead{
+		Title:  "order:fail-exec",
+		Labels: []string{"order-run:fail-exec", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fakeExec := func(_ context.Context, _, _ string, _ []string) ([]byte, error) {
+		return []byte("error output\n"), fmt.Errorf("exit status 1")
+	}
+
+	aa := []orders.Order{{
+		Name:     "fail-exec",
+		Trigger:  "cooldown",
+		Interval: "2m",
+		Exec:     "scripts/fail.sh",
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, &rec)
+	mad := ad.(*memoryOrderDispatcher)
+	mad.stderr = &stderr
+
+	captureCmdOrderLogs(t, func() {
+		mad.dispatchExec(context.Background(), orders.NewStore(beads.OrdersStore{Store: store}), execStoreTarget{ScopeRoot: t.TempDir()}, aa[0], t.TempDir(), tracking.ID, nil)
+	})
+
+	p := rec.orderPayloadFor(t, events.OrderFailed)
+	if p.Order != "fail-exec" {
+		t.Errorf("payload.Order = %q, want %q", p.Order, "fail-exec")
+	}
+	if !strings.Contains(p.Error, "exit status 1") {
+		t.Errorf("payload.Error = %q, want it to contain the exec error", p.Error)
+	}
+}
+
+// TestOrderDispatchExecSuccessRecordsOrderPayloadWithoutError proves
+// order.completed's Payload names the order and omits Error entirely on the
+// success path (json "omitempty" — no error key, not an empty-string one).
+func TestOrderDispatchExecSuccessRecordsOrderPayloadWithoutError(t *testing.T) {
+	store := beads.NewMemStore()
+	var rec memRecorder
+	var stderr bytes.Buffer
+	tracking, err := store.Create(beads.Bead{
+		Title:  "order:ok-exec",
+		Labels: []string{"order-run:ok-exec", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fakeExec := func(_ context.Context, _, _ string, _ []string) ([]byte, error) {
+		return []byte("ok\n"), nil
+	}
+
+	aa := []orders.Order{{
+		Name:     "ok-exec",
+		Trigger:  "cooldown",
+		Interval: "2m",
+		Exec:     "scripts/ok.sh",
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, fakeExec, &rec)
+	mad := ad.(*memoryOrderDispatcher)
+	mad.stderr = &stderr
+
+	captureCmdOrderLogs(t, func() {
+		mad.dispatchExec(context.Background(), orders.NewStore(beads.OrdersStore{Store: store}), execStoreTarget{ScopeRoot: t.TempDir()}, aa[0], t.TempDir(), tracking.ID, nil)
+	})
+
+	if !rec.hasType(events.OrderCompleted) {
+		t.Fatal("missing order.completed event")
+	}
+	p := rec.orderPayloadFor(t, events.OrderCompleted)
+	if p.Order != "ok-exec" {
+		t.Errorf("payload.Order = %q, want %q", p.Order, "ok-exec")
+	}
+	if p.Error != "" {
+		t.Errorf("payload.Error = %q, want empty on success", p.Error)
+	}
+	if strings.Contains(string(orderEventPayload(p.Order, "")), `"error"`) {
+		t.Error("orderEventPayload with empty errMsg should omit the error key entirely (omitempty)")
 	}
 }
 
@@ -7764,6 +7858,27 @@ func (r *memRecorder) hasSubject(subject string) bool {
 		}
 	}
 	return false
+}
+
+// orderPayloadFor decodes the Payload of the first recorded event of typ
+// (ga-uagjsj: order.* events carry a structured api.OrderEventPayload, not
+// events.NoPayload{} — see event_payloads.go's registration comment).
+func (r *memRecorder) orderPayloadFor(t *testing.T, typ string) api.OrderEventPayload {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.events {
+		if e.Type != typ {
+			continue
+		}
+		var p api.OrderEventPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decoding %s payload %s: %v", typ, e.Payload, err)
+		}
+		return p
+	}
+	t.Fatalf("no recorded event of type %s", typ)
+	return api.OrderEventPayload{}
 }
 
 // --- dedup / tracking bead lifecycle tests ---

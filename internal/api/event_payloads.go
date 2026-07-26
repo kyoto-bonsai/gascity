@@ -267,6 +267,22 @@ type BeadEventPayload struct {
 // IsEventPayload marks BeadEventPayload as an events.Payload variant.
 func (BeadEventPayload) IsEventPayload() {}
 
+// OrderEventPayload is the shape of every order.* event payload (OrderFired,
+// OrderCompleted, OrderFailed) -- registered in place of events.NoPayload{}
+// (ga-uagjsj: the envelope's Subject/Message already carry the order name and
+// error text at every cmd/gc/order_dispatch.go emission site, but a consumer
+// reading the typed SSE payload stream — the S7 mechanism-liveness metric,
+// live-watch tooling — needs it in the structured Payload field, not parsed
+// out of free text). Order is always populated; Error is empty for
+// OrderFired/OrderCompleted.
+type OrderEventPayload struct {
+	Order string `json:"order"`
+	Error string `json:"error,omitempty"`
+}
+
+// IsEventPayload marks OrderEventPayload as an events.Payload variant.
+func (OrderEventPayload) IsEventPayload() {}
+
 // UnmarshalJSON decodes a bead.* event payload via the shared canonical decoder
 // (beads.DecodeBeadEventPayload): the raw bead snapshot CachingStore.notifyChange
 // emits, with the wrapped {"bead": ...} form accepted as a tolerant fallback. A
@@ -616,7 +632,7 @@ func init() {
 	events.RegisterPayload(events.BeadDeleted, BeadEventPayload{})
 	events.RegisterPayload(events.BeadDeadAssigneeReopened, BeadDeadAssigneeReopenedPayload{})
 
-	// session.* / convoy.* / controller.* / city.* / order.* /
+	// session.* / convoy.* / controller.* / city.* /
 	// provider.* — these events carry no structured payload today;
 	// their semantics are fully captured by the envelope's Actor,
 	// Subject, and Message fields. NoPayload registers an empty typed
@@ -661,9 +677,13 @@ func init() {
 	events.RegisterPayload(events.CityCreated, CityLifecyclePayload{})
 	events.RegisterPayload(events.CityUnregisterRequested, CityLifecyclePayload{})
 
-	events.RegisterPayload(events.OrderFired, events.NoPayload{})
-	events.RegisterPayload(events.OrderCompleted, events.NoPayload{})
-	events.RegisterPayload(events.OrderFailed, events.NoPayload{})
+	// order.* carry OrderEventPayload (ga-uagjsj) -- name/error, not NoPayload;
+	// see OrderEventPayload's doc comment for why this family moved off the
+	// "envelope alone is enough" convention the comment above still describes
+	// for session.*/convoy.*/controller.*/city.*/provider.*.
+	events.RegisterPayload(events.OrderFired, OrderEventPayload{})
+	events.RegisterPayload(events.OrderCompleted, OrderEventPayload{})
+	events.RegisterPayload(events.OrderFailed, OrderEventPayload{})
 
 	// webhook.* — E8 supervisor webhook receiver observability.
 	events.RegisterPayload(events.WebhookReceived, WebhookReceivedPayload{})
