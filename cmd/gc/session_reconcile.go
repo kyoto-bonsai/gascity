@@ -522,6 +522,13 @@ func checkRateLimitStability(info sessionpkg.Info, cfg *config.City, alive bool,
 	for dec == sessionpkg.ExitGatherScreen {
 		facts.Screen = sessionpkg.ScreenOther
 		if content, err := peek(rateLimitPeekLines); err == nil {
+			if runtime.ContainsLoginExpiredDialog(content) {
+				next, quarantineErr := recordLoginExpiredQuarantine(info, sessFront, clk)
+				if quarantineErr != nil {
+					return info, false, quarantineErr
+				}
+				return next, true, nil
+			}
 			if reason := runtime.ProviderResourceExhaustionReason(content); reason != "" {
 				next, quarantineErr := recordProviderResourceExhaustionQuarantine(info, sessFront, clk, reason)
 				if quarantineErr != nil {
@@ -619,6 +626,24 @@ func recordProviderResourceExhaustionQuarantine(info sessionpkg.Info, sessFront 
 	next, err := sessFront.ApplyPatchInfo(info, batch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "recordProviderResourceExhaustionQuarantine: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck
+		return info, err
+	}
+	return next, nil
+}
+
+// recordLoginExpiredQuarantine backs off a session that exited into a
+// detected login/auth-expiry prompt, same shape as
+// recordProviderResourceExhaustionQuarantine: not treated as a crash,
+// conversation metadata preserved so a re-authenticated seat resumes rather
+// than restarts from zero — the ga-uwptpu incident's own failure mode, and
+// the direct motivation for this bead. Best-effort patterns per the
+// operator's 2026-07-26 ruling on ga-5gsyts (runtime.
+// ContainsLoginExpiredDialog's own doc has the failure-asymmetry rationale).
+func recordLoginExpiredQuarantine(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Clock) (sessionpkg.Info, error) {
+	batch := sessionpkg.LoginExpiredQuarantinePatch(clk.Now().Add(defaultLoginExpiredQuarantineDuration))
+	next, err := sessFront.ApplyPatchInfo(info, batch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "recordLoginExpiredQuarantine: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck
 		return info, err
 	}
 	return next, nil

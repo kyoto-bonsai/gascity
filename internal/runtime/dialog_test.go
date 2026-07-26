@@ -1556,6 +1556,35 @@ func TestProviderResourceExhaustionReason(t *testing.T) {
 	}
 }
 
+func TestContainsLoginExpiredDialog(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "slash login command", content: "Please run /login to continue", want: true},
+		{name: "session expired", content: "Session expired. Please authenticate again.", want: true},
+		{name: "please log in", content: "Please log in to use Claude Code", want: true},
+		{name: "authentication expired", content: "Error: authentication expired", want: true},
+		{name: "oauth refresh failed", content: "oauth token refresh failed: invalid_grant", want: true},
+		{name: "failed to refresh token", content: "Failed to refresh token, please sign in again", want: true},
+		{name: "case-insensitive match", content: "SESSION EXPIRED", want: true},
+		{name: "normal startup output", content: "Starting Claude Code...\nReady.", want: false},
+		{name: "rate limit is not login expiry", content: "Rate limit reached\n1. Keep trying\n2. Stop", want: false},
+		{name: "quota exceeded is not login expiry", content: "Error: quota exceeded", want: false},
+		{name: "credit balance is not login expiry", content: "Your credit balance is too low to access the Claude API.", want: false},
+		{name: "model not found is not login expiry", content: "model_not_found: gpt-5.3-codex-spark", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ContainsLoginExpiredDialog(tt.content); got != tt.want {
+				t.Errorf("ContainsLoginExpiredDialog(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestContainsCustomAPIKeyDialog(t *testing.T) {
 	t.Parallel()
 
