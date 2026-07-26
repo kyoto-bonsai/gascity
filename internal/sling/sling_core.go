@@ -105,6 +105,7 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 		}
 	}
 	if shouldCheckOfficerOfRecord(opts) {
+		deriveOfficerOfRecord(opts, deps)
 		if err := checkOfficerOfRecord(opts, deps); err != nil {
 			return result, err
 		}
@@ -384,6 +385,56 @@ func validateExistingBeadInQuerier(beadID, storeRef string, querier BeadQuerier)
 		return nil
 	}
 	return &MissingBeadError{BeadID: beadID, StoreRef: storeRef}
+}
+
+// deriveOfficerOfRecord stamps gc.officer_of_record on the target bead before
+// checkOfficerOfRecord evaluates it, sourced from RoutingPolicy.ReportsTo
+// (city.toml [routing.reports_to], synced by hand from the department
+// doctrine's Reports-to column — see internal/config/routing.go). This is
+// the "fix at the source" ga-owbb42 asks for: stamping here, inside the same
+// preflight pass that would otherwise refuse the dispatch, removes the need
+// for fleet-lint V8 to catch a miss 24h later or for a human to hand-stamp
+// mid-dispatch (see ga-owbb42's own comment thread for a live repro of the
+// latter, one layer up from the 24h-lag case the bead was originally filed
+// for).
+//
+// Best-effort and silent by design: every no-op path here (policy not
+// configured, target exempt, no ReportsTo entry, bead unresolvable, field
+// already set, or the write itself failing) simply leaves
+// checkOfficerOfRecord — called immediately after, unconditionally — as the
+// fail-closed backstop it already is. This function has no error return: it
+// must never itself change whether a sling is refused, only reduce how often
+// the refusal is reached.
+func deriveOfficerOfRecord(opts SlingOpts, deps SlingDeps) {
+	if deps.Cfg == nil || !deps.Cfg.RoutingPolicy.Configured() || deps.Store == nil {
+		return
+	}
+	a := opts.Target
+	if deps.Cfg.RoutingPolicy.Exempt(a.QualifiedName()) {
+		return
+	}
+	officer, ok := deps.Cfg.RoutingPolicy.DeriveOfficerOfRecord(a.QualifiedName())
+	if !ok {
+		return
+	}
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	if querier == nil {
+		return
+	}
+	b, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		return
+	}
+	if strings.TrimSpace(b.Metadata[beadmeta.OfficerOfRecordMetadataKey]) != "" {
+		return
+	}
+	if err := deps.Store.SetMetadata(opts.BeadOrFormula, beadmeta.OfficerOfRecordMetadataKey, officer); err != nil {
+		depsTracef(deps, "sling-core: deriveOfficerOfRecord: failed to stamp %s=%s on %s: %v",
+			beadmeta.OfficerOfRecordMetadataKey, officer, opts.BeadOrFormula, err)
+	}
 }
 
 // checkOfficerOfRecord enforces the hard officer-of-record gate: routing to
