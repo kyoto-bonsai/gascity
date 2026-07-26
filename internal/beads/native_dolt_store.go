@@ -2482,23 +2482,28 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 		}
 		metadata["close_reason"] = issue.CloseReason
 	}
+	// Captured before mapBdStatus collapses issue.Status away — see
+	// Bead.IsDeferredIndefinitely's doc comment for why this can't be
+	// reconstructed from the collapsed Status/DeferUntil alone.
+	deferredIndefinitely := issue.Status == beadslib.StatusDeferred && issue.DeferUntil == nil
 	b := Bead{
-		ID:                   issue.ID,
-		Title:                issue.Title,
-		Status:               status,
-		Type:                 string(issue.IssueType),
-		Priority:             nativePriorityFromIssue(issue),
-		CreatedAt:            issue.CreatedAt,
-		Assignee:             issue.Assignee,
-		From:                 issue.Sender,
-		Description:          issue.Description,
-		Labels:               append([]string(nil), issue.Labels...),
-		Metadata:             metadata,
-		Ephemeral:            issue.Ephemeral,
-		NoHistory:            issue.NoHistory,
-		DeferUntil:           cloneTimePtr(issue.DeferUntil),
-		IndefinitelyDeferred: indefinitelyDeferred,
-		Revision:             issue.RowVersion,
+		ID:                     issue.ID,
+		Title:                  issue.Title,
+		Status:                 status,
+		Type:                   string(issue.IssueType),
+		Priority:               nativePriorityFromIssue(issue),
+		CreatedAt:              issue.CreatedAt,
+		Assignee:               issue.Assignee,
+		From:                   issue.Sender,
+		Description:            issue.Description,
+		Labels:                 append([]string(nil), issue.Labels...),
+		Metadata:               metadata,
+		Ephemeral:              issue.Ephemeral,
+		NoHistory:              issue.NoHistory,
+		DeferUntil:             cloneTimePtr(issue.DeferUntil),
+		IndefinitelyDeferred:   indefinitelyDeferred,
+		IsDeferredIndefinitely: &deferredIndefinitely,
+		Revision:               issue.RowVersion,
 	}
 	for _, dep := range issue.Dependencies {
 		if dep == nil {
