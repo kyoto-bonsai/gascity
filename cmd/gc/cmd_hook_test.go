@@ -403,6 +403,53 @@ func TestDoHookClaimClaimsRoutedUnassignedWork(t *testing.T) {
 	}
 }
 
+// TestDoHookClaimPrefersCandidateMatchingCallerWorkDir is the ga-vtv442
+// regression: every session in a pool shares one PoolName (the bare template,
+// see hookClaimPrimaryRouteTarget), so gc.routed_to route-target matching
+// alone cannot tell which ready candidate belongs to the calling session.
+// claimFirstEligibleHookCandidate took the first route-matched, unassigned
+// candidate in work-query order regardless of origin — verified live
+// 2026-07-26 when persona-kieran-1 (working ga-2w4oxy) ran `gc hook
+// persona-kieran-1 --claim` and claimed ga-owbb42 instead, a different bead
+// dispatched to persona-kieran-2's own dedicated work_dir. The fix prefers a
+// candidate whose gc.work_dir metadata matches the caller's own working
+// directory when one is present, falling back to the prior first-match order
+// otherwise so pools with no work_dir stamping are unaffected.
+func TestDoHookClaimPrefersCandidateMatchingCallerWorkDir(t *testing.T) {
+	var claimedID string
+	runner := func(string, string) (string, error) {
+		// ga-owbb42 (a sibling pool member's own bead) is listed FIRST — under
+		// the pre-fix first-match-wins order this is exactly what got claimed
+		// instead of the caller's own ga-2w4oxy.
+		return `[
+			{"id":"ga-owbb42","status":"open","metadata":{"gc.routed_to":"persona-kieran","gc.work_dir":"/work/kieran-2"}},
+			{"id":"ga-2w4oxy","status":"open","metadata":{"gc.routed_to":"persona-kieran","gc.work_dir":"/work/kieran-1"}}
+		]`, nil
+	}
+	ops := hookClaimOps{
+		Runner: runner,
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			claimedID = beadID
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee, Metadata: map[string]string{"gc.routed_to": "persona-kieran"}}, true, nil
+		},
+	}
+	opts := hookClaimOptions{
+		Assignee:           "persona-kieran-1",
+		IdentityCandidates: []string{"persona-kieran-1"},
+		RouteTargets:       []string{"persona-kieran"},
+		JSON:               true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/work/kieran-1", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim(pool affinity) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if claimedID != "ga-2w4oxy" {
+		t.Fatalf("REGRESSION ga-vtv442: claimed %q, want own bead \"ga-2w4oxy\" (caller work_dir /work/kieran-1), not sibling pool member's ga-owbb42", claimedID)
+	}
+}
+
 func TestDoHookClaimRetriesAfterClaimConflict(t *testing.T) {
 	var attempts []string
 	runner := func(string, string) (string, error) {
