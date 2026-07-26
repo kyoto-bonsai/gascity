@@ -34,6 +34,17 @@ const (
 	messageBeadType = "message"
 
 	cachedSessionBeadRefreshInterval = 30 * time.Second
+
+	// messageCandidatesLimit bounds every messageCandidatesAll read (inbox,
+	// check, count, archive-match). Left unset, BdStore.listEphemeral defaults
+	// an unset ListQuery.Limit to an unbounded `bd query ... --limit 0` full
+	// scan of the wisps tier — the same cost shape ga-t2brh8 found in gc
+	// hook's tier-1 probe, here hitting every mail read instead (ga-mnl73s).
+	// status=open already narrows the scan to the live/unprocessed working
+	// set; 500 stays well above this package's own existing bulk default
+	// (mailArchiveSelectOptions{Limit: 100} in cmd/gc/cmd_mail.go) so no
+	// caller's effective result set shrinks.
+	messageCandidatesLimit = 500
 )
 
 // Provider implements [mail.Provider] using [beads.Store] as the backend.
@@ -1200,6 +1211,7 @@ func (p *Provider) messageCandidatesAll(routes []string) ([]beads.Bead, error) {
 		Status:   "open",
 		TierMode: beads.TierBoth,
 		Live:     true,
+		Limit:    messageCandidatesLimit,
 	}
 	if len(routes) > 0 {
 		query.Assignees = routes

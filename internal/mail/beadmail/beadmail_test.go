@@ -434,6 +434,35 @@ func TestMessageQueriesUseBothTiers(t *testing.T) {
 	}
 }
 
+func TestMessageCandidatesAllBoundsQueryLimit(t *testing.T) {
+	store := &messageListProbeStore{MemStore: beads.NewMemStore()}
+	p := New(store)
+
+	if _, err := p.Send("human", "mayor", "", "body"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// Assignees-routed branch (single recipient).
+	if _, err := p.Check("mayor"); err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	// AllowScan branch (empty recipient resolves to no routes).
+	if _, err := p.All(""); err != nil {
+		t.Fatalf("All: %v", err)
+	}
+
+	if len(store.messageQueries) == 0 {
+		t.Fatalf("no message queries captured")
+	}
+	for _, query := range store.messageQueries {
+		if query.Limit != messageCandidatesLimit {
+			t.Fatalf("message query = %+v, want Limit == messageCandidatesLimit (%d); an unset/zero Limit makes "+
+				"BdStore.listEphemeral run an unbounded `bd query --limit 0` full scan of the wisps tier on every "+
+				"mail read under Dolt load (ga-mnl73s)", query, messageCandidatesLimit)
+		}
+	}
+}
+
 func hasMailMessageID(messages []mail.Message, id string) bool {
 	for _, message := range messages {
 		if message.ID == id {
