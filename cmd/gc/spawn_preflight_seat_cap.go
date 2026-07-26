@@ -25,9 +25,11 @@ var seatCapLookPathHook config.LookPathFunc = exec.LookPath
 
 // checkProviderSeatCap counts open sessions currently attributed to
 // providerName (via each session's template->provider resolution) and
-// refuses if dispatching one more would meet or exceed the provider's
-// ratified max_seats. Fails open — same posture as the other two P2 checks —
-// when store/cfg/providerName are unset, the provider has no configured cap
+// refuses a dispatch once that count has already reached the provider's
+// ratified max_seats — the cap itself is reachable; only the dispatch that
+// would push the count past it is refused. Fails open — same posture as
+// the other two P2 checks — when store/cfg/providerName are unset, the
+// provider has no configured cap
 // (nil MaxSeats), or the cap is the explicit-unlimited sentinel (-1). A
 // snapshot-load error also fails open: this gate augments dispatch, it
 // doesn't replace the store's own error surfacing.
