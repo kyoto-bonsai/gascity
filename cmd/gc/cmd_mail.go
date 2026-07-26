@@ -123,6 +123,17 @@ func newMailNudgeFunc(sender string) nudgeFunc {
 	}
 }
 
+// mailShouldAttemptNudge reports whether gc mail send/reply should attempt a
+// live-session nudge for this message. Predicate-based (ga-2w649o), not
+// flag-gated: attempted whenever a store is available to resolve the target,
+// regardless of --notify/--nudge (both kept for backward compatibility but no
+// longer control this). Whether the recipient is actually live -- and so
+// whether a nudge really lands -- is decided deeper in the call chain
+// (sendMailNotifyWithWorker checks obs.Running before attempting delivery).
+func mailShouldAttemptNudge(store beads.Store) bool {
+	return store != nil
+}
+
 func newMailCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mail",
@@ -1435,17 +1446,18 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to nudge
-the recipient after sending. Use --from to override the sender identity.
-Use --to as an alternative to the positional <to> argument.
-Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").`,
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". If the recipient is a
+currently-live session, it is nudged automatically -- no flag required.
+Use --from to override the sender identity. Use --to as an alternative to
+the positional <to> argument. Use -s/--subject for the summary line and
+-m/--message for the body text. Use --all to broadcast to all live sessions
+(excluding sender and "human"). --notify/--nudge are accepted for backward
+compatibility and have no additional effect.`,
 		Example: `  gc mail send mayor "Build is green"
   gc mail send mayor -s "Build is green"
   gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
   gc mail send --to mayor "Build is green"
   gc mail send human "Review needed for PR #42"
-  gc mail send polecat "Priority task" --notify
   gc mail send --all "Status update: tests passing"`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -1461,7 +1473,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&notify, "notify", false, "nudge the recipient about this message, even if earlier mail is still unread")
+	cmd.Flags().BoolVar(&notify, "notify", false, "no-op, kept for backward compatibility -- live recipients are nudged automatically")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
 	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
@@ -1548,8 +1560,10 @@ func newMailReplyCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Reply to a message. The reply is addressed to the original sender.
 
 Inherits the thread ID from the original message for conversation tracking.
-Use --notify to nudge the recipient after replying.
-Use -s/--subject for the reply subject and -m/--message for the reply body.`,
+If the recipient is a currently-live session, it is nudged automatically --
+no flag required. Use -s/--subject for the reply subject and -m/--message
+for the reply body. --notify/--nudge are accepted for backward compatibility
+and have no additional effect.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0
@@ -1566,7 +1580,7 @@ Use -s/--subject for the reply subject and -m/--message for the reply body.`,
 	}
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "reply subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "reply body text")
-	cmd.Flags().BoolVar(&notify, "notify", false, "nudge the recipient about this reply, even if earlier mail is still unread")
+	cmd.Flags().BoolVar(&notify, "notify", false, "no-op, kept for backward compatibility -- live recipients are nudged automatically")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
 	_ = cmd.Flags().MarkHidden("nudge")
@@ -1745,8 +1759,12 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 		}
 	}
 
+	// The store is already opened unconditionally above for sender/recipient
+	// identity resolution, so mailShouldAttemptNudge's auto-detect costs
+	// nothing extra here.
+	_ = notify
 	var nf nudgeFunc
-	if notify && store != nil {
+	if mailShouldAttemptNudge(store) {
 		nf = newMailNudgeFunc(sender)
 	}
 
@@ -2214,8 +2232,15 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 		body = strings.Join(args[1:], " ")
 	}
 
+	// Predicate-based, not flag-gated (ga-2w649o): a live-session nudge is now
+	// attempted whenever a store resolved above, regardless of --notify --
+	// see mailShouldAttemptNudge. notify/--nudge are kept for backward
+	// compatibility: they still control whether the block above bothers
+	// opening a store at all for a bare human sender (unchanged from before),
+	// and the warning text below still names --notify since that's the only
+	// way a human sender reaches this branch.
 	var nf nudgeFunc
-	if notify && store != nil {
+	if mailShouldAttemptNudge(store) {
 		nf = newMailNudgeFunc(sender)
 	} else if notify && strings.HasPrefix(providerName, "exec:") && notifySetupErr != nil {
 		fmt.Fprintf(stderr, "gc mail reply: --notify requested but no city store available; nudge skipped: %v\n", notifySetupErr) //nolint:errcheck // best-effort stderr
