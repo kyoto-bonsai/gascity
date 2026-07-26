@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -28,7 +29,35 @@ const (
 	// gets a correct answer via the c.lastRun fallback in latestOrderFiredAt
 	// — this limit only bounds the fast path, not correctness.
 	orderFiringEventTailLimit = 20000
+	// orderFiringLastRunTimeout bounds each PER-ORDER call to c.lastRun in
+	// latestOrderFiredAt (ga-17ow3v follow-up: the event-tail fix above
+	// shipped and verified bounded, but the check still timed out on this
+	// machine). Root cause is upstream, not this check: c.lastRun resolves
+	// through orders.LastRunAcross -> Store.LastRun, an already well-formed
+	// Limit:1/sorted/label-filtered beads query — the slowness is this
+	// city's Dolt sql-server saturating under normal fleet concurrency
+	// (tracked separately as ga-t2brh8, "schema migration lock unavailable:
+	// timeout"; not a quick fix, gated on its own audit). Direct measurement
+	// on this machine: a single `gc order history <name>` call for the one
+	// order that actually needed this fallback took 92s; a `gc order check`
+	// pass over all ~20 monitored orders took 2m2s. No fixed WHOLE-check
+	// timeout below several minutes could make the old design (any one
+	// order's lastRun call blocks the entire check, discarding every other
+	// order's already-computed result) reliably pass here. Bounding the
+	// call per-order instead means the orders that resolve from the
+	// in-memory event tail are unaffected, and only the order(s) actually
+	// needing the fallback degrade to tail-only data (see
+	// errOrderHistoryLookupTimedOut) rather than blinding the whole check.
+	orderFiringLastRunTimeout = 5 * time.Second
 )
+
+// errOrderHistoryLookupTimedOut signals that a single order's Dolt/beads
+// fallback lookup (c.lastRun) did not return within the check's configured
+// last-run timeout. Callers should treat this as a soft degradation, not a
+// hard failure: the accompanying time.Time is still the best available
+// (tail-derived) answer, and ga-t2brh8 — not this check — owns fixing the
+// underlying contention.
+var errOrderHistoryLookupTimedOut = errors.New("order-run history lookup timed out")
 
 // OrderFiringCurrentLastRunFunc reports the newest persisted run time for an order.
 type OrderFiringCurrentLastRunFunc func(order orders.Order) (time.Time, error)
@@ -51,6 +80,7 @@ type OrderFiringCurrentCheck struct {
 	clock          func() time.Time
 	lastRun        OrderFiringCurrentLastRunFunc
 	historyTimeout time.Duration
+	lastRunTimeout time.Duration
 }
 
 // NewOrderFiringCurrentCheck creates a check for cron and cooldown order freshness.
@@ -60,11 +90,22 @@ func NewOrderFiringCurrentCheck(cfg *config.City, cityPath string, opts ...Order
 		cityPath:       cityPath,
 		clock:          time.Now,
 		historyTimeout: orderFiringHistoryTimeout,
+		lastRunTimeout: orderFiringLastRunTimeout,
 	}
 	for _, opt := range opts {
 		opt(check)
 	}
 	return check
+}
+
+// resolvedLastRunTimeout returns the configured per-order lastRun timeout,
+// falling back to orderFiringLastRunTimeout for checks constructed via a bare
+// struct literal (as several tests do) rather than NewOrderFiringCurrentCheck.
+func (c *OrderFiringCurrentCheck) resolvedLastRunTimeout() time.Duration {
+	if c.lastRunTimeout > 0 {
+		return c.lastRunTimeout
+	}
+	return orderFiringLastRunTimeout
 }
 
 // Name returns the check identifier shown by gc doctor.
@@ -175,7 +216,8 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			continue
 		}
 		lastFired, err := c.latestOrderFiredAt(firedEvents, order, expected, now)
-		if err != nil {
+		degradedLookup := errors.Is(err, errOrderHistoryLookupTimedOut)
+		if err != nil && !degradedLookup {
 			worst = worseStatus(worst, StatusError)
 			result.Details = append(result.Details, fmt.Sprintf("%s: cannot read order history: %v", orderDisplayName(order), err))
 			if firstNonOK == "" {
@@ -185,6 +227,16 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			continue
 		}
 		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt)
+		if degradedLookup {
+			// lastFired is still the tail-derived value classifyOrderFiring
+			// just used (see latestOrderFiredAt) — only the Dolt/beads
+			// confirmation was skipped. Never silently report clean when we
+			// could not actually confirm it (see resolvedLastRunTimeout).
+			detail = fmt.Sprintf("%s — order-run history confirmation timed out after %s (see ga-t2brh8)", detail, c.resolvedLastRunTimeout())
+			if status == StatusOK {
+				status = StatusWarning
+			}
+		}
 		worst = worseStatus(worst, status)
 		result.Details = append(result.Details, detail)
 		if status != StatusOK {
@@ -583,14 +635,36 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 	if !latest.IsZero() && now.Sub(latest) < expected+expected/2 {
 		return latest, nil
 	}
-	runAt, err := c.lastRun(order)
-	if err != nil {
-		return time.Time{}, err
+
+	// c.lastRun opens the beads/Dolt store and does not accept a context (see
+	// the comment on Run for why that call is kept off the main goroutine).
+	// Bound it per-order here too: under known Dolt contention (ga-t2brh8) a
+	// single call can take well over a minute, and letting that block this
+	// whole method serially would once again let one stalled order consume
+	// every other order's time budget (the original ga-17ow3v symptom, just
+	// moved one level down).
+	type lastRunResult struct {
+		at  time.Time
+		err error
 	}
-	if runAt.After(latest) {
-		return runAt, nil
+	resultCh := make(chan lastRunResult, 1)
+	go func() {
+		at, err := c.lastRun(order)
+		resultCh <- lastRunResult{at, err}
+	}()
+
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			return time.Time{}, res.err
+		}
+		if res.at.After(latest) {
+			return res.at, nil
+		}
+		return latest, nil
+	case <-time.After(c.resolvedLastRunTimeout()):
+		return latest, errOrderHistoryLookupTimedOut
 	}
-	return latest, nil
 }
 
 func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
