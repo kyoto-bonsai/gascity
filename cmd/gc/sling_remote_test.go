@@ -67,10 +67,6 @@ func TestCmdSlingRemote_RefusesUnsupportedModes(t *testing.T) {
 			var out, errb bytes.Buffer
 			return cmdSlingRemote(base(), remoteTestTarget(srv.URL), []string{"mayor", "BL-1"}, false, false, false, "", nil, "", false, false, false, "", false, false, true /*dryRun*/, "", "", false, &out, &errb)
 		}, "dry-run"},
-		{"nudge", func() int {
-			var out, errb bytes.Buffer
-			return cmdSlingRemote(base(), remoteTestTarget(srv.URL), []string{"mayor", "BL-1"}, false, true /*nudge*/, false, "", nil, "", false, false, false, "", false, false, false, "", "", false, &out, &errb)
-		}, "not supported"},
 		{"one-arg", func() int {
 			var out, errb bytes.Buffer
 			return cmdSlingRemote(base(), remoteTestTarget(srv.URL), []string{"BL-1"}, false, false, false, "", nil, "", false, false, false, "", false, false, false, "", "", false, &out, &errb)
@@ -86,6 +82,54 @@ func TestCmdSlingRemote_RefusesUnsupportedModes(t *testing.T) {
 				t.Fatalf("expected exit 1, got %d", code)
 			}
 		})
+	}
+}
+
+// Nudge is now the default for every sling (doctrine R3, wake-on-dispatch),
+// but the wire SlingRequest has no nudge field yet -- a remote city cannot
+// honor it. TestCmdSlingRemote_RefusesUnsupportedModes above proves --on and
+// --stdin still hard-refuse; nudge must NOT join that list, or plain,
+// flagless `gc sling` to a remote city would fail unconditionally under the
+// new default. It degrades instead: the request still reaches the server and
+// routes normally, with a visible (not fatal) warning standing in for the
+// undeliverable wake.
+func TestCmdSlingRemote_NudgeDegradesToWarningNotRefusal(t *testing.T) {
+	var contacted bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		contacted = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"routed","target":"mayor","bead":"BL-1"}`))
+	}))
+	defer srv.Close()
+
+	var out, errb bytes.Buffer
+	code := cmdSlingRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "BL-1"},
+		false, true /*nudge*/, false, "", nil, "", false, false, false, "", false, false, false, "", "", false, &out, &errb)
+	if code != 0 {
+		t.Fatalf("nudge must not refuse the whole dispatch; exit %d, stderr=%q", code, errb.String())
+	}
+	if !contacted {
+		t.Fatal("server was not contacted; nudge must still route, just without delivering the wake")
+	}
+	if !strings.Contains(errb.String(), "not yet supported for a remote city") {
+		t.Errorf("expected a visible warning about undelivered remote nudge, got stderr=%q", errb.String())
+	}
+
+	// JSON mode: the same warning must appear in the machine-readable payload,
+	// not only on stderr, so a scripted caller can detect the gap too.
+	var out2, errb2 bytes.Buffer
+	code2 := cmdSlingRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "BL-1"},
+		false, true /*nudge*/, false, "", nil, "", false, false, false, "", false, false, false, "", "", true /*json*/, &out2, &errb2)
+	if code2 != 0 {
+		t.Fatalf("exit %d; stderr=%q", code2, errb2.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out2.Bytes(), &got); err != nil {
+		t.Fatalf("output not JSON: %v (%q)", err, out2.String())
+	}
+	warnings, _ := got["warnings"].([]any)
+	if len(warnings) == 0 {
+		t.Errorf("json warnings missing the undelivered-nudge notice: %v", got)
 	}
 }
 

@@ -31,15 +31,23 @@ func cmdSlingRemote(c *api.Client, target *remoteTarget, args []string, isFormul
 	if dryRun {
 		return fail("unsupported_remote", "gc sling: --dry-run is not supported for a remote city")
 	}
-	// --nudge and --on stay refused for a remote city. --nudge needs server-side
-	// delivery wiring. --on's per-child convoy expansion is local-only: the remote
-	// handler would attach the wisp to a convoy CONTAINER instead of each child (a
-	// silent orchestration divergence a Fable red-team caught), so a clear refusal
-	// is safer until the server expands containers on the attach path. The metadata
-	// flags (--merge/--no-convoy/--owned/--no-formula) are server-expressible and
-	// forwarded below.
+	// --on stays refused for a remote city: its per-child convoy expansion is
+	// local-only, so the remote handler would attach the wisp to a convoy
+	// CONTAINER instead of each child (a silent orchestration divergence a Fable
+	// red-team caught) -- a clear refusal is safer until the server expands
+	// containers on the attach path. The metadata flags (--merge/--no-convoy/
+	// --owned/--no-formula) are server-expressible and forwarded below.
+	//
+	// Nudge delivery needs server-side wiring that does not exist yet (the wire
+	// SlingRequest carries no nudge field), but wake-on-dispatch is now the
+	// default for every sling, local or remote -- hard-refusing the whole
+	// dispatch over a best-effort wake would make plain, flagless `gc sling` to
+	// a remote city fail unconditionally. Degrade instead: route normally and
+	// surface the gap as a warning (visible per doctrine R3's "claim or visible
+	// failure" floor) rather than as a fatal error.
+	var localWarnings []string
 	if doNudge {
-		return fail("unsupported_remote", "gc sling: --nudge delivery for a remote city lands separately; sling without --nudge")
+		localWarnings = append(localWarnings, "wake-nudge is not yet supported for a remote city; bead routed without it (gc session nudge the target directly, or run the sling from the target's own city, to wake a parked session)")
 	}
 	if onFormula != "" {
 		return fail("unsupported_remote", "gc sling: --on for a remote city lands separately (per-child convoy expansion is local-only); attach the formula from the local city, or sling the bead without --on")
@@ -94,6 +102,7 @@ func cmdSlingRemote(c *api.Client, target *remoteTarget, args []string, isFormul
 	if err != nil {
 		return fail("sling_failed", "gc sling: "+err.Error())
 	}
+	res.Warnings = append(res.Warnings, localWarnings...)
 	return renderRemoteSlingResult(res, jsonOutput, stdout, stderr)
 }
 
