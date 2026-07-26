@@ -104,6 +104,19 @@ type Bead struct {
 	// store did not provide the projection and cached ready falls back to
 	// dependency-derived readiness for backward compatibility.
 	IsBlocked *bool `json:"is_blocked,omitempty"`
+	// IsDeferredIndefinitely carries whether this bead's raw upstream status
+	// is bd's status-based indefinite deferral (`bd defer <id>` with no
+	// --until: status=deferred, defer_until=NULL) — a distinct case from a
+	// time-bound deferral (defer_until set), which DeferUntil/IsDeferred
+	// already represent. mapBdStatus collapses "deferred" into Status="open"
+	// for the NativeDoltStore/BdStore backends, and an indefinite deferral
+	// leaves DeferUntil nil too — identical to a bead that was never deferred
+	// at all — so neither Status nor DeferUntil can carry this signal through
+	// Get() on those backends (see ga-tk5mcg.2). Nil means the backend does
+	// not collapse raw status (MemStore, FileStore, ...), where Status can
+	// simply be read directly instead. json:"-" because this is an
+	// internal dispatchability signal, not wire API surface.
+	IsDeferredIndefinitely *bool `json:"-"`
 	// Revision is the store-internal optimistic-concurrency token for
 	// ConditionalWriter. It is deliberately json:"-" so it stays off every HTTP
 	// and SSE wire path (beads.Bead is both the Huma response type and the SSE
@@ -474,6 +487,36 @@ func IsReadyCandidateForTier(b Bead, now time.Time, tier TierMode) bool {
 	return b.Status == "open" &&
 		!IsReadyExcludedBead(b) &&
 		!IsDeferred(b, now)
+}
+
+// IsStatusDispatchable reports whether a bead's status/defer state would let
+// it surface via Ready()'s status/defer axis — the same status set
+// Ready() queries (StatusOpen, plus StatusDeferred only once an expired
+// DeferUntil resurfaces it) — checked directly against a single bead instead
+// of a bulk Ready() scan. Unlike IsReadyCandidateForTier, this deliberately
+// does NOT apply the type/label/tier/assignee exclusions: it exists for
+// callers like gc sling's preflight that need to refuse writing routing
+// metadata onto a target that would silently never surface (ga-tk5mcg.2),
+// without also refusing legitimate targets for unrelated reasons — an
+// in_progress bead is a valid --reassign target and must return true here.
+//
+// Checks, in order: closed beads are never dispatchable; a bead carrying
+// IsDeferredIndefinitely=true (collapsing backends) or a raw Status of
+// "deferred" with no DeferUntil (non-collapsing backends) is bd's
+// status-based indefinite deferral and stays hidden until explicitly
+// un-deferred; otherwise falls through to IsDeferred's ordinary
+// future-DeferUntil check.
+func IsStatusDispatchable(b Bead, now time.Time) bool {
+	if b.Status == "closed" {
+		return false
+	}
+	if b.IsDeferredIndefinitely != nil && *b.IsDeferredIndefinitely {
+		return false
+	}
+	if b.Status == "deferred" && b.DeferUntil == nil {
+		return false
+	}
+	return !IsDeferred(b, now)
 }
 
 // IsReadyExcludedBead reports whether a bead is infrastructure rather than

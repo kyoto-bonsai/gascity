@@ -114,6 +114,11 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 			return result, err
 		}
 	}
+	if shouldCheckTargetDispatchable(opts) {
+		if err := checkTargetDispatchable(opts, deps); err != nil {
+			return result, err
+		}
+	}
 	if shouldGuardCrossRig(opts) {
 		if err := CrossRigRouteError(opts.BeadOrFormula, a, deps.Cfg); err != nil {
 			return result, err
@@ -511,6 +516,108 @@ func checkLiveRoutingConflict(opts SlingOpts, deps SlingDeps) error {
 		}
 	}
 	return nil
+}
+
+// shouldCheckTargetDispatchable reports whether preflight should verify
+// opts.BeadOrFormula's status/defer state before stamping gc.routed_to on
+// it. Applicability mirrors shouldValidateExistingBead/shouldCheckOfficerOfRecord
+// (a formula LAUNCH creates a fresh open bead with nothing to check; a
+// dry-run inline-text preview never resolves a real target bead) since this
+// check is only meaningful against a bead that already exists. Unlike
+// shouldCheckLiveRoutingConflict, this does NOT additionally gate on
+// !opts.Force: see checkTargetDispatchable's doc comment for why forcing
+// through is never a legitimate override here.
+func shouldCheckTargetDispatchable(opts SlingOpts) bool {
+	return !opts.IsFormula && !(opts.DryRun && opts.InlineText)
+}
+
+// checkTargetDispatchable refuses to route opts.BeadOrFormula onto
+// a.QualifiedName() when the target bead's status/defer state would exclude
+// it from Ready()'s pool-demand probe. nativeDoltOpenReadyStatuses
+// (internal/beads/native_dolt_store.go) documents the exact set Ready()
+// queries: only StatusOpen, or StatusDeferred once an expired DeferUntil
+// resurfaces it. beads.IsStatusDispatchable is the shared, store-independent
+// predicate for that same axis; see its doc comment for why this check does
+// not fold in Ready()'s type/label/tier/assignee exclusions too — those are
+// separate, already-understood concerns, not this bug's shape.
+//
+// Confirmed specimen: ga-96zjze was parked deferred with no --until (bd
+// defer's status-based indefinite deferral). A sling still wrote
+// gc.routed_to successfully — the bead's Status/DeferUntil looked identical
+// to an ordinary open bead once collapsed — and it sat invisible to `bd
+// ready` for 21h despite the routing write "succeeding" (ga-tk5mcg.2).
+//
+// There is no --force override. Every other force-bypassable preflight
+// check (checkLiveRoutingConflict, dep-cycle, cross-rig) exists to block an
+// outcome that forcing through can still legitimately produce — an operator
+// who --forces past a live-routing conflict gets a real, if risky, dispatch.
+// Forcing past this check cannot: the target's raw status is what excludes
+// it from Ready(), not gc sling's opinion about it, so writing gc.routed_to
+// anyway reproduces the exact silently-stranded state this check exists to
+// prevent, unconditionally. The fix is always to change the bead's status
+// first, never to override the sling.
+//
+// A bead that does not resolve (beads.ErrNotFound) is NOT refused here, for
+// the same --force-visibility reason checkOfficerOfRecord isn't: a bead
+// visible in a remote store not yet synced locally must keep working, and
+// this check cannot verify status on a bead it cannot see.
+func checkTargetDispatchable(opts SlingOpts, deps SlingDeps) error {
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	if querier == nil {
+		return nil
+	}
+	storeRef := strings.TrimSpace(deps.StoreRef)
+	if storeRef == "" {
+		storeRef = "local"
+	}
+	b, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: err}
+	}
+	now := time.Now().UTC()
+	if beads.IsStatusDispatchable(b, now) {
+		return nil
+	}
+	// Non-dispatchable: beads.IsStatusDispatchable's own conditions exhaust
+	// the possibilities below, so classifying here (for an actionable
+	// message only — the gate decision above already happened) can't drift
+	// out of sync with what actually blocked it.
+	a := opts.Target
+	target := a.QualifiedName()
+	// bd exposes distinct subcommands for each transition — reopen only
+	// clears closed, update --status open only clears a deferred status
+	// (see internal/beads/bdstore.go's "reopen" vs "update" write paths) —
+	// so the two refusal branches below name different fix commands.
+	clearDeferCmd := fmt.Sprintf("bd update %s --status open", opts.BeadOrFormula)
+	switch {
+	case b.Status == "closed":
+		return &NonDispatchableTargetError{
+			BeadID: opts.BeadOrFormula,
+			Target: target,
+			Status: "closed",
+			Fix:    fmt.Sprintf("reopen it first (bd reopen %s)", opts.BeadOrFormula),
+		}
+	case (b.IsDeferredIndefinitely != nil && *b.IsDeferredIndefinitely) || (b.Status == "deferred" && b.DeferUntil == nil):
+		return &NonDispatchableTargetError{
+			BeadID: opts.BeadOrFormula,
+			Target: target,
+			Status: "deferred indefinitely (bd defer with no --until)",
+			Fix:    "clear the defer first (" + clearDeferCmd + ")",
+		}
+	default: // beads.IsDeferred(b, now): a future-dated defer window
+		return &NonDispatchableTargetError{
+			BeadID: opts.BeadOrFormula,
+			Target: target,
+			Status: fmt.Sprintf("deferred until %s", b.DeferUntil.Format(time.RFC3339)),
+			Fix:    "wait for the defer window to pass, or clear it now (" + clearDeferCmd + ")",
+		}
+	}
 }
 
 // slingFormula handles the --formula dispatch path.
