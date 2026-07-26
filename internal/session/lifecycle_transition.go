@@ -252,7 +252,7 @@ func ClearWakeBlockersPatch(state State, sleepReason string) MetadataPatch {
 	switch SleepReason(sleepReason) {
 	case SleepReasonUserHold, SleepReasonWaitHold, SleepReasonQuarantine,
 		SleepReasonContextChurn, SleepReasonRateLimit, SleepReasonDrained,
-		SleepReasonProviderResourceExhausted:
+		SleepReasonProviderResourceExhausted, SleepReasonLoginExpired:
 		patch["sleep_reason"] = ""
 	}
 	return patch
@@ -280,7 +280,7 @@ func ClearExpiredQuarantinePatch(sleepReason string) MetadataPatch {
 	}
 	switch SleepReason(sleepReason) {
 	case SleepReasonQuarantine, SleepReasonContextChurn, SleepReasonRateLimit,
-		SleepReasonProviderResourceExhausted:
+		SleepReasonProviderResourceExhausted, SleepReasonLoginExpired:
 		patch["sleep_reason"] = ""
 	}
 	return patch

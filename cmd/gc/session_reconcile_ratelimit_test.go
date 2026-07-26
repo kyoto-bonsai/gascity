@@ -518,3 +518,90 @@ func TestCheckStability_QuotaExceeded_QuarantinesNotTerminal(t *testing.T) {
 		t.Errorf("%s = %q, want unset", sessionHealthStateMetadataKey, got)
 	}
 }
+
+// ga-5gsyts, operator ruling 2026-07-26: best-effort login-expiry patterns
+// must quarantine-and-retry, not mark terminal, and must preserve
+// conversation identity so a re-authenticated seat resumes instead of
+// restarting from zero (ga-uwptpu's own failure mode).
+func TestCheckStability_LoginExpiredScreen_QuarantinesNotTerminal(t *testing.T) {
+	now := time.Date(2026, 7, 26, 14, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := newTestStore()
+	dt := newDrainTracker()
+
+	session := makeBead("b1", map[string]string{
+		"last_woke_at":        now.Add(-10 * time.Second).Format(time.RFC3339),
+		"wake_attempts":       "3", // a real crash would push us to 4
+		"session_key":         "provider-conversation",
+		"started_config_hash": "config",
+	})
+
+	peek := func(_ int) (string, error) {
+		return "Session expired. Please run /login to continue.", nil
+	}
+
+	_, stab := checkStability(seedSessionInfo(session), nil, false, dt, sessionFrontDoor(store), clk, peek)
+	syncBeadFromStore(&session, store)
+	if !stab {
+		t.Fatal("checkStability should return true when it records a login-expired quarantine")
+	}
+	if got := session.Metadata["wake_attempts"]; got != "3" {
+		t.Errorf("wake_attempts = %q, want 3; a login-expired quarantine must not count as a crash", got)
+	}
+	if got := session.Metadata["state"]; got != "asleep" {
+		t.Errorf("state = %q, want asleep", got)
+	}
+	if got := session.Metadata["sleep_reason"]; got != string(sessionpkg.SleepReasonLoginExpired) {
+		t.Errorf("sleep_reason = %q, want %q", got, string(sessionpkg.SleepReasonLoginExpired))
+	}
+	if got := session.Metadata["quarantined_until"]; got == "" {
+		t.Error("quarantined_until = \"\", want a future timestamp set")
+	}
+	if got := session.Metadata[sessionHealthStateMetadataKey]; got != "" {
+		t.Errorf("%s = %q, want unset (login expiry is not a terminal error)", sessionHealthStateMetadataKey, got)
+	}
+	if got := session.Metadata[sessionDrainableMetadataKey]; got != "" {
+		t.Errorf("%s = %q, want unset (login expiry is not a terminal error)", sessionDrainableMetadataKey, got)
+	}
+	// Conversation identity preserved — the whole point per ga-uwptpu.
+	if got := session.Metadata["session_key"]; got != "provider-conversation" {
+		t.Errorf("session_key = %q, want preserved", got)
+	}
+	if got := session.Metadata["started_config_hash"]; got != "config" {
+		t.Errorf("started_config_hash = %q, want preserved", got)
+	}
+	if got := session.Metadata["last_woke_at"]; got != "" {
+		t.Errorf("last_woke_at = %q, want cleared after quarantine classification", got)
+	}
+}
+
+// Login-expiry detection must win over both the resource-exhaustion and
+// terminal-error detectors when checked in sequence — asserts the actual
+// ordering in checkRateLimitStability, not just that each detector works in
+// isolation.
+func TestCheckStability_LoginExpired_WinsOverOtherClassifiers(t *testing.T) {
+	now := time.Date(2026, 7, 26, 14, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := newTestStore()
+	dt := newDrainTracker()
+
+	session := makeBead("b1", map[string]string{
+		"last_woke_at": now.Add(-10 * time.Second).Format(time.RFC3339),
+	})
+
+	// Pane content that plausibly contains BOTH a login-expiry cue and
+	// unrelated noise, confirming the login-expiry branch is checked first
+	// and short-circuits (matches checkRateLimitStability's source order).
+	peek := func(_ int) (string, error) {
+		return "oauth token refresh failed: invalid_grant\nPlease run /login to continue.", nil
+	}
+
+	_, stab := checkStability(seedSessionInfo(session), nil, false, dt, sessionFrontDoor(store), clk, peek)
+	syncBeadFromStore(&session, store)
+	if !stab {
+		t.Fatal("checkStability should return true")
+	}
+	if got := session.Metadata["sleep_reason"]; got != string(sessionpkg.SleepReasonLoginExpired) {
+		t.Errorf("sleep_reason = %q, want %q", got, string(sessionpkg.SleepReasonLoginExpired))
+	}
+}
