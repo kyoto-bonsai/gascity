@@ -567,6 +567,44 @@ func TestSend(t *testing.T) {
 	}
 }
 
+// TestSendRejectsBlankRecipient pins ga-qumgso: a blank recipient must fail
+// loudly rather than silently create a message bead that can never appear in
+// any inbox (the bead's Assignee, which the read-path keys on, would be "").
+func TestSendRejectsBlankRecipient(t *testing.T) {
+	for _, to := range []string{"", "   ", "\t\n"} {
+		store := beads.NewMemStore()
+		p := New(store)
+
+		if _, err := p.Send("human", to, "Subject", "body"); err == nil {
+			t.Errorf("Send(to=%q) = nil error, want rejection", to)
+		}
+
+		all, err := store.List(beads.ListQuery{Type: "message", TierMode: beads.TierBoth, AllowScan: true})
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if len(all) != 0 {
+			t.Errorf("Send(to=%q) created %d message bead(s), want 0", to, len(all))
+		}
+	}
+}
+
+// TestSendHandoffRejectsBlankRecipient is SendHandoff's counterpart to
+// TestSendRejectsBlankRecipient.
+func TestSendHandoffRejectsBlankRecipient(t *testing.T) {
+	for _, to := range []string{"", "   "} {
+		store := beads.NewMemStore()
+		p := New(store)
+
+		_, err := p.SendHandoff(mail.HandoffIntent{
+			From: "human", To: to, Subject: "Subject", Body: "body", ThreadID: "thread-test",
+		})
+		if err == nil {
+			t.Errorf("SendHandoff(to=%q) = nil error, want rejection", to)
+		}
+	}
+}
+
 func TestSendStoresStableSessionRouteWithoutChangingDisplaySender(t *testing.T) {
 	store := beads.NewMemStore()
 	p := New(store)

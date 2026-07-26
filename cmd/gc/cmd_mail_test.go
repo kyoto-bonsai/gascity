@@ -737,6 +737,50 @@ func TestCmdMailSendToControllerRecipientIsRejected(t *testing.T) {
 	}
 }
 
+// TestCmdMailSendBlankPositionalRecipientIsRejected pins ga-qumgso: a blank
+// positional recipient must fail loudly. Without the guard,
+// resolveMailRecipientIdentityCached treats "" as "unaddressed" and silently
+// canonicalizes it to "human" — so `gc mail send "" "body"` would silently
+// deliver to human instead of erroring on the caller's missing recipient.
+func TestCmdMailSendBlankPositionalRecipientIsRejected(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	for _, to := range []string{"", "   "} {
+		var stdout, stderr bytes.Buffer
+		code := cmdMailSend([]string{to, "body text"}, false, false, "human", "", "", "", &stdout, &stderr)
+		if code == 0 {
+			t.Fatalf("cmdMailSend(to=%q) = 0, want failure; stdout=%s stderr=%s", to, stdout.String(), stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "recipient is required") {
+			t.Fatalf("cmdMailSend(to=%q) stderr = %q, want recipient-required error", to, stderr.String())
+		}
+	}
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	all, err := store.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth, AllowScan: true})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	for _, b := range all {
+		if b.Type == "message" {
+			t.Fatalf("message bead should not be created for a blank recipient: %#v", b)
+		}
+	}
+}
+
 // TestCmdMailSendTrailingSlashHumanRecipientResolvesToHuman pins the default
 // escalation recipient contract: pack scripts address the reserved human
 // mailbox, and the trailing-slash target form must resolve to it instead of

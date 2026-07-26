@@ -140,10 +140,11 @@ func (c *sessionBeadCache) isFresh(now time.Time) bool {
 }
 
 // Send creates a message bead with subject in Title and body in Description.
-// Returns an error if to is empty: blank recipients produce messages that never
-// appear in any inbox but still inflate global counts.
+// Returns an error if to is empty or whitespace-only: blank recipients
+// produce messages that never appear in any inbox but still inflate global
+// counts.
 func (p *Provider) Send(from, to, subject, body string) (mail.Message, error) {
-	if to == "" {
+	if strings.TrimSpace(to) == "" {
 		return mail.Message{}, fmt.Errorf("beadmail send: recipient is required")
 	}
 	from, metadata, err := p.resolveSenderRoute(from)
@@ -174,7 +175,7 @@ func (p *Provider) Send(from, to, subject, body string) (mail.Message, error) {
 // implementation. Sender-route metadata is resolved exactly as [Provider.Send]
 // does, so handoff mail replies route correctly.
 func (p *Provider) SendHandoff(intent mail.HandoffIntent) (mail.Message, error) {
-	if intent.To == "" {
+	if strings.TrimSpace(intent.To) == "" {
 		return mail.Message{}, fmt.Errorf("beadmail handoff: recipient is required")
 	}
 	from, metadata, err := p.resolveSenderRoute(intent.From)

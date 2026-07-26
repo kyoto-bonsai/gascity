@@ -1775,6 +1775,15 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 			args = []string{args[0], subject, body}
 		}
 	}
+	if !all && len(args) > 0 && strings.TrimSpace(args[0]) == "" {
+		// resolveMailRecipientIdentityCached treats "" as "unaddressed" and
+		// maps it to "human" (the right call for identity resolution, where ""
+		// legitimately means "use the ambient default"). A send recipient has
+		// no such default: a blank arg here is a caller bug, not an implicit
+		// human. Reject before canonicalization so it can't silently retarget.
+		fmt.Fprintln(stderr, "gc mail send: recipient is required") //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	if !all && len(args) > 0 && store != nil {
 		canonicalTo, err := resolveMailRecipientIdentityCached(cityPath, cfg, store, args[0], idCache)
 		if err != nil {
