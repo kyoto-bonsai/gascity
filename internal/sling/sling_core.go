@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
@@ -105,6 +106,11 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 	}
 	if shouldCheckOfficerOfRecord(opts) {
 		if err := checkOfficerOfRecord(opts, deps); err != nil {
+			return result, err
+		}
+	}
+	if shouldCheckLiveRoutingConflict(opts) {
+		if err := checkLiveRoutingConflict(opts, deps); err != nil {
 			return result, err
 		}
 	}
@@ -432,6 +438,119 @@ func checkOfficerOfRecord(opts SlingOpts, deps SlingDeps) error {
 		return nil
 	}
 	return &MissingOfficerOfRecordError{BeadID: opts.BeadOrFormula, Target: a.QualifiedName()}
+}
+
+// liveRoutingConflictHeartbeatWindow bounds how recent a candidate session's
+// gc.last_heartbeat_at must be to count as a live conflict. Chosen to
+// comfortably absorb ordinary inter-heartbeat gaps (tool latency, brief idle
+// stretches) while excluding a session that is merely still-claimed but
+// stranded for the long tail (parked at a stale interactive prompt, a
+// credit-outage freeze) — recovery tooling needs to be able to re-route
+// around those without tripping this guard. First-pass value; the validator
+// on ga-5m7fir should weigh in if fixture evidence shows it too tight/loose.
+const liveRoutingConflictHeartbeatWindow = 5 * time.Minute
+
+// shouldCheckLiveRoutingConflict reports whether preflight should enforce the
+// live-routing guard for this sling. Applicability mirrors
+// shouldCheckOfficerOfRecord for the same reasons (a formula LAUNCH creates a
+// fresh bead with no claim history to conflict with; a dry-run inline-text
+// preview never resolves a real target bead). Unlike checkOfficerOfRecord,
+// --force DOES bypass this guard: this is a live-safety interlock against
+// accidental concurrent dispatch (ga-11quqf), not a compliance/paper-trail
+// requirement with "no exceptions" — a deliberate operator override stays
+// available. This governs applicability only.
+func shouldCheckLiveRoutingConflict(opts SlingOpts) bool {
+	return !opts.IsFormula && !(opts.DryRun && opts.InlineText) && !opts.Force
+}
+
+// checkLiveRoutingConflict enforces the live-routing guard: gc sling refuses
+// to route opts.BeadOrFormula to a.QualifiedName() when that same target
+// already has a live session — a session bead whose gc.template matches the
+// target and whose gc.last_heartbeat_at is within
+// liveRoutingConflictHeartbeatWindow — claimed (Assignee == that session's
+// session_name, Status == in_progress) on a DIFFERENT bead. Mirrors
+// checkOfficerOfRecord's refusal shape, applied to gc.routed_to/session-
+// liveness instead of officer identity: a Go-side hard block at dispatch time,
+// closing the gap left by Efficiency W1 (ga-k1fe1d, Python-side detect-after-
+// the-fact fleet-lint dedup). Evidence base: ga-11quqf (same-persona
+// concurrent-session races — this reproduces the two-nils-sessions-build-
+// same-binary incident, where one session shipped a disclosed-defective
+// binary while a second believed a hold was in effect).
+//
+// Like checkOfficerOfRecord, this is opt-in at the city-config level (no-op
+// when RoutingPolicy.Configured() is false) and exempt targets (officers, CoS
+// office, independent audit, meta) are never subject to it — those seats are
+// accountable-by-construction and routinely run overlapping sessions as part
+// of normal operation.
+//
+// Every store lookup failure here is fail-open (returns nil, not an error):
+// this guard is an ADDITIONAL safety layer over dispatch paths that already
+// carry their own idempotency/reassign safeguards, not the sole enforcement
+// point for a hard requirement the way checkOfficerOfRecord's BeadLookupError
+// precedent is — a transient session-store read failure must not block every
+// sling in the city.
+func checkLiveRoutingConflict(opts SlingOpts, deps SlingDeps) error {
+	if deps.Cfg == nil || !deps.Cfg.RoutingPolicy.Configured() {
+		return nil
+	}
+	a := opts.Target
+	target := a.QualifiedName()
+	if deps.Cfg.RoutingPolicy.Exempt(target) {
+		return nil
+	}
+	if deps.Store == nil {
+		return nil
+	}
+	sessionBeads, err := session.ListAllSessionBeads(deps.Store, beads.ListQuery{Status: "open"})
+	if err != nil {
+		return nil
+	}
+	now := time.Now()
+	for _, sb := range sessionBeads {
+		if sb.Metadata[beadmeta.TemplateMetadataKey] != target {
+			continue
+		}
+		sessionName := strings.TrimSpace(sb.Metadata["session_name"])
+		if sessionName == "" {
+			continue
+		}
+		if !hasFreshHeartbeat(sb.Metadata[beadmeta.LastHeartbeatAtMetadataKey], now) {
+			continue
+		}
+		claimed, err := deps.Store.List(beads.ListQuery{Assignee: sessionName, Status: "in_progress"})
+		if err != nil {
+			continue
+		}
+		for _, c := range claimed {
+			if c.ID == opts.BeadOrFormula {
+				continue
+			}
+			return &LiveRoutingConflictError{
+				BeadID:            opts.BeadOrFormula,
+				Target:            target,
+				ConflictingBeadID: c.ID,
+				Session:           sessionName,
+			}
+		}
+	}
+	return nil
+}
+
+// hasFreshHeartbeat reports whether an RFC3339 gc.last_heartbeat_at value is
+// within liveRoutingConflictHeartbeatWindow of now. An empty or unparsable
+// timestamp is treated as NOT fresh — fail-open toward allowing the sling,
+// consistent with checkLiveRoutingConflict's overall fail-open posture on
+// missing or malformed session data.
+func hasFreshHeartbeat(raw string, now time.Time) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+	return now.Sub(ts) <= liveRoutingConflictHeartbeatWindow
 }
 
 // slingFormula handles the --formula dispatch path.

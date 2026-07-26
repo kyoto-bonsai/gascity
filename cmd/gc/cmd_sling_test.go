@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
@@ -971,6 +972,228 @@ func TestDoSlingOfficerOfRecordNoopWhenPolicyUnconfigured(t *testing.T) {
 		t.Fatalf("doSling with unconfigured RoutingPolicy returned %d, want 0 (opt-in gate must no-op): stderr=%q", code, stderr.String())
 	}
 	assertStoreRoutedTo(t, deps.Store, "BL-1", "worker")
+}
+
+// liveRoutingConflictTestCfg returns a City with [routing] configured
+// (opt-in, no exempt groups) — the shared fixture for the live-routing-
+// conflict tests below. A dedicated helper (rather than reusing
+// officerOfRecordTestCfg) keeps this file's two gates' fixtures independent
+// if they ever need to diverge.
+func liveRoutingConflictTestCfg() *config.City {
+	return &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		RoutingPolicy: config.RoutingPolicyConfig{
+			OfficerOfRecordValueDomain: []string{"operator"},
+		},
+	}
+}
+
+// seedLiveSession creates a fake session bead — Type=session
+// (session.BeadType), Labels=[gc:session] (session.LabelSession), open, with
+// gc.template=target (matching a.QualifiedName()), session_name=name, and
+// gc.last_heartbeat_at=heartbeatAt (RFC3339) — for the live-routing-conflict
+// tests below.
+func seedLiveSession(t *testing.T, store beads.Store, target, name string, heartbeatAt time.Time) {
+	t.Helper()
+	_, err := store.Create(beads.Bead{
+		Title:  name,
+		Type:   "session",
+		Status: "open",
+		Labels: []string{"gc:session"},
+		Metadata: map[string]string{
+			beadmeta.TemplateMetadataKey:        target,
+			"session_name":                      name,
+			beadmeta.LastHeartbeatAtMetadataKey: heartbeatAt.UTC().Format(time.RFC3339),
+		},
+	})
+	if err != nil {
+		t.Fatalf("seeding live session bead: %v", err)
+	}
+}
+
+// seedClaimedBead creates a work bead and transitions it to
+// Status=in_progress with the given assignee. MemStore.Create unconditionally
+// forces Status="open" on every new bead regardless of the input value, so
+// the in_progress transition must go through a separate Update call — a
+// Create alone cannot seed an already-claimed fixture.
+func seedClaimedBead(t *testing.T, store beads.Store, title, assignee string, metadata map[string]string) beads.Bead {
+	t.Helper()
+	created, err := store.Create(beads.Bead{Title: title, Type: "task", Metadata: metadata})
+	if err != nil {
+		t.Fatalf("seeding %q: %v", title, err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(created.ID, beads.UpdateOpts{Status: &inProgress, Assignee: &assignee}); err != nil {
+		t.Fatalf("claiming %q: %v", title, err)
+	}
+	claimed, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("re-reading claimed %q: %v", title, err)
+	}
+	return claimed
+}
+
+// TestDoSlingRefusesLiveRoutingConflict reproduces ga-ktvnh1's fixture 1: a
+// bare-persona-alias sling while that alias's session is alive and
+// in_progress on a different bead (the ga-11quqf two-nils-sessions-build-
+// same-binary incident).
+func TestDoSlingRefusesLiveRoutingConflict(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", time.Now())
+	claimed := seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
+	target, err := deps.Store.Create(beads.Bead{
+		Title: "new work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding target bead: %v", err)
+	}
+
+	opts := testOpts(a, target.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling returned 0, want non-zero (refused for live routing conflict)")
+	}
+	if !strings.Contains(stderr.String(), "live session") {
+		t.Errorf("stderr = %q, want live-session refusal wording", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), claimed.ID) {
+		t.Errorf("stderr = %q, want it to name the conflicting bead %q", stderr.String(), claimed.ID)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("got %d runner calls, want 0 — should refuse before dispatch", len(runner.calls))
+	}
+}
+
+// TestDoSlingRoutesWhenNoLiveConflict is the negative case: zero session
+// beads exist, so the guard must not false-positive.
+func TestDoSlingRoutesWhenNoLiveConflict(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	created, err := deps.Store.Create(beads.Bead{
+		Title: "new work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding bead: %v", err)
+	}
+
+	opts := testOpts(a, created.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 — no live session exists: stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, created.ID, "worker")
+}
+
+// TestDoSlingLiveRoutingConflictForceBypasses proves --force overrides this
+// guard, unlike the officer-of-record gate — a deliberate design difference
+// (see shouldCheckLiveRoutingConflict's doc comment): this is a live-safety
+// interlock, not a compliance requirement with no exceptions.
+func TestDoSlingLiveRoutingConflictForceBypasses(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", time.Now())
+	seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
+	target, err := deps.Store.Create(beads.Bead{
+		Title: "new work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding target bead: %v", err)
+	}
+
+	opts := testOpts(a, target.ID)
+	opts.Force = true
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling with --force returned %d, want 0 — force bypasses this guard: stderr=%q", code, stderr.String())
+	}
+}
+
+// TestDoSlingLiveRoutingConflictStaleHeartbeatAllowed proves a stranded
+// session (stale heartbeat) does not block a reclaim — the "good" outcome of
+// fixture 2 (pool-alias reuse onto a dead-but-not-yet-reconciled seat): once
+// the prior seat's heartbeat has gone stale, recovery tooling must be able to
+// re-route around it.
+func TestDoSlingLiveRoutingConflictStaleHeartbeatAllowed(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-stale-1", time.Now().Add(-2*time.Hour))
+	seedClaimedBead(t, deps.Store, "stranded claim", "worker-stale-1", map[string]string{"gc.officer_of_record": "operator"})
+	target, err := deps.Store.Create(beads.Bead{
+		Title: "reclaim work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding target bead: %v", err)
+	}
+
+	opts := testOpts(a, target.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 — stale heartbeat must not block a reclaim: stderr=%q", code, stderr.String())
+	}
+}
+
+// TestDoSlingLiveRoutingConflictNoopWhenPolicyUnconfigured mirrors the
+// officer-of-record gate's own no-op test: a city that has not authored
+// [routing] at all must see unchanged behavior, even with a live conflicting
+// session present.
+func TestDoSlingLiveRoutingConflictNoopWhenPolicyUnconfigured(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", time.Now())
+	seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", nil)
+
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling with unconfigured RoutingPolicy returned %d, want 0 (opt-in gate must no-op): stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "worker")
+}
+
+// TestDoSlingLiveRoutingConflictSameBeadIsNotAConflict proves re-slinging the
+// bead a live session already holds is not treated as a conflict — only a
+// DIFFERENT bead triggers the guard.
+func TestDoSlingLiveRoutingConflictSameBeadIsNotAConflict(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	created := seedClaimedBead(t, deps.Store, "already mine", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", time.Now())
+
+	opts := testOpts(a, created.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 — re-slinging the same bead the live session already holds is not a conflict: stderr=%q", code, stderr.String())
+	}
 }
 
 func TestDoSlingSuspendedRigWarns(t *testing.T) {
