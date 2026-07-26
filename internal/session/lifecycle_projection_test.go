@@ -190,6 +190,32 @@ func TestProjectLifecycleCreatingStalenessUsesPendingCreateStartedAt(t *testing.
 	}
 }
 
+// TestProjectLifecycleStartPendingStalenessUsesPendingCreateStartedAt mirrors
+// TestProjectLifecycleCreatingStalenessUsesPendingCreateStartedAt above:
+// RequestWakePatch stamps pending_create_started_at at the same instant it
+// sets state=start-pending, so the fresh/stale boundary must be measured from
+// that field, not CreatedAt (which can predate the current wake attempt by an
+// arbitrary amount for a reopened/reused session bead).
+func TestProjectLifecycleStartPendingStalenessUsesPendingCreateStartedAt(t *testing.T) {
+	now := time.Date(2026, 5, 3, 9, 0, 0, 0, time.UTC)
+	view := ProjectLifecycle(LifecycleInput{
+		Status:                 "open",
+		StoredState:            string(StateStartPending),
+		PendingCreateStartedAt: now.Add(-30 * time.Second).UTC().Format(time.RFC3339),
+		Runtime:                RuntimeFacts{Observed: true, Alive: false},
+		CreatedAt:              now.Add(-2 * time.Minute),
+		StaleStartPendingAfter: time.Minute,
+		Now:                    now,
+	})
+
+	if view.RuntimeProjection != RuntimeProjectionStartRequested {
+		t.Fatalf("RuntimeProjection = %q, want %q", view.RuntimeProjection, RuntimeProjectionStartRequested)
+	}
+	if view.ReconciledState != StateStartPending {
+		t.Fatalf("ReconciledState = %q, want %q", view.ReconciledState, StateStartPending)
+	}
+}
+
 func TestProjectLifecycleNamedIdentityProjection(t *testing.T) {
 	now := time.Date(2026, 4, 15, 12, 0, 0, 0, time.UTC)
 
@@ -452,6 +478,58 @@ func TestProjectLifecycleRuntimeLivenessProjection(t *testing.T) {
 				CreatedAt:          now.Add(-2 * time.Minute),
 				StaleCreatingAfter: time.Minute,
 				Now:                now,
+			},
+			wantRuntime:         RuntimeProjectionStartRequested,
+			wantReconciledState: StateStartPending,
+		},
+		{
+			name: "fresh start-pending state stays start-pending",
+			input: LifecycleInput{
+				Status:                 "open",
+				StoredState:            string(StateStartPending),
+				Runtime:                RuntimeFacts{Observed: true, Alive: false},
+				CreatedAt:              now.Add(-30 * time.Second),
+				StaleStartPendingAfter: time.Minute,
+				Now:                    now,
+			},
+			wantRuntime:         RuntimeProjectionStartRequested,
+			wantReconciledState: StateStartPending,
+		},
+		{
+			// Unlike stale-creating, staleness here does NOT reset continuation
+			// identity: shouldResetContinuation only fires for BaseStateActive/
+			// BaseStateCreating, deliberately excluding BaseStateStartPending —
+			// no provider Start attempt has begun yet at start-pending, so an
+			// existing SessionKey/StartedConfigHash from a prior active period
+			// is not made stale by the reconciler failing to pick up this wake
+			// request; a fresh wake attempt should still be allowed to resume it.
+			name: "stale start-pending state heals to asleep without resetting resume identity",
+			input: LifecycleInput{
+				Status:                 "open",
+				StoredState:            string(StateStartPending),
+				SessionKey:             "old-provider-conversation",
+				Runtime:                RuntimeFacts{Observed: true, Alive: false},
+				CreatedAt:              now.Add(-2 * time.Minute),
+				StaleStartPendingAfter: time.Minute,
+				Now:                    now,
+			},
+			wantRuntime:         RuntimeProjectionStaleStartPending,
+			wantReconciledState: StateAsleep,
+			wantReset:           false,
+		},
+		{
+			// StaleStartPendingAfter defaulting to zero (no caller opted in, e.g.
+			// the non-reconciler ProjectLifecycle call sites that never set it)
+			// must behave exactly like the pre-fix code: unconditionally
+			// start-pending, never ages out. Same disabled-by-zero convention as
+			// StaleCreatingAfter/creatingStateIsStale.
+			name: "start-pending never ages out when StaleStartPendingAfter is unset",
+			input: LifecycleInput{
+				Status:      "open",
+				StoredState: string(StateStartPending),
+				Runtime:     RuntimeFacts{Observed: true, Alive: false},
+				CreatedAt:   now.Add(-24 * time.Hour),
+				Now:         now,
 			},
 			wantRuntime:         RuntimeProjectionStartRequested,
 			wantReconciledState: StateStartPending,

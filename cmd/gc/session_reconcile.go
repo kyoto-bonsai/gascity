@@ -235,6 +235,19 @@ const staleCreatingStateTimeout = time.Minute
 // out from under the reconciler's still-active never-started lease.
 const stalePendingCreateTimeout = 5 * time.Minute
 
+// staleStartPendingStateTimeout bounds how long a state=start-pending bead may
+// sit — a wake has been requested (RequestWakePatch) but no provider Start
+// attempt has begun yet (the boundary into state=creating, handled separately
+// by staleCreatingStateTimeout above) — before ProjectLifecycle ages it to
+// StateAsleep so the reconciler gets another chance at it rather than leaving
+// it stuck indefinitely. Set to the same order of magnitude as
+// stalePendingCreateTimeout (a deliberately longer grace than
+// staleCreatingStateTimeout's one minute): unlike an in-flight provider Start
+// call, start-pending can legitimately queue behind ordinary reconciler
+// backlog before a Start attempt even begins, per gc-durability-findings-
+// 2026-07-25.md §4 (three separate documented start-pending-hang incidents).
+const staleStartPendingStateTimeout = 5 * time.Minute
+
 // sessionMetadataStateInfo normalizes the RAW persisted state metadata
 // (Info.MetadataState, not the normalized Info.State) onto the display/decision
 // vocabulary: awake→active, start_pending→creating, drained→asleep, everything
@@ -879,14 +892,17 @@ func mergeMetadataPatch(dst, src map[string]string) map[string]string {
 func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, clk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) map[string]string {
 	var now time.Time
 	var staleCreatingAfter time.Duration
+	var staleStartPendingAfter time.Duration
 	if clk != nil {
 		now = clk.Now()
 		staleCreatingAfter = staleCreatingStateTimeout
+		staleStartPendingAfter = staleStartPendingStateTimeout
 	}
 	lcInput := sessionpkg.LifecycleInputFromInfo(info)
 	lcInput.Runtime = sessionpkg.RuntimeFacts{Observed: true, Alive: alive}
 	lcInput.CreatedAt = info.CreatedAt
 	lcInput.StaleCreatingAfter = staleCreatingAfter
+	lcInput.StaleStartPendingAfter = staleStartPendingAfter
 	lcInput.Now = now
 	view := sessionpkg.ProjectLifecycle(lcInput)
 
