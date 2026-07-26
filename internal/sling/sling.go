@@ -858,6 +858,26 @@ func (e *MissingOfficerOfRecordError) Error() string {
 		e.BeadID, e.Target, e.BeadID)
 }
 
+// LiveRoutingConflictError reports that a staff-persona routing target
+// already has a live session claimed on a different bead. Unlike
+// MissingOfficerOfRecordError, --force overrides this check — see
+// shouldCheckLiveRoutingConflict's doc comment for why.
+type LiveRoutingConflictError struct {
+	BeadID            string
+	Target            string
+	ConflictingBeadID string
+	Session           string
+}
+
+// Error returns the live-routing-conflict diagnostic, naming the conflicting
+// bead and session so the caller can inspect it before deciding to --force.
+func (e *LiveRoutingConflictError) Error() string {
+	return fmt.Sprintf(
+		"gc sling: refusing %s → %s: target has a live session (%s) already claimed on %s — "+
+			"use --force to override, or wait for %s to release it",
+		e.BeadID, e.Target, e.Session, e.ConflictingBeadID, e.ConflictingBeadID)
+}
+
 // BeadLookupError reports an operational failure while checking whether a bead
 // exists in the target store.
 type BeadLookupError struct {
