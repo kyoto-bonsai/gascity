@@ -3085,6 +3085,92 @@ func TestMailSendAcceptsNudgeAlias(t *testing.T) {
 	}
 }
 
+// --- ga-2w649o: predicate-based auto-nudge, not flag-gated ---
+
+func TestMailShouldAttemptNudge(t *testing.T) {
+	if mailShouldAttemptNudge(nil) {
+		t.Error("mailShouldAttemptNudge(nil store) = true, want false")
+	}
+	if !mailShouldAttemptNudge(beads.NewMemStore()) {
+		t.Error("mailShouldAttemptNudge(store) = false, want true (a live-session nudge must be attempted regardless of --notify)")
+	}
+}
+
+// setupMailNotifyTestCity creates an isolated temp city with one session bead
+// (alias "recipient") and returns its path. Each caller gets its own city so
+// notify=false/notify=true runs can't see each other's message-bead IDs.
+func setupMailNotifyTestCity(t *testing.T) string {
+	t.Helper()
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "sender",
+			"session_name": "sender-gc-42",
+		},
+	}); err != nil {
+		t.Fatalf("Create sender: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "recipient",
+			"session_name": "recipient-gc-42",
+		},
+	}); err != nil {
+		t.Fatalf("Create recipient: %v", err)
+	}
+	return cityPath
+}
+
+// TestMailSendNotifyFlagNoLongerGatesNudgeAttempt is the CLI-level regression
+// guard for ga-2w649o: --notify must no longer be the thing that decides
+// whether a nudge is attempted (mailShouldAttemptNudge above is the unit-level
+// guard for the same claim). Runs cmdMailSendJSON once with notify=false and
+// once with notify=true against separately-fixtured but identical cities and
+// asserts the two runs are indistinguishable on the signals that would differ
+// if the flag still gated the attempt.
+func TestMailSendNotifyFlagNoLongerGatesNudgeAttempt(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_SESSION_ID", "gc-does-not-match")
+	t.Setenv("GC_ALIAS", "sender")
+	_ = os.Unsetenv("GC_AGENT")
+
+	run := func(notify bool) mailActionResult {
+		t.Setenv("GC_CITY", setupMailNotifyTestCity(t))
+		var stdout, stderr bytes.Buffer
+		code := cmdMailSendJSON([]string{"recipient", "hello"}, notify, false, "", "", "", "", true, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("cmdMailSendJSON(notify=%v) = %d, want 0; stdout=%s stderr=%s", notify, code, stdout.String(), stderr.String())
+		}
+		var result mailActionResult
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("unmarshal cmdMailSendJSON(notify=%v) output: %v; stdout=%s", notify, err, stdout.String())
+		}
+		return result
+	}
+
+	withoutFlag := run(false)
+	withFlag := run(true)
+
+	if withoutFlag.OK != withFlag.OK {
+		t.Errorf("OK differs: notify=false -> %v, notify=true -> %v", withoutFlag.OK, withFlag.OK)
+	}
+	if withoutFlag.Notified != withFlag.Notified {
+		t.Errorf("Notified differs: notify=false -> %v, notify=true -> %v (the flag must no longer change whether a nudge is attempted)", withoutFlag.Notified, withFlag.Notified)
+	}
+}
+
 // --- gc mail send --all ---
 
 func TestMailSendAll(t *testing.T) {
