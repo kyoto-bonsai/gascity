@@ -1861,6 +1861,50 @@ func TestHealState_StaleCreatingWithoutPendingClaimHealsToAsleep(t *testing.T) {
 	}
 }
 
+// Durability fix 5 (ga-ig880p): mirrors
+// TestHealState_PreservesFreshCreatingWithoutPendingClaim for the
+// start-pending sub-state — a fresh RequestWakePatch must not be aged out
+// before staleStartPendingStateTimeout elapses.
+func TestHealState_PreservesFreshStartPending(t *testing.T) {
+	store := newTestStore()
+	clk := &clock.Fake{Time: time.Date(2026, 3, 29, 4, 0, 0, 0, time.UTC)}
+
+	session := makeBead("b1", map[string]string{
+		"state":                     string(sessionpkg.StateStartPending),
+		"pending_create_started_at": pendingCreateStartedAtNow(clk.Now().Add(-30 * time.Second)),
+	})
+	session.CreatedAt = clk.Now().Add(-30 * time.Second)
+
+	healStateInfo(&session, false, sessionFrontDoor(store), clk)
+	if session.Metadata["state"] != string(sessionpkg.StateStartPending) {
+		t.Fatalf("state = %q, want start-pending", session.Metadata["state"])
+	}
+}
+
+// Durability fix 5 (ga-ig880p): mirrors
+// TestHealState_StaleCreatingWithoutPendingClaimHealsToAsleep for the
+// start-pending sub-state. Before this fix, BaseStateStartPending had no
+// staleness check at all in projectRuntimeProjection and this heal would
+// never fire — a session stuck in start-pending (e.g. the reconciler crashing
+// between RequestWakePatch and the provider Start attempt) stayed
+// start-pending forever, per gc-durability-findings-2026-07-25.md §4.
+func TestHealState_StaleStartPendingHealsToAsleep(t *testing.T) {
+	store := newTestStore()
+	clk := &clock.Fake{Time: time.Date(2026, 3, 29, 4, 0, 0, 0, time.UTC)}
+
+	startedAt := clk.Now().Add(-staleStartPendingStateTimeout - time.Second)
+	session := makeBead("b1", map[string]string{
+		"state":                     string(sessionpkg.StateStartPending),
+		"pending_create_started_at": pendingCreateStartedAtNow(startedAt),
+	})
+	session.CreatedAt = startedAt
+
+	healStateInfo(&session, false, sessionFrontDoor(store), clk)
+	if session.Metadata["state"] != "asleep" {
+		t.Fatalf("state = %q, want asleep", session.Metadata["state"])
+	}
+}
+
 // ga-mf1 regression: a session bead that enters state=creating with
 // pending_create_claim=true and a now-stale pending_create_started_at must
 // settle in state=asleep after one heal tick and NOT flip back to creating on
