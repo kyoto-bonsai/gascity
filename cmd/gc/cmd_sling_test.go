@@ -26,6 +26,7 @@ import (
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/pgauth"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -990,10 +991,14 @@ func liveRoutingConflictTestCfg() *config.City {
 
 // seedLiveSession creates a fake session bead — Type=session
 // (session.BeadType), Labels=[gc:session] (session.LabelSession), open, with
-// gc.template=target (matching a.QualifiedName()), session_name=name, and
-// gc.last_heartbeat_at=heartbeatAt (RFC3339) — for the live-routing-conflict
-// tests below.
-func seedLiveSession(t *testing.T, store beads.Store, target, name string, heartbeatAt time.Time) {
+// template=target (matching a.QualifiedName()), session_name=name, and
+// state=state. These are the BARE metadata keys internal/session actually
+// writes (confirmed against manager.go's real session-creation Metadata map),
+// not the beadmeta gc.-prefixed constants this fixture originally used —
+// ga-5m7fir's validation found production read those same wrong constants,
+// so the original fixture agreed with the buggy code by construction rather
+// than with any real session bead. For the live-routing-conflict tests below.
+func seedLiveSession(t *testing.T, store beads.Store, target, name, state string) {
 	t.Helper()
 	_, err := store.Create(beads.Bead{
 		Title:  name,
@@ -1001,9 +1006,9 @@ func seedLiveSession(t *testing.T, store beads.Store, target, name string, heart
 		Status: "open",
 		Labels: []string{"gc:session"},
 		Metadata: map[string]string{
-			beadmeta.TemplateMetadataKey:        target,
-			"session_name":                      name,
-			beadmeta.LastHeartbeatAtMetadataKey: heartbeatAt.UTC().Format(time.RFC3339),
+			"template":     target,
+			"session_name": name,
+			"state":        state,
 		},
 	})
 	if err != nil {
@@ -1043,7 +1048,7 @@ func TestDoSlingRefusesLiveRoutingConflict(t *testing.T) {
 	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
 
 	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
-	seedLiveSession(t, deps.Store, "worker", "worker-live-1", time.Now())
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", string(session.StateActive))
 	claimed := seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
 	target, err := deps.Store.Create(beads.Bead{
 		Title: "new work", Type: "task",
@@ -1105,7 +1110,7 @@ func TestDoSlingLiveRoutingConflictForceBypasses(t *testing.T) {
 	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
 
 	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
-	seedLiveSession(t, deps.Store, "worker", "worker-live-1", time.Now())
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", string(session.StateActive))
 	seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
 	target, err := deps.Store.Create(beads.Bead{
 		Title: "new work", Type: "task",
@@ -1125,17 +1130,26 @@ func TestDoSlingLiveRoutingConflictForceBypasses(t *testing.T) {
 }
 
 // TestDoSlingLiveRoutingConflictStaleHeartbeatAllowed proves a stranded
-// session (stale heartbeat) does not block a reclaim — the "good" outcome of
-// fixture 2 (pool-alias reuse onto a dead-but-not-yet-reconciled seat): once
-// the prior seat's heartbeat has gone stale, recovery tooling must be able to
-// re-route around it.
+// session — one the reconciler has already transitioned to StateAsleep, the
+// observed shape of a dead session in this fleet (gc session list shows
+// state=asleep, reason=runtime-missing) — does not block a reclaim.
+//
+// This replaces the original heartbeat-window mechanism (gc.last_heartbeat_at,
+// a field with no live writer on session beads at all — see ga-5m7fir's root
+// cause) with the reconciler's own state field. Deliberate, disclosed scope
+// change versus the original design: a session that is dead but NOT YET
+// reconciled (state still active/awake because the sweep hasn't run) is now
+// treated as a live conflict requiring --force, whereas the original window
+// design would have allowed it through once the window elapsed. Flagging for
+// validator review rather than silently choosing — the reconciler's own
+// signal has no "not yet caught up" analogue to safely fall back to.
 func TestDoSlingLiveRoutingConflictStaleHeartbeatAllowed(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
 
 	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
-	seedLiveSession(t, deps.Store, "worker", "worker-stale-1", time.Now().Add(-2*time.Hour))
+	seedLiveSession(t, deps.Store, "worker", "worker-stale-1", string(session.StateAsleep))
 	seedClaimedBead(t, deps.Store, "stranded claim", "worker-stale-1", map[string]string{"gc.officer_of_record": "operator"})
 	target, err := deps.Store.Create(beads.Bead{
 		Title: "reclaim work", Type: "task",
@@ -1149,7 +1163,37 @@ func TestDoSlingLiveRoutingConflictStaleHeartbeatAllowed(t *testing.T) {
 	code := doSling(opts, deps, nil, stdout, stderr)
 
 	if code != 0 {
-		t.Fatalf("doSling returned %d, want 0 — stale heartbeat must not block a reclaim: stderr=%q", code, stderr.String())
+		t.Fatalf("doSling returned %d, want 0 — an asleep (reconciled-dead) session must not block a reclaim: stderr=%q", code, stderr.String())
+	}
+}
+
+// TestDoSlingLiveRoutingConflictAwakeStateIsLive proves StateAwake (the
+// reconciler's alias for StateActive, per internal/session/manager.go) is
+// also treated as a live conflict, not just the literal "active" value.
+func TestDoSlingLiveRoutingConflictAwakeStateIsLive(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-awake-1", string(session.StateAwake))
+	claimed := seedClaimedBead(t, deps.Store, "already claimed", "worker-awake-1", map[string]string{"gc.officer_of_record": "operator"})
+	target, err := deps.Store.Create(beads.Bead{
+		Title: "new work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding target bead: %v", err)
+	}
+
+	opts := testOpts(a, target.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling returned 0, want non-zero — StateAwake must be treated as a live conflict")
+	}
+	if !strings.Contains(stderr.String(), claimed.ID) {
+		t.Errorf("stderr = %q, want it to name the conflicting bead %q", stderr.String(), claimed.ID)
 	}
 }
 
@@ -1164,7 +1208,7 @@ func TestDoSlingLiveRoutingConflictNoopWhenPolicyUnconfigured(t *testing.T) {
 	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
 
 	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
-	seedLiveSession(t, deps.Store, "worker", "worker-live-1", time.Now())
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", string(session.StateActive))
 	seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", nil)
 
 	opts := testOpts(a, "BL-1")
@@ -1186,7 +1230,7 @@ func TestDoSlingLiveRoutingConflictSameBeadIsNotAConflict(t *testing.T) {
 
 	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
 	created := seedClaimedBead(t, deps.Store, "already mine", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
-	seedLiveSession(t, deps.Store, "worker", "worker-live-1", time.Now())
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", string(session.StateActive))
 
 	opts := testOpts(a, created.ID)
 	code := doSling(opts, deps, nil, stdout, stderr)
