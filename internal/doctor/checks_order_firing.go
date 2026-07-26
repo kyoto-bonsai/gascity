@@ -27,15 +27,15 @@ const (
 	// out on read cost, not on reachability, and the old connectivity wording
 	// sent triage at a healthy data plane for a full cycle (ga-klv).
 	orderFiringTimeoutHint = "the city event log or order history is large; re-run the inspect commands bounded (gc order history <name> --limit 20) and consider gc events compact"
-	// orderFiringEventTailLimit bounds the newest-first event-log read. The
-	// check needs only each order's most recent firing, so it reads the tail
-	// of the log rather than scanning it whole: on a busy city the active log
-	// reaches hundreds of megabytes and a full scan costs tens of seconds per
-	// read (measured: 36s against a 161MB/253k-line log), which alone blows
-	// the check budget above. Any order whose newest firing falls outside this
-	// window is not lost — latestOrderFiredAt falls through to the bounded
-	// order-run history lookup, which is authoritative.
-	orderFiringEventTailLimit = 2000
+	// orderFiringEventTailLimit bounds the order.fired scan to the most
+	// recent N matching events instead of the full history (ga-17ow3v: on a
+	// live city this file plus its rotated archives can exceed 350MB and
+	// 40k+ matching lines, which reliably blew the 15s budget below). The
+	// tail read only ever opens the active file, never the gzip archives.
+	// Any order whose true last-fired time falls outside this window still
+	// gets a correct answer via the c.lastRun fallback in latestOrderFiredAt
+	// — this limit only bounds the fast path, not correctness.
+	orderFiringEventTailLimit = 20000
 	// orderFiringLastRunConcurrency caps the parallel order-run lookups. Each
 	// is an independent read against a store that may be remote, so the cap
 	// exists to be a good citizen against the data plane rather than to
