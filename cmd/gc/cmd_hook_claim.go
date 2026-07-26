@@ -284,20 +284,22 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 }
 
 // claimFirstEligibleHookCandidate claims the first unassigned, route-matched
-// candidate and returns a terminal result carrying the exit code of the
-// work-result write. A claim lost to a different live claimant is surfaced as a
-// bead.claim_rejected event before moving on. A candidate whose claim mutation
-// errors is logged and skipped so one unclaimable id cannot wedge the hook. When
-// no candidate can be claimed — none match this session, every claimable one was
-// lost to another claimant, or every claimable one errored — it returns a
-// non-terminal result (no output written) so a federated caller can try a later
-// store before the shared no-work drain; the result's claimsErrored flag records
-// whether any skip was an error so that drain stays distinguishable from idle.
+// candidate — preferring one whose gc.work_dir matches the caller's own, see
+// prioritizeHookClaimCandidatesByWorkDir — and returns a terminal result
+// carrying the exit code of the work-result write. A claim lost to a
+// different live claimant is surfaced as a bead.claim_rejected event before
+// moving on. A candidate whose claim mutation errors is logged and skipped so
+// one unclaimable id cannot wedge the hook. When no candidate can be claimed —
+// none match this session, every claimable one was lost to another claimant,
+// or every claimable one errored — it returns a non-terminal result (no
+// output written) so a federated caller can try a later store before the
+// shared no-work drain; the result's claimsErrored flag records whether any
+// skip was an error so that drain stays distinguishable from idle.
 func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) hookClaimResult {
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
 	claimsErrored := false
-	for _, candidate := range candidates {
+	for _, candidate := range prioritizeHookClaimCandidatesByWorkDir(candidates, dir) {
 		if !hookCandidateClaimable(candidate, opts.RouteTargets) {
 			continue
 		}
@@ -375,6 +377,39 @@ func hookCandidateClaimable(candidate beads.Bead, routeTargets []string) bool {
 	return strings.TrimSpace(candidate.ID) != "" &&
 		strings.TrimSpace(candidate.Assignee) == "" &&
 		hookClaimMatchesRoute(candidate, routeTargets)
+}
+
+// prioritizeHookClaimCandidatesByWorkDir stably reorders candidates so that
+// any candidate whose gc.work_dir metadata matches the calling session's own
+// working directory (dir) is tried first, ahead of every other candidate.
+// Every session in a pool shares one gc.routed_to route target — the bare
+// template, see hookClaimPrimaryRouteTarget's PoolName branch — so
+// hookCandidateClaimable's route-target match alone cannot distinguish this
+// session's own dispatched bead from a pool sibling's also-ready bead (ga-
+// vtv442: persona-kieran-1, working ga-2w4oxy, claimed persona-kieran-2's
+// ga-owbb42 instead, because it was first in work-query order). A caller with
+// no dir, or a candidate set with no work_dir-stamped match, is returned
+// unchanged: relative order is otherwise preserved exactly, so the prior
+// first-eligible-in-query-order contract still holds wherever work_dir
+// affinity does not apply.
+func prioritizeHookClaimCandidatesByWorkDir(candidates []beads.Bead, dir string) []beads.Bead {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return candidates
+	}
+	ordered := make([]beads.Bead, 0, len(candidates))
+	var rest []beads.Bead
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.Metadata[beadmeta.WorkDirMetadataKey]) == dir {
+			ordered = append(ordered, candidate)
+			continue
+		}
+		rest = append(rest, candidate)
+	}
+	if len(ordered) == 0 {
+		return candidates
+	}
+	return append(ordered, rest...)
 }
 
 // reportHookClaimRejected publishes a bead.claim_rejected event (ADR-0009) when a
