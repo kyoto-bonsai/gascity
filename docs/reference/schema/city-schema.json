@@ -2706,6 +2706,13 @@
           },
           "type": "array",
           "description": "OfficerOfRecordValueDomain lists the legal values for a stamped\ngc.officer_of_record (the department officers plus \"operator\"). Not\nenforced by the sling gate itself (which only checks presence) — used\nby doctrine/lint-layer tooling that additionally validates the stamped\nvalue, kept here so both layers can reference one declared domain."
+        },
+        "reports_to": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "ReportsTo maps a staff persona to the officer_of_record value gc sling\nshould auto-stamp when routing to that persona and the target bead does\nnot yet carry gc.officer_of_record. Source of truth for the mapping is\nrigs/personas/doctrine/agent-org-departments-v2-2026-07-12.md (the\nReports-to column) — kept in sync by hand, same discipline as\nRoutingExempt/OfficerOfRecordValueDomain above. Deliberately omits\npersonas already covered by RoutingExempt (officers, CoS office,\nindependent audit, meta): Exempt() short-circuits before this map is\never consulted for them, so an entry there would be dead data. This is\nthe \"fix at the source\" ga-owbb42 asks for: stamping here, before\ncheckOfficerOfRecord evaluates, means a mapped persona never trips the\ngate in the first place instead of being caught by fleet-lint V8 24h\nlater or requiring a human hand-stamp mid-dispatch."
         }
       },
       "additionalProperties": false,
