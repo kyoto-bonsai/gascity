@@ -843,6 +843,25 @@ func (e *MissingBeadError) Error() string {
 	return fmt.Sprintf("bead %q not found in store %s", e.BeadID, e.StoreRef)
 }
 
+// MissingOfficerOfRecordError reports that a staff-persona routing target's
+// bead lacks required gc.officer_of_record metadata. There is no --force
+// override for this check — rigs/personas/ariadne-plan-persona-standards-2026-07-25.md
+// phase_2_slinggate ruling (a) retires the prior flagged-exception dispatch
+// path entirely; this is the hard gate that replaces it.
+type MissingOfficerOfRecordError struct {
+	BeadID string
+	Target string
+}
+
+// Error returns the officer-of-record diagnostic, including the fix command.
+func (e *MissingOfficerOfRecordError) Error() string {
+	return fmt.Sprintf(
+		"gc sling: refusing %s → %s: missing gc.officer_of_record — "+
+			"set one first (gc bd update %s --set-metadata gc.officer_of_record=<officer>); "+
+			"no --force override for this check",
+		e.BeadID, e.Target, e.BeadID)
+}
+
 // BeadLookupError reports an operational failure while checking whether a bead
 // exists in the target store.
 type BeadLookupError struct {
