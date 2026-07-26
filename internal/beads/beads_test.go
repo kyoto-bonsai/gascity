@@ -146,6 +146,81 @@ func TestIsReadyCandidate(t *testing.T) {
 	}
 }
 
+// TestIsStatusDispatchable covers the status/defer axis gc sling's preflight
+// uses to refuse routing onto an unreachable target (ga-tk5mcg.2). The
+// indefinite-defer cases specifically exercise both shapes a Bead can arrive
+// in: collapsing backends (NativeDoltStore/BdStore) that erase raw
+// "deferred" to Status="open" but populate IsDeferredIndefinitely at
+// conversion time, and non-collapsing backends (MemStore/FileStore, and any
+// test fixture) where Status can simply read "deferred" directly. Both must
+// refuse — a guard that only recognizes one shape reproduces this same bug
+// class against whichever backend it doesn't cover.
+func TestIsStatusDispatchable(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Minute)
+	future := now.Add(time.Minute)
+	trueVal, falseVal := true, false
+
+	tests := []struct {
+		name string
+		bead Bead
+		want bool
+	}{
+		{
+			name: "open, never deferred",
+			bead: Bead{Status: "open"},
+			want: true,
+		},
+		{
+			name: "closed",
+			bead: Bead{Status: "closed"},
+			want: false,
+		},
+		{
+			name: "in_progress stays dispatchable (reassign target)",
+			bead: Bead{Status: "in_progress"},
+			want: true,
+		},
+		{
+			name: "indefinite defer, collapsing-backend shape (Status erased to open)",
+			bead: Bead{Status: "open", DeferUntil: nil, IsDeferredIndefinitely: &trueVal},
+			want: false,
+		},
+		{
+			name: "indefinite defer, raw-status backend shape (no field populated)",
+			bead: Bead{Status: "deferred", DeferUntil: nil, IsDeferredIndefinitely: nil},
+			want: false,
+		},
+		{
+			name: "backend explicitly confirms NOT indefinite (false, not nil)",
+			bead: Bead{Status: "open", DeferUntil: nil, IsDeferredIndefinitely: &falseVal},
+			want: true,
+		},
+		{
+			name: "expired time-bound defer resurfaces, raw-status shape",
+			bead: Bead{Status: "deferred", DeferUntil: &past},
+			want: true,
+		},
+		{
+			name: "future-dated defer, raw-status shape",
+			bead: Bead{Status: "deferred", DeferUntil: &future},
+			want: false,
+		},
+		{
+			name: "future-dated defer, collapsed-status shape",
+			bead: Bead{Status: "open", DeferUntil: &future},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsStatusDispatchable(tt.bead, now); got != tt.want {
+				t.Fatalf("IsStatusDispatchable(%+v) = %v, want %v", tt.bead, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestTierWispsIncludesNoHistoryRows(t *testing.T) {
 	items := []Bead{
 		{ID: "issue", Title: "issue", Status: "open", Type: "task"},

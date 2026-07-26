@@ -1,8 +1,10 @@
 package sling
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -85,6 +87,101 @@ func TestAttachFormulaToBeadEntryShapes(t *testing.T) {
 		}
 		if want := `instantiating default formula "nonexistent-formula" on`; !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %q, want prefix %q", err.Error(), want)
+		}
+	})
+}
+
+// TestCheckTargetDispatchable reproduces the ga-96zjze shape (ga-tk5mcg.2):
+// gc sling stamping gc.routed_to onto a target whose status/defer state
+// keeps it invisible to Ready()'s pool-demand probe, reporting success on a
+// dispatch that will never be delivered. Because a non-nil preflight error
+// short-circuits DoSling before finalize (the only place gc.routed_to is
+// written — see DoSling's switch), a typed *NonDispatchableTargetError here
+// is itself the proof gc.routed_to was never touched: asserting only that
+// DoSling returned *some* error would not distinguish this from an unrelated
+// failure, so each case checks the concrete error type.
+func TestCheckTargetDispatchable(t *testing.T) {
+	now := time.Now().UTC()
+	past := now.Add(-time.Hour)
+	future := now.Add(time.Hour)
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	newDeps := func(seed beads.Bead) SlingDeps {
+		deps := testDeps(&config.City{Workspace: config.Workspace{Name: "test"}}, runtime.NewFake(), newFakeRunner().run)
+		if seed.Metadata == nil {
+			seed.Metadata = map[string]string{}
+		}
+		deps.Store = beads.NewMemStoreFrom(0, []beads.Bead{seed}, nil)
+		return deps
+	}
+
+	t.Run("refuses indefinitely deferred bead", func(t *testing.T) {
+		deps := newDeps(beads.Bead{ID: "BL-1", Title: "stuck", Type: "task", Status: "deferred"})
+
+		_, err := DoSling(SlingOpts{Target: a, BeadOrFormula: "BL-1"}, deps, deps.Store)
+		var nde *NonDispatchableTargetError
+		if !errors.As(err, &nde) {
+			t.Fatalf("DoSling err = %v (%T), want *NonDispatchableTargetError", err, err)
+		}
+		if !strings.Contains(nde.Status, "deferred indefinitely") {
+			t.Errorf("Status = %q, want to mention indefinite defer", nde.Status)
+		}
+	})
+
+	t.Run("refuses closed bead", func(t *testing.T) {
+		deps := newDeps(beads.Bead{ID: "BL-1", Title: "done", Type: "task", Status: "closed"})
+
+		_, err := DoSling(SlingOpts{Target: a, BeadOrFormula: "BL-1"}, deps, deps.Store)
+		var nde *NonDispatchableTargetError
+		if !errors.As(err, &nde) {
+			t.Fatalf("DoSling err = %v (%T), want *NonDispatchableTargetError", err, err)
+		}
+		if nde.Status != "closed" {
+			t.Errorf("Status = %q, want %q", nde.Status, "closed")
+		}
+	})
+
+	t.Run("refuses future-dated defer window", func(t *testing.T) {
+		deps := newDeps(beads.Bead{ID: "BL-1", Title: "snoozed", Type: "task", Status: "deferred", DeferUntil: &future})
+
+		_, err := DoSling(SlingOpts{Target: a, BeadOrFormula: "BL-1"}, deps, deps.Store)
+		var nde *NonDispatchableTargetError
+		if !errors.As(err, &nde) {
+			t.Fatalf("DoSling err = %v (%T), want *NonDispatchableTargetError", err, err)
+		}
+	})
+
+	t.Run("allows expired defer window to resurface", func(t *testing.T) {
+		deps := newDeps(beads.Bead{ID: "BL-1", Title: "resurfaced", Type: "task", Status: "deferred", DeferUntil: &past})
+
+		if _, err := DoSling(SlingOpts{Target: a, BeadOrFormula: "BL-1"}, deps, deps.Store); err != nil {
+			t.Fatalf("DoSling: %v", err)
+		}
+	})
+
+	t.Run("allows open bead", func(t *testing.T) {
+		deps := newDeps(beads.Bead{ID: "BL-1", Title: "fresh", Type: "task", Status: "open"})
+
+		if _, err := DoSling(SlingOpts{Target: a, BeadOrFormula: "BL-1"}, deps, deps.Store); err != nil {
+			t.Fatalf("DoSling: %v", err)
+		}
+	})
+
+	t.Run("allows in_progress bead (reassign target)", func(t *testing.T) {
+		deps := newDeps(beads.Bead{ID: "BL-1", Title: "in flight", Type: "task", Status: "in_progress"})
+
+		if _, err := DoSling(SlingOpts{Target: a, BeadOrFormula: "BL-1"}, deps, deps.Store); err != nil {
+			t.Fatalf("DoSling: %v", err)
+		}
+	})
+
+	t.Run("--force does not bypass the refusal", func(t *testing.T) {
+		deps := newDeps(beads.Bead{ID: "BL-1", Title: "stuck", Type: "task", Status: "deferred"})
+
+		_, err := DoSling(SlingOpts{Target: a, BeadOrFormula: "BL-1", Force: true}, deps, deps.Store)
+		var nde *NonDispatchableTargetError
+		if !errors.As(err, &nde) {
+			t.Fatalf("DoSling with --force err = %v (%T), want *NonDispatchableTargetError (no override for this check)", err, err)
 		}
 	})
 }
