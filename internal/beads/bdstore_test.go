@@ -467,6 +467,46 @@ func TestBdIssueToBeadFallsBackToMetadataFrom(t *testing.T) {
 	}
 }
 
+// TestBdIssueToBeadPopulatesIsDeferredIndefinitely mirrors
+// TestBeadFromNativeIssuePopulatesIsDeferredIndefinitely for the BdStore
+// (bd-CLI-shelling) backend: mapBdStatus collapses bd's raw "deferred"
+// status into Bead.Status="open" here too, so toBead must carry the same
+// IsDeferredIndefinitely side channel gc sling's preflight relies on
+// (ga-tk5mcg.2).
+func TestBdIssueToBeadPopulatesIsDeferredIndefinitely(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json bd-indefinite`: {
+			out: []byte(`[{"id":"bd-indefinite","title":"stuck","status":"deferred","issue_type":"task","created_at":"2025-01-15T10:30:00Z"}]`),
+		},
+		`bd show --json bd-time-bound`: {
+			out: []byte(`[{"id":"bd-time-bound","title":"snoozed","status":"deferred","issue_type":"task","created_at":"2025-01-15T10:30:00Z","defer_until":"2099-01-01T00:00:00Z"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+
+	indefinite, err := s.Get("bd-indefinite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if indefinite.Status != "open" {
+		t.Errorf("indefinite.Status = %q, want open (the collapse this bug is about)", indefinite.Status)
+	}
+	if indefinite.IsDeferredIndefinitely == nil || !*indefinite.IsDeferredIndefinitely {
+		t.Errorf("indefinite.IsDeferredIndefinitely = %v, want pointer to true", indefinite.IsDeferredIndefinitely)
+	}
+
+	timeBound, err := s.Get("bd-time-bound")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeBound.IsDeferredIndefinitely == nil || *timeBound.IsDeferredIndefinitely {
+		t.Errorf("timeBound.IsDeferredIndefinitely = %v, want pointer to false (has a defer_until)", timeBound.IsDeferredIndefinitely)
+	}
+}
+
 func TestBdStoreGetNotFound(t *testing.T) {
 	// Real "not found" scenario: bd show returns an empty JSON array.
 	runner := func(_, _ string, _ ...string) ([]byte, error) {

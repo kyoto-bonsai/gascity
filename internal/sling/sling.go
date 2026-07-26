@@ -878,6 +878,31 @@ func (e *LiveRoutingConflictError) Error() string {
 		e.BeadID, e.Target, e.Session, e.ConflictingBeadID, e.ConflictingBeadID)
 }
 
+// NonDispatchableTargetError reports that opts.BeadOrFormula's status/defer
+// state would keep it invisible to Ready()'s pool-demand probe even after
+// gc.routed_to is stamped onto it — writing the metadata "succeeds" but the
+// bead never surfaces to any session, a silent no-op dispatch (confirmed
+// specimen: ga-96zjze, parked indefinitely deferred, routed via sling,
+// gc.routed_to moved successfully, and invisible to `bd ready` for 21h;
+// ga-tk5mcg.2). There is no --force override: forcing through never
+// produces a working dispatch, only the exact silently-stranded state this
+// check exists to prevent.
+type NonDispatchableTargetError struct {
+	BeadID string
+	Target string
+	Status string // human-readable, e.g. "closed", "deferred indefinitely", "deferred until 2026-08-01T00:00:00Z"
+	Fix    string // the actionable command to resolve it
+}
+
+// Error returns the non-dispatchable-target diagnostic, naming the status
+// and the fix command per ga-tk5mcg.2's acceptance floor.
+func (e *NonDispatchableTargetError) Error() string {
+	return fmt.Sprintf(
+		"gc sling: refusing %s → %s: target bead is %s — invisible to the ready pool, "+
+			"dispatch would silently no-op; %s; no --force override for this check",
+		e.BeadID, e.Target, e.Status, e.Fix)
+}
+
 // BeadLookupError reports an operational failure while checking whether a bead
 // exists in the target store.
 type BeadLookupError struct {

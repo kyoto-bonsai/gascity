@@ -197,6 +197,79 @@ func TestNativeDoltStoreGetPropagatesUpstreamError(t *testing.T) {
 	}
 }
 
+// TestBeadFromNativeIssuePopulatesIsDeferredIndefinitely covers the exact
+// collapse beadFromNativeIssue performs on issue.Status via mapBdStatus: an
+// indefinitely status-deferred issue (status=deferred, defer_until=NULL —
+// bd defer with no --until) converts to Bead.Status="open" indistinguishably
+// from a bead that was never deferred, so Get() callers checking Status
+// alone cannot see it (the exact shape behind ga-tk5mcg.2, reproduced via
+// gc sling against this store). IsDeferredIndefinitely is the side channel
+// that survives the collapse.
+func TestBeadFromNativeIssuePopulatesIsDeferredIndefinitely(t *testing.T) {
+	past := time.Now().UTC().Add(-time.Hour)
+	future := time.Now().UTC().Add(time.Hour)
+
+	tests := []struct {
+		name           string
+		status         beadslib.Status
+		deferUntil     *time.Time
+		wantStatus     string
+		wantIndefinite bool
+	}{
+		{
+			name:           "open, never deferred",
+			status:         beadslib.StatusOpen,
+			wantStatus:     "open",
+			wantIndefinite: false,
+		},
+		{
+			name:           "indefinitely deferred: status=deferred, no defer_until",
+			status:         beadslib.StatusDeferred,
+			deferUntil:     nil,
+			wantStatus:     "open", // the collapse this bug is about
+			wantIndefinite: true,
+		},
+		{
+			name:           "expired time-bound defer: status=deferred, defer_until in the past",
+			status:         beadslib.StatusDeferred,
+			deferUntil:     &past,
+			wantStatus:     "open",
+			wantIndefinite: false,
+		},
+		{
+			name:           "future time-bound defer: status=deferred, defer_until in the future",
+			status:         beadslib.StatusDeferred,
+			deferUntil:     &future,
+			wantStatus:     "open",
+			wantIndefinite: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issue := &beadslib.Issue{
+				ID:         "gc-1",
+				Title:      "test",
+				Status:     tt.status,
+				IssueType:  beadslib.TypeTask,
+				DeferUntil: tt.deferUntil,
+			}
+			bead, err := beadFromNativeIssue(issue)
+			if err != nil {
+				t.Fatalf("beadFromNativeIssue: %v", err)
+			}
+			if bead.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q", bead.Status, tt.wantStatus)
+			}
+			if bead.IsDeferredIndefinitely == nil {
+				t.Fatalf("IsDeferredIndefinitely = nil, want non-nil (populated) pointer")
+			}
+			if *bead.IsDeferredIndefinitely != tt.wantIndefinite {
+				t.Errorf("IsDeferredIndefinitely = %v, want %v", *bead.IsDeferredIndefinitely, tt.wantIndefinite)
+			}
+		})
+	}
+}
+
 func TestNativeDoltStoreConvertsDefaultPriorityAsUnset(t *testing.T) {
 	bead, err := beadFromNativeIssue(&beadslib.Issue{
 		ID:        "gc-unset-priority",

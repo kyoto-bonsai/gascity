@@ -787,28 +787,36 @@ func (b *bdIssue) toBead() Bead {
 		}
 		metadata["close_reason"] = b.CloseReason
 	}
+	// Captured before mapBdStatus collapses b.Status away — mirrors
+	// beadFromNativeIssue's native_dolt_store.go treatment; see
+	// Bead.IsDeferredIndefinitely's doc comment. bdIssue.Status is bd's raw
+	// JSON status string directly (no beadslib.Status typed wrapper on this
+	// backend), so "deferred" is compared as a literal, same as mapBdStatus's
+	// own case arms just below.
+	deferredIndefinitely := b.Status == "deferred" && b.DeferUntil == nil
 	return Bead{
-		ID:           b.ID,
-		Title:        b.Title,
-		Status:       mapBdStatus(b.Status),
-		Type:         b.IssueType,
-		Priority:     cloneIntPtr(b.Priority),
-		CreatedAt:    b.CreatedAt.Truncate(time.Second),
-		UpdatedAt:    b.UpdatedAt.Truncate(time.Second),
-		Assignee:     b.Assignee,
-		From:         from,
-		ParentID:     parentID,
-		Ref:          b.Ref,
-		Needs:        b.Needs,
-		Description:  b.Description,
-		Labels:       b.Labels,
-		Metadata:     metadata,
-		Dependencies: deps,
-		Ephemeral:    b.Ephemeral,
-		NoHistory:    b.NoHistory,
-		DeferUntil:   cloneTimePtr(b.DeferUntil),
-		IsBlocked:    b.IsBlocked.ptr(),
-		Revision:     b.Revision,
+		ID:                     b.ID,
+		Title:                  b.Title,
+		Status:                 mapBdStatus(b.Status),
+		Type:                   b.IssueType,
+		Priority:               cloneIntPtr(b.Priority),
+		CreatedAt:              b.CreatedAt.Truncate(time.Second),
+		UpdatedAt:              b.UpdatedAt.Truncate(time.Second),
+		Assignee:               b.Assignee,
+		From:                   from,
+		ParentID:               parentID,
+		Ref:                    b.Ref,
+		Needs:                  b.Needs,
+		Description:            b.Description,
+		Labels:                 b.Labels,
+		Metadata:               metadata,
+		Dependencies:           deps,
+		Ephemeral:              b.Ephemeral,
+		NoHistory:              b.NoHistory,
+		DeferUntil:             cloneTimePtr(b.DeferUntil),
+		IsBlocked:              b.IsBlocked.ptr(),
+		IsDeferredIndefinitely: &deferredIndefinitely,
+		Revision:               b.Revision,
 	}
 }
 
