@@ -378,6 +378,27 @@ type InFlightProvider interface {
 	ListInFlight(filter Filter) ([]Event, error)
 }
 
+// ExhaustiveTailProvider is an optional extension of TailProvider for
+// providers whose ListTail, when it returns fewer than the requested limit,
+// has already walked the entirety of retained history (including archives
+// and any in-flight rotation segment) to do so — the short result is a
+// complete, final answer, not merely "what happened to be nearby" in a
+// recent-only view. fetchEventPageAscending (internal/api) uses this marker
+// to skip an otherwise-redundant full-history fallback scan: without it, a
+// short ListTail result is ambiguous (contrast a provider whose tail view is
+// only the active/recent segment, e.g. a naive TailProvider implementation),
+// so the caller must fall back to a full scan to be sure nothing was missed.
+//
+// Do not implement this via struct embedding of a type that doesn't itself
+// guarantee exhaustiveness (e.g. Fake, whose test wrappers deliberately
+// simulate a narrower ListTail view) — Go promotes embedded methods, so an
+// embedder would silently inherit a guarantee it does not honor. See
+// ga-96zjze.
+type ExhaustiveTailProvider interface {
+	TailProvider
+	ExhaustiveTail()
+}
+
 // Watcher yields events one at a time. Created by [Provider.Watch].
 // Callers must call Close() when done watching.
 type Watcher interface {

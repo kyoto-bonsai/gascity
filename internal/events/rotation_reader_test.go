@@ -481,3 +481,165 @@ func TestReadFilteredIgnoresUnrelatedFiles(t *testing.T) {
 		t.Fatalf("ReadFiltered returned %d events, want 6 (3 pre + 1 anchor + 2 post)", len(got))
 	}
 }
+
+// TestReadFilteredTailCrossesArchiveBoundary is the reader-level fix for
+// ga-96zjze: a sparse type whose active-file occurrences don't fill the
+// requested tail must extend into archives (newest first), not stop short.
+func TestReadFilteredTailCrossesArchiveBoundary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 20 pre-rotate events; every 4th (i=0,4,8,12,16 -> seq 1,5,9,13,17) is the
+	// sparse type under test, mirroring convoy.closed's low density in the
+	// original repro.
+	for i := 0; i < 20; i++ {
+		typ := BeadClosed
+		if i%4 == 0 {
+			typ = ConvoyClosed
+		}
+		rec.Record(Event{Type: typ, Actor: "human", Subject: fmt.Sprintf("s%d", i)})
+	}
+	res, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	if res.Done != nil {
+		<-res.Done
+	}
+	// Active file after rotation: anchor (seq 21) + 2 more, only one matching.
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "post-0"})   // seq 22
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "post-1"}) // seq 23
+	rec.Close()                                                              //nolint:errcheck // test cleanup
+
+	// Active file alone has exactly 1 match (seq 23) — short of limit=3, so
+	// this must reach into the archive for the newest 2 of its 5 matches
+	// (seq 13, 17), not the oldest 2 (seq 1, 5).
+	got, err := ReadFilteredTail(path, Filter{Type: ConvoyClosed}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seqs := seqsOf(got); !reflect.DeepEqual(seqs, []uint64{13, 17, 23}) {
+		t.Fatalf("tail seqs = %v, want [13 17 23] (newest 3 matches, ascending — not the oldest 3)", seqs)
+	}
+}
+
+// TestReadFilteredTailFewerMatchesThanLimit is the explicit pagination
+// correctness check called for on ga-96zjze: requesting more matches than
+// exist anywhere in retained history (including zero) must return exactly
+// what exists — not panic, truncate wrong, or duplicate — not merely be fast.
+func TestReadFilteredTailFewerMatchesThanLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "c1"}) // seq 1
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "n1"})   // seq 2
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "c2"}) // seq 3
+	res, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	if res.Done != nil {
+		<-res.Done
+	}
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "n2"}) // seq 5, no more matches anywhere
+	rec.Close()                                                        //nolint:errcheck // test cleanup
+
+	// Total ConvoyClosed matches across all retained history = 2. Requesting
+	// 5 must return exactly those 2, in order, not hang and not error.
+	got, err := ReadFilteredTail(path, Filter{Type: ConvoyClosed}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Subject != "c1" || got[1].Subject != "c2" {
+		t.Fatalf("got %+v, want exactly [c1 c2] (exhausted history, fewer than limit)", got)
+	}
+
+	// A type with zero occurrences anywhere: the unavoidable full-history
+	// case. Must terminate cleanly with an empty result, not hang.
+	none, err := ReadFilteredTail(path, Filter{Type: "totally.absent.type"}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("got %d events for a never-emitted type, want 0", len(none))
+	}
+}
+
+// TestReadFilteredTailDoesNotOpenUnneededOlderArchives proves the early-exit
+// is real, not just correct: this is ga-96zjze's actual complaint (a sparse
+// type forcing a full decompress of every archive) rendered as a test that
+// fails loudly if the bound regresses. The oldest archive is replaced with
+// garbage that errors on open; if the newest archive plus the active file
+// already satisfy the request, the corrupted archive must never be touched.
+func TestReadFilteredTailDoesNotOpenUnneededOlderArchives(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Archive 1 (oldest): seq 1..5, all matching — would satisfy the request
+	// on its own, which is exactly why it must never be opened.
+	for i := 0; i < 5; i++ {
+		rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: fmt.Sprintf("old-%d", i)})
+	}
+	res1, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate 1: %v", err)
+	}
+	if res1.Done != nil {
+		<-res1.Done
+	}
+
+	// Archive 2 (newest): seq 6..9 (anchor, match, match, noise).
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "new-0"})
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "new-1"})
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "new-2"})
+	res2, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate 2: %v", err)
+	}
+	if res2.Done != nil {
+		<-res2.Done
+	}
+
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "active"}) // seq 11
+	rec.Close()                                                              //nolint:errcheck // test cleanup
+
+	archives, err := archiveFilesIn(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 2 {
+		t.Fatalf("want 2 archives, got %d", len(archives))
+	}
+	oldest := filepath.Join(dir, archives[0].Basename) // ascending FirstSeq: [0] is the oldest
+	if err := os.WriteFile(oldest, []byte("not a gzip file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Active (1 match) + newest archive's 2 matches satisfy limit=2 without
+	// ever needing the corrupted oldest archive.
+	got, err := ReadFilteredTail(path, Filter{Type: ConvoyClosed}, 2)
+	if err != nil {
+		t.Fatalf("ReadFilteredTail errored — it must not have opened the corrupted older archive: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2", len(got))
+	}
+	if got[0].Subject != "new-1" || got[1].Subject != "active" {
+		t.Fatalf("subjects = [%s %s], want [new-1 active]", got[0].Subject, got[1].Subject)
+	}
+}
