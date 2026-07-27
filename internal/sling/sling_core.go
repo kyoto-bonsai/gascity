@@ -120,6 +120,11 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 			return result, err
 		}
 	}
+	if shouldCheckTargetAssigneeConflict(opts) {
+		if err := checkTargetAssigneeConflict(opts, deps); err != nil {
+			return result, err
+		}
+	}
 	if shouldGuardCrossRig(opts) {
 		if err := CrossRigRouteError(opts.BeadOrFormula, a, deps.Cfg); err != nil {
 			return result, err
@@ -669,6 +674,129 @@ func checkTargetDispatchable(opts SlingOpts, deps SlingDeps) error {
 			Fix:    "wait for the defer window to pass, or clear it now (" + clearDeferCmd + ")",
 		}
 	}
+}
+
+// shouldCheckTargetAssigneeConflict reports whether preflight should verify
+// opts.BeadOrFormula's assignee before stamping gc.routed_to on it.
+// Applicability mirrors shouldCheckTargetDispatchable for the same
+// formula/dry-run-preview reasons (nothing meaningful to check against a
+// bead that doesn't exist yet or was never resolved to a real target).
+// Unlike shouldCheckTargetDispatchable, this additionally gates on
+// !opts.Reassign: --reassign's own reopenForReassign step (later in this
+// same preflight) clears the assignee and reopens the bead specifically to
+// handle this case, so refusing here first would block the one flag that
+// already fixes it.
+func shouldCheckTargetAssigneeConflict(opts SlingOpts) bool {
+	return !opts.Reassign && !opts.IsFormula && !(opts.DryRun && opts.InlineText)
+}
+
+// checkTargetAssigneeConflict refuses to route opts.BeadOrFormula onto
+// opts.Target.QualifiedName() when the bead is in_progress with a different
+// assignee already set. checkTargetDispatchable (and the
+// beads.IsStatusDispatchable predicate it calls) correctly treats
+// in_progress as dispatchable in general — a live --reassign target is
+// legitimate and is exactly what SlingOpts.Reassign exists for — so this is
+// deliberately a separate check, not a change to that one; see
+// IsStatusDispatchable's own doc comment ("type/label/tier/assignee
+// exclusions... already-understood concerns, not this bug's shape").
+//
+// Without --reassign, sling only ever writes gc.routed_to. The pool-demand
+// probe gc hook actually runs (bd ready --metadata-field
+// gc.routed_to=<target> --unassigned) excludes any bead with a set
+// Assignee, independent of status — so the write succeeds with a success
+// echo while the bead remains permanently unreachable by the new target:
+// the same silently-stranded state ga-tk5mcg.2 fixed for closed/deferred
+// targets, reached through the assignee axis instead of the status axis
+// (ga-tk5mcg.9).
+//
+// Confirmed specimen (ga-tk5mcg.9): four beads sitting at
+// gc.awaiting=validator had gc.routed_to written to a fresh validator
+// persona each; `bd ready --metadata-field gc.routed_to=<persona>
+// --unassigned` returned zero of them 10-12 minutes later. Every write had
+// succeeded; every bd show displayed the intended validator.
+//
+// A bead with no assignee, or already assigned to the same identity being
+// routed to, is unaffected — both remain pool-reachable. There is no
+// --force override, for the same reason checkTargetDispatchable has none:
+// forcing through cannot produce a working dispatch here, only reproduce
+// the exact stranded state this check exists to prevent.
+func checkTargetAssigneeConflict(opts SlingOpts, deps SlingDeps) error {
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	if querier == nil {
+		return nil
+	}
+	b, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		storeRef := strings.TrimSpace(deps.StoreRef)
+		if storeRef == "" {
+			storeRef = "local"
+		}
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: err}
+	}
+	if b.Status != "in_progress" {
+		return nil
+	}
+	assignee := strings.TrimSpace(b.Assignee)
+	if assignee == "" {
+		return nil
+	}
+	a := opts.Target
+	target := a.QualifiedName()
+	if assignee == target {
+		return nil
+	}
+	if sessionBelongsToTarget(deps, assignee, target) {
+		// assignee is a specific live-or-recorded session instance of the
+		// same target pool/agent (e.g. Assignee "worker-live-1" vs target
+		// "worker") -- not a different owner, just a more specific spelling
+		// of the same one. checkLiveRoutingConflict above already permits
+		// re-slinging a bead onto the pool a live member of that pool
+		// currently holds; refusing it here on a bare string mismatch would
+		// contradict that and break the ordinary idempotent-resling case.
+		return nil
+	}
+	return &NonDispatchableTargetError{
+		BeadID: opts.BeadOrFormula,
+		Target: target,
+		Status: fmt.Sprintf("in_progress, assigned to %s", assignee),
+		Fix: fmt.Sprintf(
+			"pass --reassign to clear the assignee and reopen it (gc sling --reassign %s %s), or route to %s instead",
+			target, opts.BeadOrFormula, assignee,
+		),
+	}
+}
+
+// sessionBelongsToTarget reports whether assignee names a session-tracking
+// bead (labeled gc:session) whose "template" metadata equals target -- i.e.
+// assignee is a specific instance of the target pool/agent being slung to,
+// not a genuinely different owner. Mirrors the session-bead lookup
+// checkLiveRoutingConflict performs above, keyed by assignee name directly
+// instead of scanning for conflicting claims. Deliberately does not filter
+// on session state (active/awake) the way checkLiveRoutingConflict does:
+// this is an identity question (which pool does this name belong to), not a
+// liveness one, and a stale/dead session bead still correctly identifies
+// which pool originally claimed the work.
+func sessionBelongsToTarget(deps SlingDeps, assignee, target string) bool {
+	if deps.Store == nil || assignee == "" {
+		return false
+	}
+	sessionBeads, err := session.ListAllSessionBeads(deps.Store, beads.ListQuery{Status: "open"})
+	if err != nil {
+		return false
+	}
+	for _, sb := range sessionBeads {
+		if strings.TrimSpace(sb.Metadata["session_name"]) != assignee {
+			continue
+		}
+		return sb.Metadata[sessionTemplateMetadataKey] == target
+	}
+	return false
 }
 
 // slingFormula handles the --formula dispatch path.
