@@ -1439,6 +1439,7 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var to string
 	var subject string
 	var message string
+	var bodyFile string
 	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "send [<to>] [<body>]",
@@ -1450,22 +1451,46 @@ to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". If the recipient is a
 currently-live session, it is nudged automatically -- no flag required.
 Use --from to override the sender identity. Use --to as an alternative to
 the positional <to> argument. Use -s/--subject for the summary line and
--m/--message for the body text. Use --all to broadcast to all live sessions
-(excluding sender and "human"). --notify/--nudge are accepted for backward
-compatibility and have no additional effect.`,
+-m/--message for the body text. Use --body-file to read the body from a file
+instead (pass - for stdin). Prefer --body-file over -m/positional body when
+the text may contain backticks or $(...): the invoking shell expands those
+as command substitution inside a double-quoted argument before gc ever sees
+them, silently corrupting (or executing) the body. A file path never
+transits a shell argument, so its contents round-trip byte-for-byte.
+Use --all to broadcast to all live sessions (excluding sender and "human").
+--notify/--nudge are accepted for backward compatibility and have no
+additional effect.`,
 		Example: `  gc mail send mayor "Build is green"
   gc mail send mayor -s "Build is green"
   gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
+  gc mail send myrig/witness -s "Findings" --body-file findings.md
   gc mail send --to mayor "Build is green"
   gc mail send human "Review needed for PR #42"
   gc mail send --all "Status update: tests passing"`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
+			effectiveMessage := message
+			if bodyFile != "" {
+				positionalBody := len(args) > 1
+				if all || to != "" {
+					positionalBody = len(args) > 0
+				}
+				if positionalBody {
+					fmt.Fprintln(stderr, "gc mail send: cannot combine --body-file with a positional body") //nolint:errcheck // best-effort stderr
+					return errExit
+				}
+				content, err := readMailBodyFile(bodyFile)
+				if err != nil {
+					fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
+					return errExit
+				}
+				effectiveMessage = content
+			}
 			code := 0
 			if jsonOut {
-				code = cmdMailSendJSON(args, notify, all, from, to, subject, message, true, stdout, stderr)
+				code = cmdMailSendJSON(args, notify, all, from, to, subject, effectiveMessage, true, stdout, stderr)
 			} else {
-				code = cmdMailSend(args, notify, all, from, to, subject, message, stdout, stderr)
+				code = cmdMailSend(args, notify, all, from, to, subject, effectiveMessage, stdout, stderr)
 			}
 			if code != 0 {
 				return errExit
@@ -1481,9 +1506,30 @@ compatibility and have no additional effect.`,
 	cmd.Flags().StringVar(&to, "to", "", "recipient address (alternative to positional argument)")
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
+	cmd.Flags().StringVar(&bodyFile, "body-file", "", "read message body from file (use - for stdin)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
 	cmd.MarkFlagsMutuallyExclusive("to", "all")
+	cmd.MarkFlagsMutuallyExclusive("message", "body-file")
 	return cmd
+}
+
+// readMailBodyFile reads a message body from a file. path == "-" reads from
+// stdin instead, mirroring bd create's --body-file convention. A file path
+// never transits a shell argument, so unlike -m/positional text its contents
+// cannot be backtick/$()-expanded by the invoking shell before gc sees them.
+func readMailBodyFile(path string) (string, error) {
+	if path == "-" {
+		content, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", fmt.Errorf("reading body from stdin: %w", err)
+		}
+		return string(content), nil
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading body file: %w", err)
+	}
+	return string(content), nil
 }
 
 func newMailInboxCmd(stdout, stderr io.Writer) *cobra.Command {
