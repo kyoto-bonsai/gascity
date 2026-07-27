@@ -197,6 +197,7 @@ type realExecutor struct{}
 
 func (realExecutor) execute(args []string) (string, error) {
 	cmd := exec.Command("tmux", args...)
+	cmd.Env = SubprocessEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -209,6 +210,7 @@ func (realExecutor) execute(args []string) (string, error) {
 
 func (realExecutor) executeCtx(ctx context.Context, args []string) (string, error) {
 	cmd := exec.CommandContext(ctx, "tmux", args...)
+	cmd.Env = SubprocessEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -1370,7 +1372,7 @@ func (t *Tmux) ensureHiddenAttachedClient(target string) error {
 	}
 	cmdArgs = append(cmdArgs, "attach-session", "-t", target)
 	cmd := exec.CommandContext(ctx, "script", hiddenAttachScriptArgs(goruntime.GOOS, cmdArgs)...)
-	cmd.Env = append(cmd.Environ(), "TERM=xterm-256color")
+	cmd.Env = append(SubprocessEnv(), "TERM=xterm-256color")
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 

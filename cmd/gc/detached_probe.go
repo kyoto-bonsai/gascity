@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
+	sessiontmux "github.com/gastownhall/gascity/internal/runtime/tmux"
 )
 
 const (
@@ -85,6 +86,7 @@ func probeDetachedWorkWithTimeout(ctx context.Context, spec string, timeout time
 	defer cancel()
 
 	cmd := exec.CommandContext(probeCtx, "tmux", "-L", parsed.Socket, "has-session", "-t", parsed.Session)
+	cmd.Env = sessiontmux.SubprocessEnv()
 	if err := cmd.Run(); err != nil {
 		if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 			return detachedProbeResult{Status: detachedProbeTimeout, Spec: parsed, Err: probeCtx.Err()}
