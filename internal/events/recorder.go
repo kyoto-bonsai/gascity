@@ -442,9 +442,41 @@ func (r *FileRecorder) ListInFlight(filter Filter) ([]Event, error) {
 }
 
 // ListTail returns trailing matching events from the underlying file.
+// ReadFilteredTail already walks every sibling archive (newest first,
+// bounded) before coming up short of limit, so a short result normally
+// reflects the entirety of retained history. The one gap it cannot see is a
+// segment stranded in an in-flight events.jsonl.rotating-* file mid-gzip (see
+// ReadFilteredWithInFlight) — checked here cheaply (a directory listing, no
+// archive reopened) so the expensive in-flight-aware rescan is only paid in
+// that narrow, rare window, not on every sparse-type query. See ga-96zjze.
 func (r *FileRecorder) ListTail(filter Filter, limit int) ([]Event, error) {
-	return ReadFilteredTail(r.path, filter, limit)
+	tail, err := ReadFilteredTail(r.path, filter, limit)
+	if err != nil || limit <= 0 || len(tail) >= limit {
+		return tail, err
+	}
+	inFlight, err := hasInFlightRotation(filepath.Dir(r.path))
+	if err != nil {
+		return nil, err
+	}
+	if !inFlight {
+		return tail, nil
+	}
+	full, err := ReadFilteredWithInFlight(r.path, filter)
+	if err != nil {
+		return nil, err
+	}
+	if len(full) > limit {
+		full = full[len(full)-limit:]
+	}
+	return full, nil
 }
+
+// ExhaustiveTail marks FileRecorder as an [ExhaustiveTailProvider]: ListTail
+// above always resolves a short result against the complete retained history
+// (active file + archives + any in-flight rotation segment), never just a
+// recent-only view. The method itself does nothing; its presence is the
+// signal fetchEventPageAscending checks for.
+func (r *FileRecorder) ExhaustiveTail() {}
 
 // LatestSeq returns the highest sequence number in the event log.
 func (r *FileRecorder) LatestSeq() (uint64, error) {
