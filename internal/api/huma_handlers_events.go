@@ -149,17 +149,28 @@ func parseEventBeforeSeq(cursor string) (uint64, error) {
 // has-more signal. It returns the fetched events and scanned — the best-effort
 // count of matching rows the read could see, used as the filtered Total.
 //
-// ListTail is the fast path: a backward scan of the ACTIVE events.jsonl only,
-// never the .gz archives, so its result is trusted ONLY when it yields a full
-// limit+1 rows. The active file holds the newest events, so a full tail page
-// there IS the newest page below the boundary. Anything short cannot
-// distinguish "log exhausted" from "active file exhausted, older matches in
-// archives/rotation" and MUST fall through to the full scan — otherwise a
-// rotation (or a selective filter) strands the older history behind an unminted
-// cursor. The scan uses the in-flight-aware read when the provider offers one
-// (listWithInFlight) so a just-rotated segment living only in a .rotating-* file
-// is not skipped; the BeforeSeq predicate keeps rotation/archive handling inside
-// the one battle-tested sequential reader instead of a bespoke reverse reader.
+// ListTail is the fast path. A TailProvider's contract only promises a
+// bounded view (e.g. a naive implementation might scan the active
+// events.jsonl only, never .gz archives), so a short result is generally
+// AMBIGUOUS: it cannot distinguish "log exhausted" from "this provider's tail
+// view is narrower than full history, older matches may exist in
+// archives/rotation" — and MUST fall through to the full scan, otherwise a
+// rotation (or a selective filter) strands the older history behind an
+// unminted cursor. The scan uses the in-flight-aware read when the provider
+// offers one (listWithInFlight) so a just-rotated segment living only in a
+// .rotating-* file is not skipped; the BeforeSeq predicate keeps
+// rotation/archive handling inside the one battle-tested sequential reader
+// instead of a bespoke reverse reader.
+//
+// A provider can opt out of that ambiguity by additionally implementing
+// [events.ExhaustiveTailProvider] — a promise that ITS short results already
+// reflect the complete retained history (FileRecorder does, see ga-96zjze:
+// its ListTail now walks every archive plus any in-flight rotation segment
+// before giving up). For such a provider, a short result is trusted directly,
+// skipping a redundant second full scan that would otherwise re-read the same
+// archives ListTail just walked — the original bug: a sparse or wholly absent
+// event type (zero historical occurrences is the worst case) always fell
+// through to an unconditional, unbounded scan of the entire retained log here.
 func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int) ([]events.Event, int, error) {
 	fetch := limit + 1
 	if tp, ok := ep.(events.TailProvider); ok {
@@ -169,6 +180,9 @@ func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int
 		}
 		if len(tail) == fetch {
 			return tail, limit, nil
+		}
+		if _, exhaustive := ep.(events.ExhaustiveTailProvider); exhaustive {
+			return tail, len(tail), nil
 		}
 	}
 	all, err := listWithInFlight(ep, filter)
