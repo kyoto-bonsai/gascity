@@ -16,8 +16,9 @@ import (
 
 // Compile-time interface checks.
 var (
-	_ Provider = (*FileRecorder)(nil)
-	_ Provider = (*Fake)(nil)
+	_ Provider               = (*FileRecorder)(nil)
+	_ Provider               = (*Fake)(nil)
+	_ ExhaustiveTailProvider = (*FileRecorder)(nil)
 )
 
 func TestFileRecorderWritesEvent(t *testing.T) {
@@ -1013,6 +1014,104 @@ func TestFileRecorderListTail(t *testing.T) {
 	}
 	if got[0].Subject != "new" {
 		t.Fatalf("subject = %q, want new", got[0].Subject)
+	}
+}
+
+// TestFileRecorderListTailFoldsInInFlightRotation proves ListTail's
+// short-of-limit result folds in a segment stranded in an in-flight
+// events.jsonl.rotating-* file — the one gap ReadFilteredTail's
+// archive-crossing alone cannot see (it only knows about the active file and
+// completed .gz archives). This is what makes marking FileRecorder as an
+// ExhaustiveTailProvider sound: without this fold-in, a query landing in the
+// brief post-rotation compression window could silently miss the
+// just-rotated segment once fetchEventPageAscending starts trusting a short
+// result outright. See ga-96zjze.
+func TestFileRecorderListTailFoldsInInFlightRotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// seq 1: archived (completed .gz), matching. Rotation's own anchor event
+	// (EventsRotated, non-matching) becomes seq 2 in the fresh active file.
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "archived"})
+	res, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	if res.Done != nil {
+		<-res.Done
+	}
+	rec.Close() //nolint:errcheck // switching to direct file manipulation below
+
+	// seq 3: hand-crafted in-flight rotating file, matching — simulates the
+	// window between a rotation trigger and its background gzip finishing.
+	rotEvent := Event{Seq: 3, Type: ConvoyClosed, Actor: "human", Subject: "in-flight", Ts: time.Now()}
+	rotLine, err := json.Marshal(rotEvent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotPath := filepath.Join(dir, formatRotatingBasename(time.Now(), 3, 3))
+	if err := os.WriteFile(rotPath, append(rotLine, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen read-only via a fresh FileRecorder handle (ListTail only reads by
+	// path, so this is equivalent to the original rec for read purposes).
+	reader, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close() //nolint:errcheck // test cleanup
+
+	// Active file has only the non-matching anchor -> 0 matches; archive has
+	// 1 (seq 1). ReadFilteredTail alone comes up short of limit=2, so this
+	// must check for and fold in the in-flight rotating file's match.
+	got, err := reader.ListTail(Filter{Type: ConvoyClosed}, 2)
+	if err != nil {
+		t.Fatalf("ListTail: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2 (archived seq 1 + in-flight seq 3)", len(got))
+	}
+	if got[0].Subject != "archived" || got[1].Subject != "in-flight" {
+		t.Fatalf("subjects = [%s %s], want [archived in-flight]", got[0].Subject, got[1].Subject)
+	}
+}
+
+// TestFileRecorderListTailSkipsInFlightCheckWhenSatisfied proves the
+// in-flight check is only paid when ReadFilteredTail actually comes up short
+// — a corrupted archive that would error if opened must never be touched
+// when the active file alone already satisfies limit, matching the existing
+// TestReadFilteredTailDoesNotOpenUnneededOlderArchives bound one level up.
+func TestFileRecorderListTailSkipsInFlightCheckWhenSatisfied(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A corrupted archive that would error if opened — proves it is never
+	// touched when the active file alone satisfies the request.
+	badArchive := filepath.Join(dir, formatArchiveBasename(time.Now().Add(-time.Hour), 1, 1))
+	if err := os.WriteFile(badArchive, []byte("not a gzip file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "active"})
+	defer rec.Close() //nolint:errcheck // test cleanup
+
+	got, err := rec.ListTail(Filter{Type: ConvoyClosed}, 1)
+	if err != nil {
+		t.Fatalf("ListTail errored — it must not have opened the corrupted archive or checked in-flight rotation: %v", err)
+	}
+	if len(got) != 1 || got[0].Subject != "active" {
+		t.Fatalf("got %+v, want exactly [active]", got)
 	}
 }
 
