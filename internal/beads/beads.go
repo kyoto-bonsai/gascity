@@ -59,6 +59,16 @@ var ErrConditionalWriteUnsupported = errors.New("conditional writes unsupported"
 // and "into empty database".
 var ErrBDSilentFallback = errors.New("bd silent fallback to on-disk auto-import")
 
+// ErrBDMigrationLockFailure reports that a bd-backed store operation saw bd
+// exit successfully (rc=0) even though its stderr shows the store-open lost
+// the race for the schema-migration lock (github.com/steveyegge/beads
+// internal/storage/schema.ErrMigrationLockUnavailable). Under fleet-wide
+// concurrency this has been observed to drop writes silently: bd's own exit
+// code cannot be trusted for this failure class, so BdStore surfaces it as
+// an error for reads and writes instead. Detection requires the exact marker
+// substring: "schema migration lock unavailable". See ga-tk5mcg.1.
+var ErrBDMigrationLockFailure = errors.New("bd schema-migration-lock timeout")
+
 // Bead is a single unit of work in Gas City. Everything is a bead: tasks,
 // mail, molecules, convoys.
 type Bead struct {

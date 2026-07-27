@@ -3289,6 +3289,79 @@ esac
 	}
 }
 
+// TestBdStoreWritePathsSurfaceMigrationLockFailure pins the ga-tk5mcg.1 fix:
+// when bd's store-open loses the schema-migration-lock race but still exits
+// 0, classifyBDExecResult must surface ErrBDMigrationLockFailure rather than
+// letting the silently-dropped write reach the caller as success. This is
+// the write-side counterpart to the read-side silent-fallback tests above,
+// for a different root cause (Dolt lock contention under load, not a lost
+// managed server) — and because classifyBDExecResult backs every BdStore
+// method, this one detection site covers every beads.Store write caller
+// (gc bd, gc mail send, sling, the API server), not just the gc bd CLI.
+func TestBdStoreWritePathsSurfaceMigrationLockFailure(t *testing.T) {
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+echo "WARN native_store_unavailable gate=native_open reason=\"failed to initialize schema: schema migration: schema: acquire migration lock: schema migration lock unavailable: timeout\"" >&2
+case "$1" in
+  update)
+    exit 0
+    ;;
+  *)
+    echo "unexpected bd command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := beads.ExecCommandRunnerWithEnv(nil)
+	s := beads.NewBdStore(t.TempDir(), runner)
+
+	if err := s.SetMetadata("bd-42", "key", "value"); !errors.Is(err, beads.ErrBDMigrationLockFailure) {
+		t.Fatalf("SetMetadata error = %v, want ErrBDMigrationLockFailure", err)
+	}
+}
+
+// TestBdStoreReadPathsSurfaceMigrationLockFailure is the read-side
+// counterpart to TestBdStoreWritePathsSurfaceMigrationLockFailure, mirroring
+// TestBdStoreReadPathsSurfaceSilentFallbackMarkerPair's shape for the
+// migration-lock marker.
+func TestBdStoreReadPathsSurfaceMigrationLockFailure(t *testing.T) {
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+echo "WARN native_store_unavailable gate=native_open reason=\"failed to initialize schema: schema migration: schema: acquire migration lock: schema migration lock unavailable: timeout\"" >&2
+case "$1" in
+  show)
+    printf '[{"id":"bd-42","title":"lock read","status":"open","issue_type":"task","created_at":"2026-06-07T00:00:00Z"}]'
+    ;;
+  list)
+    printf '[]'
+    ;;
+  *)
+    echo "unexpected bd command: $*" >&2
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runner := beads.ExecCommandRunnerWithEnv(nil)
+	s := beads.NewBdStore(t.TempDir(), runner)
+
+	if _, err := s.Get("bd-42"); !errors.Is(err, beads.ErrBDMigrationLockFailure) {
+		t.Fatalf("Get error = %v, want ErrBDMigrationLockFailure", err)
+	}
+	if _, err := s.List(beads.ListQuery{AllowScan: true}); !errors.Is(err, beads.ErrBDMigrationLockFailure) {
+		t.Fatalf("List error = %v, want ErrBDMigrationLockFailure", err)
+	}
+}
+
 func TestBdStoreReleaseIfCurrentUsesGuardedSQL(t *testing.T) {
 	var gotName string
 	var gotArgs []string

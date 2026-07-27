@@ -1788,6 +1788,59 @@ func TestGcBdSurfacesSilentFallbackAsLoudError_ReleaseIfCurrentPath(t *testing.T
 	}
 }
 
+// migrationLockFakeBdScript builds a fake `bd` shell script that emits the
+// schema-migration-lock-timeout marker on stderr and exits 0 — the shape bd
+// has been observed to produce when it loses the race for the
+// schema-migration lock under fleet-wide bd/gc concurrency (ga-tk5mcg.1).
+// doBd should treat this as a hard failure regardless of bd's exit code.
+const migrationLockFakeBdScript = `#!/bin/sh
+echo "WARN native_store_unavailable gate=native_open reason=\"failed to initialize schema: schema migration: schema: acquire migration lock: schema migration lock unavailable: timeout\"" >&2
+echo "$@"
+exit 0
+`
+
+// TestGcBdSurfacesMigrationLockFailureAsLoudError_UpdatePath pins the
+// ga-tk5mcg.1 fix: when bd's store-open loses the schema-migration-lock race
+// but still exits 0, gc bd must convert that into a non-zero exit with an
+// operator-facing message instead of letting the silently-dropped write
+// reach the operator as success. Same shape as the #2080/#2079
+// silent-fallback tests above, for a different root cause (Dolt lock
+// contention under load, not a lost managed server).
+func TestGcBdSurfacesMigrationLockFailureAsLoudError_UpdatePath(t *testing.T) {
+	silentFallbackTestSetup(t, migrationLockFakeBdScript)
+
+	var stdout, stderr bytes.Buffer
+	got := doBd([]string{"update", "demo-abc", "--set-metadata", "k=v"}, &stdout, &stderr)
+	if got != bdMigrationLockExitCode {
+		t.Fatalf("doBd(update) = %d, want %d (migration-lock exit code); stderr=%q",
+			got, bdMigrationLockExitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "schema-migration-lock timeout") {
+		t.Fatalf("stderr missing loud-fail message; stderr=%q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "schema migration lock unavailable") {
+		t.Fatalf("original bd stderr not passed through; stderr=%q", stderr.String())
+	}
+}
+
+// TestGcBdSurfacesMigrationLockFailureAsLoudError_CreatePath covers gc bd
+// create — the other write subcommand ga-tk5mcg.1 named directly (alongside
+// update/comment/mail send) as observed failing this way in the same
+// fleet session.
+func TestGcBdSurfacesMigrationLockFailureAsLoudError_CreatePath(t *testing.T) {
+	silentFallbackTestSetup(t, migrationLockFakeBdScript)
+
+	var stdout, stderr bytes.Buffer
+	got := doBd([]string{"create", "New task", "--type", "task"}, &stdout, &stderr)
+	if got != bdMigrationLockExitCode {
+		t.Fatalf("doBd(create) = %d, want %d (migration-lock exit code); stderr=%q",
+			got, bdMigrationLockExitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "schema-migration-lock timeout") {
+		t.Fatalf("stderr missing loud-fail message; stderr=%q", stderr.String())
+	}
+}
+
 // TestGcBdHappyPathExitsZeroWithoutFallbackMarker is the inverse: a clean
 // bd run that produces no auto-import marker must NOT be converted into the
 // loud-fail. This guards against false positives where bd's stderr happens
@@ -1808,6 +1861,9 @@ exit 0
 	}
 	if strings.Contains(stderr.String(), "managed Dolt unreachable") {
 		t.Fatalf("loud-fail message fired on a happy-path run; stderr=%q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "schema-migration-lock timeout") {
+		t.Fatalf("migration-lock loud-fail message fired on a happy-path run; stderr=%q", stderr.String())
 	}
 }
 
@@ -1849,6 +1905,22 @@ exit 3
 	}
 }
 
+// TestGcBdProcessExitCodeMatchesMigrationLockContract pins the process-level
+// exit code contract for the ga-tk5mcg.1 fix, mirroring
+// TestGcBdProcessExitCodeMatchesSilentFallbackContract: bdMigrationLockExitCode
+// must survive exitForCode/commandExitCode unchanged rather than collapsing
+// to 1.
+func TestGcBdProcessExitCodeMatchesMigrationLockContract(t *testing.T) {
+	silentFallbackTestSetup(t, migrationLockFakeBdScript)
+
+	var stdout, stderr bytes.Buffer
+	got := run([]string{"bd", "update", "demo-abc", "--set-metadata", "k=v"}, &stdout, &stderr)
+	if got != bdMigrationLockExitCode {
+		t.Fatalf("run(bd update) = %d, want %d (migration-lock exit code); stderr=%q",
+			got, bdMigrationLockExitCode, stderr.String())
+	}
+}
+
 // TestBdOutputIndicatesSilentFallback covers the marker-detection helper
 // directly with table-driven cases so the source-of-truth for what counts
 // as "silent fallback" is unit-pinned.
@@ -1869,11 +1941,40 @@ func TestBdOutputIndicatesSilentFallback(t *testing.T) {
 		{"unrelated transport error", "dial tcp 127.0.0.1:3306: connect: connection refused", false},
 		{"unrelated server-unreachable error", "server unreachable", false},
 		{"both markers buried in long output", "starting bd\n... \nauto-importing 220929 bytes from .beads/issues.jsonl into empty database... \n... \nauto-imported 123 issues\n", true},
+		{"migration-lock marker alone does not false-positive as silent-fallback (ga-tk5mcg.1 is a distinct root cause)", "schema migration lock unavailable: timeout", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := bdOutputIndicatesSilentFallback(tt.input); got != tt.want {
 				t.Errorf("bdOutputIndicatesSilentFallback(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBdOutputIndicatesMigrationLockFailure covers the ga-tk5mcg.1
+// marker-detection helper directly with table-driven cases, including
+// explicit non-overlap with the unrelated silent-fallback marker pair
+// (a distinct root cause: lock contention under load, not a lost server).
+func TestBdOutputIndicatesMigrationLockFailure(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"empty", "", false},
+		{"exact wrapped error text observed live (ga-tk5mcg.1)", "failed to open database: failed to initialize schema: schema migration: schema: acquire migration lock: schema migration lock unavailable: timeout", true},
+		{"case insensitive uppercase", "SCHEMA MIGRATION LOCK UNAVAILABLE", true},
+		{"case insensitive mixed", "Schema Migration Lock Unavailable: timeout", true},
+		{"buried in long output", "starting bd\n...\nWARN native_store_unavailable gate=native_open reason=\"schema migration lock unavailable: timeout\"\n...\n", true},
+		{"unrelated silent-fallback marker pair does not false-positive", "auto-importing 100 bytes into empty database", false},
+		{"unrelated transport error", "dial tcp 127.0.0.1:3306: connect: connection refused", false},
+		{"partial phrase missing 'unavailable' does not match", "acquire migration lock: some other error", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := bdOutputIndicatesMigrationLockFailure(tt.input); got != tt.want {
+				t.Errorf("bdOutputIndicatesMigrationLockFailure(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
 	}

@@ -1092,6 +1092,24 @@ func bdOutputIndicatesSilentFallback(s string) bool {
 		strings.Contains(lower, bdSilentFallbackMarkerEmptyDB)
 }
 
+// bdSilentMigrationLockMarker is the substring bd's stderr contains when its
+// store-open failed on a contended schema-migration lock
+// (github.com/steveyegge/beads internal/storage/schema.
+// ErrMigrationLockUnavailable, wrapped as "schema: acquire migration lock:
+// schema migration lock unavailable: timeout"). Under fleet-wide concurrency,
+// many short-lived bd/gc processes race to open the same Dolt-backed store;
+// a loser has been observed to still exit 0, silently dropping the write
+// (ga-tk5mcg.1). Single source of truth, mirroring
+// bdSilentFallbackMarkerImport/EmptyDB above.
+const bdSilentMigrationLockMarker = "schema migration lock unavailable"
+
+// bdOutputIndicatesMigrationLockFailure reports whether the given bd output
+// (typically captured stderr) shows bd's store-open lost the race for the
+// schema-migration lock. See bdSilentMigrationLockMarker.
+func bdOutputIndicatesMigrationLockFailure(s string) bool {
+	return strings.Contains(strings.ToLower(s), bdSilentMigrationLockMarker)
+}
+
 func bdCommandRunnerWithManagedRetry(cityPath string, envFn func(dir string) map[string]string) beads.CommandRunner {
 	return bdCommandRunnerWithManagedRetryErr(cityPath, func(dir string) (map[string]string, error) {
 		return envFn(dir), nil

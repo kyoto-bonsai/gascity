@@ -41,6 +41,16 @@ const bdSilentFallbackExitCode = 4
 
 const bdSilentFallbackUserMessage = "gc bd: managed Dolt unreachable; bd fell back to on-disk auto-import mode. If this command wrote data, that write was NOT persisted. Restart the managed Dolt server (or check connectivity) and retry. (See gastownhall/gascity#2080.)"
 
+// bdMigrationLockExitCode is the exit code gc bd emits when it detects that
+// bd's store-open lost a contended schema-migration lock race but still
+// exited 0 (see bdSilentMigrationLockMarker in bd_env.go). Distinct from
+// bdSilentFallbackExitCode (a different root cause: a lost managed Dolt
+// server, not lock contention) so operators and CI can tell the two silent-
+// success classes apart. See ga-tk5mcg.1.
+const bdMigrationLockExitCode = 5
+
+const bdMigrationLockUserMessage = "gc bd: bd reported success (exit 0) but its stderr shows a schema-migration-lock timeout during store open; under fleet-wide Dolt load this can mean the write in this command was NOT persisted. Re-read the bead to confirm before trusting this command's exit code. (See ga-tk5mcg.1.)"
+
 // bdStderrScanLimit caps how much of bd's stderr gc retains to scan for the
 // silent-fallback marker. bd emits the marker pair while opening the store —
 // before it runs the subcommand — so the marker, when present, always lands
@@ -355,6 +365,17 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	if bdOutputIndicatesSilentFallback(stderrScan.String()) {
 		fmt.Fprintln(stderr, bdSilentFallbackUserMessage) //nolint:errcheck // best-effort stderr
 		return bdSilentFallbackExitCode
+	}
+
+	// bd exited 0, but if its stderr shows it lost the schema-migration-lock
+	// race while opening its store, the write in this command was likely NOT
+	// applied — bd has been observed to still exit 0 in this case (ga-tk5mcg.1,
+	// reproduced under fleet-wide concurrent bd/gc load). Mirrors the
+	// silent-fallback check above for a different root cause (Dolt lock
+	// contention, not a lost server).
+	if bdOutputIndicatesMigrationLockFailure(stderrScan.String()) {
+		fmt.Fprintln(stderr, bdMigrationLockUserMessage) //nolint:errcheck // best-effort stderr
+		return bdMigrationLockExitCode
 	}
 
 	return 0

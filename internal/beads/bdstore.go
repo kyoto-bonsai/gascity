@@ -181,6 +181,18 @@ func classifyBDExecResult(parent, ctx context.Context, name string, timeout time
 		fallbackErr := fmt.Errorf("%w: %s", ErrBDSilentFallback, strings.TrimSpace(stderr))
 		return "error", fallbackErr, fallbackErr
 	}
+	// bd exited 0, but if its stderr shows it lost the schema-migration-lock
+	// race while opening its store, the operation was likely NOT applied —
+	// bd has been observed to still exit 0 in this case (ga-tk5mcg.1,
+	// reproduced under fleet-wide concurrent bd/gc load). Mirrors the
+	// silent-fallback check above for a different root cause (Dolt lock
+	// contention, not a lost server). This classifier backs every BdStore
+	// method (reads and writes alike), so this one check covers the whole
+	// beads.Store surface, not just the gc bd CLI passthrough.
+	if runErr == nil && name == "bd" && bdOutputIndicatesMigrationLockFailure(stderr) {
+		lockErr := fmt.Errorf("%w: %s", ErrBDMigrationLockFailure, strings.TrimSpace(stderr))
+		return "error", lockErr, lockErr
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		timeoutErr := bdExecTimeoutError(parent, timeout, start)
 		if stderr != "" {
@@ -277,6 +289,18 @@ func bdOutputIndicatesSilentFallback(s string) bool {
 	lower := strings.ToLower(s)
 	return strings.Contains(lower, bdSilentFallbackMarkerImport) &&
 		strings.Contains(lower, bdSilentFallbackMarkerEmptyDB)
+}
+
+// bdSilentMigrationLockMarker is the substring bd's stderr contains when its
+// store-open failed on a contended schema-migration lock. See
+// ErrBDMigrationLockFailure. Mirrors cmd/gc/bd_env.go's identically-named
+// constant — the two packages cannot share it directly (cmd/gc imports
+// internal/beads, not the reverse), matching how
+// bdSilentFallbackMarkerImport/EmptyDB are already duplicated across both.
+const bdSilentMigrationLockMarker = "schema migration lock unavailable"
+
+func bdOutputIndicatesMigrationLockFailure(s string) bool {
+	return strings.Contains(strings.ToLower(s), bdSilentMigrationLockMarker)
 }
 
 // PurgeRunnerFunc executes a bd purge command with custom dir and env.
