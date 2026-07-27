@@ -2544,9 +2544,15 @@ to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". If the recipient is a
 currently-live session, it is nudged automatically -- no flag required.
 Use --from to override the sender identity. Use --to as an alternative to
 the positional &lt;to&gt; argument. Use -s/--subject for the summary line and
--m/--message for the body text. Use --all to broadcast to all live sessions
-(excluding sender and "human"). --notify/--nudge are accepted for backward
-compatibility and have no additional effect.
+-m/--message for the body text. Use --body-file to read the body from a file
+instead (pass - for stdin). Prefer --body-file over -m/positional body when
+the text may contain backticks or $(...): the invoking shell expands those
+as command substitution inside a double-quoted argument before gc ever sees
+them, silently corrupting (or executing) the body. A file path never
+transits a shell argument, so its contents round-trip byte-for-byte.
+Use --all to broadcast to all live sessions (excluding sender and "human").
+--notify/--nudge are accepted for backward compatibility and have no
+additional effect.
 
 ```
 gc mail send [<to>] [<body>] [flags]
@@ -2558,6 +2564,7 @@ gc mail send [<to>] [<body>] [flags]
 gc mail send mayor "Build is green"
 gc mail send mayor -s "Build is green"
 gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
+gc mail send myrig/witness -s "Findings" --body-file findings.md
 gc mail send --to mayor "Build is green"
 gc mail send human "Review needed for PR #42"
 gc mail send --all "Status update: tests passing"
@@ -2566,6 +2573,7 @@ gc mail send --all "Status update: tests passing"
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--all` | bool |  | broadcast to all live sessions (excludes sender and human) |
+| `--body-file` | string |  | read message body from file (use - for stdin) |
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
