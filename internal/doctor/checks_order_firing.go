@@ -37,18 +37,42 @@ const (
 	// Limit:1/sorted/label-filtered beads query — the slowness is this
 	// city's Dolt sql-server saturating under normal fleet concurrency
 	// (tracked separately as ga-t2brh8, "schema migration lock unavailable:
-	// timeout"; not a quick fix, gated on its own audit). Direct measurement
-	// on this machine: a single `gc order history <name>` call for the one
-	// order that actually needed this fallback took 92s; a `gc order check`
-	// pass over all ~20 monitored orders took 2m2s. No fixed WHOLE-check
-	// timeout below several minutes could make the old design (any one
-	// order's lastRun call blocks the entire check, discarding every other
-	// order's already-computed result) reliably pass here. Bounding the
+	// timeout"; closed 2026-07-26 with adaptive backoff on a DIFFERENT
+	// codepath — gc's own session/hook work-query polling — so contention
+	// here is mitigated by that fix, not eliminated by it). Direct
+	// measurement on this machine: a single `gc order history <name>` call
+	// for the one order that actually needed this fallback took 92s; a
+	// `gc order check` pass over all ~20 monitored orders took 2m2s. No fixed
+	// WHOLE-check timeout below several minutes could make the old design
+	// (any one order's lastRun call blocks the entire check, discarding every
+	// other order's already-computed result) reliably pass here. Bounding the
 	// call per-order instead means the orders that resolve from the
 	// in-memory event tail are unaffected, and only the order(s) actually
 	// needing the fallback degrade to tail-only data (see
 	// errOrderHistoryLookupTimedOut) rather than blinding the whole check.
+	//
+	// A FIXED per-order bound alone does not bound the AGGREGATE, though:
+	// enough orders needing the fallback at once — this city monitors ~27,
+	// several on multi-hour cooldowns liable to fall outside the event tail
+	// together — can still sum past orderFiringHistoryTimeout and trip the
+	// whole-check timeout in Run, reintroducing the exact symptom this bound
+	// was meant to fix (persona-marcus review on this bead, 2026-07-26).
+	// latestOrderFiredAt now additionally clamps each attempt to whatever
+	// remains of the whole-check deadline (see orderFiringDeadlineReserve),
+	// so no combination of stalled orders can exceed it: once the shared
+	// budget is spent, remaining orders degrade immediately without even
+	// attempting the call.
 	orderFiringLastRunTimeout = 5 * time.Second
+	// orderFiringDeadlineReserve is held back from the whole-check deadline
+	// when computing how much of the remaining budget a per-order lastRun
+	// attempt may use (see latestOrderFiredAt). It covers Run's own
+	// goroutine-dispatch and channel-select overhead so a fully-consumed
+	// per-order budget can't itself tip the whole check past
+	// orderFiringHistoryTimeout. Measured against real wall-clock time
+	// (time.Now/time.Until), never the mockable clock field — the whole-check
+	// budget is a real-process constraint, independent of whatever simulated
+	// "now" business-logic classification uses.
+	orderFiringDeadlineReserve = 1 * time.Second
 )
 
 // errOrderHistoryLookupTimedOut signals that a single order's Dolt/beads
@@ -75,22 +99,24 @@ func WithOrderFiringCurrentLastRunFunc(fn OrderFiringCurrentLastRunFunc) OrderFi
 
 // OrderFiringCurrentCheck reports scheduled orders whose last firing is stale.
 type OrderFiringCurrentCheck struct {
-	cfg            *config.City
-	cityPath       string
-	clock          func() time.Time
-	lastRun        OrderFiringCurrentLastRunFunc
-	historyTimeout time.Duration
-	lastRunTimeout time.Duration
+	cfg             *config.City
+	cityPath        string
+	clock           func() time.Time
+	lastRun         OrderFiringCurrentLastRunFunc
+	historyTimeout  time.Duration
+	lastRunTimeout  time.Duration
+	deadlineReserve time.Duration
 }
 
 // NewOrderFiringCurrentCheck creates a check for cron and cooldown order freshness.
 func NewOrderFiringCurrentCheck(cfg *config.City, cityPath string, opts ...OrderFiringCurrentOption) *OrderFiringCurrentCheck {
 	check := &OrderFiringCurrentCheck{
-		cfg:            cfg,
-		cityPath:       cityPath,
-		clock:          time.Now,
-		historyTimeout: orderFiringHistoryTimeout,
-		lastRunTimeout: orderFiringLastRunTimeout,
+		cfg:             cfg,
+		cityPath:        cityPath,
+		clock:           time.Now,
+		historyTimeout:  orderFiringHistoryTimeout,
+		lastRunTimeout:  orderFiringLastRunTimeout,
+		deadlineReserve: orderFiringDeadlineReserve,
 	}
 	for _, opt := range opts {
 		opt(check)
@@ -108,6 +134,16 @@ func (c *OrderFiringCurrentCheck) resolvedLastRunTimeout() time.Duration {
 	return orderFiringLastRunTimeout
 }
 
+// resolvedDeadlineReserve returns the configured deadline reserve, falling
+// back to orderFiringDeadlineReserve for checks constructed via a bare struct
+// literal rather than NewOrderFiringCurrentCheck.
+func (c *OrderFiringCurrentCheck) resolvedDeadlineReserve() time.Duration {
+	if c.deadlineReserve > 0 {
+		return c.deadlineReserve
+	}
+	return orderFiringDeadlineReserve
+}
+
 // Name returns the check identifier shown by gc doctor.
 func (c *OrderFiringCurrentCheck) Name() string { return orderFiringCurrentName }
 
@@ -123,13 +159,21 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 	if timeout <= 0 {
 		timeout = orderFiringHistoryTimeout
 	}
+	// Shared deadline for the whole check, threaded down to each per-order
+	// lastRun fallback attempt so no combination of stalled orders can sum
+	// past this budget (see orderFiringDeadlineReserve). Measured against
+	// real wall-clock time, not c.clock — the mockable clock field is for
+	// business-logic "now" (order-age classification) and is frozen to a
+	// fixed instant in most tests, which would never let a real-time budget
+	// shrink; the whole-check timeout below is likewise always real-time.
+	deadline := time.Now().Add(timeout)
 
 	// The order-history resolver opens the beads/Dolt store and does not accept
 	// a context. Keep that potentially blocking I/O from wedging the complete
 	// doctor run; the gc process exits after printing this failed check.
 	results := make(chan *CheckResult, 1)
 	go func() {
-		results <- c.run(ctx)
+		results <- c.run(ctx, deadline)
 	}()
 
 	select {
@@ -145,7 +189,7 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
+func (c *OrderFiringCurrentCheck) run(ctx *CheckContext, deadline time.Time) *CheckResult {
 	result := &CheckResult{Name: c.Name()}
 	if c.cfg == nil {
 		result.Status = StatusOK
@@ -215,7 +259,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		lastFired, err := c.latestOrderFiredAt(firedEvents, order, expected, now)
+		lastFired, err := c.latestOrderFiredAt(firedEvents, order, expected, now, deadline)
 		degradedLookup := errors.Is(err, errOrderHistoryLookupTimedOut)
 		if err != nil && !degradedLookup {
 			worst = worseStatus(worst, StatusError)
@@ -627,7 +671,7 @@ func latestControllerStartedAt(eventPath string) (time.Time, error) {
 	return latest, nil
 }
 
-func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order orders.Order, expected time.Duration, now time.Time) (time.Time, error) {
+func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order orders.Order, expected time.Duration, now time.Time, deadline time.Time) (time.Time, error) {
 	latest := latestOrderFiredAt(evts, order.ScopedName())
 	if c.lastRun == nil {
 		return latest, nil
@@ -643,6 +687,24 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 	// whole method serially would once again let one stalled order consume
 	// every other order's time budget (the original ga-17ow3v symptom, just
 	// moved one level down).
+	//
+	// A fixed per-order bound alone still lets enough stalled orders sum past
+	// the whole-check budget (persona-marcus review, 2026-07-26), so clamp
+	// this attempt to whatever remains of the shared deadline first. Once
+	// that shared budget is gone, degrade immediately without even attempting
+	// the call — an attempt that can't complete in time isn't worth the
+	// goroutine/scheduling overhead, and every order after the exhaustion
+	// point still needs to be classified and reported, not discarded.
+	perCallTimeout := c.resolvedLastRunTimeout()
+	if !deadline.IsZero() {
+		if remaining := time.Until(deadline) - c.resolvedDeadlineReserve(); remaining < perCallTimeout {
+			perCallTimeout = remaining
+		}
+	}
+	if perCallTimeout <= 0 {
+		return latest, errOrderHistoryLookupTimedOut
+	}
+
 	type lastRunResult struct {
 		at  time.Time
 		err error
@@ -662,7 +724,7 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 			return res.at, nil
 		}
 		return latest, nil
-	case <-time.After(c.resolvedLastRunTimeout()):
+	case <-time.After(perCallTimeout):
 		return latest, errOrderHistoryLookupTimedOut
 	}
 }

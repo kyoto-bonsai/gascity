@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -596,7 +597,7 @@ func TestLatestOrderFiredAt_RecentEventSkipsLastRun(t *testing.T) {
 		},
 	}
 
-	got, err := check.latestOrderFiredAt(evts, order, expected, now)
+	got, err := check.latestOrderFiredAt(evts, order, expected, now, time.Time{})
 	if err != nil {
 		t.Fatalf("latestOrderFiredAt returned error: %v", err)
 	}
@@ -627,7 +628,7 @@ func TestLatestOrderFiredAt_StaleEventConsultsLastRun(t *testing.T) {
 		},
 	}
 
-	got, err := check.latestOrderFiredAt(evts, order, expected, now)
+	got, err := check.latestOrderFiredAt(evts, order, expected, now, time.Time{})
 	if err != nil {
 		t.Fatalf("latestOrderFiredAt returned error: %v", err)
 	}
@@ -639,7 +640,21 @@ func TestLatestOrderFiredAt_StaleEventConsultsLastRun(t *testing.T) {
 	}
 }
 
-func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
+// TestOrderFiringCurrent_StalledLastRun_DegradesInsteadOfBlindingWholeCheck
+// used to pin the OUTER whole-check timeout firing whenever a single
+// lastRun call stalled under a tight historyTimeout. Superseded by the
+// persona-marcus review finding (2026-07-26, ga-17ow3v): a per-order lastRun
+// bound alone is not enough, because an extremely tight whole-check budget
+// (or several stalled orders summing past a looser one) still tripped Run's
+// own outer timeout and discarded every order's already-computed result —
+// the exact "blinds the order-staleness gate" symptom in this bead's title,
+// just moved from "unbounded event scan" to "unbounded aggregate lastRun
+// spend." latestOrderFiredAt now clamps each attempt to the shared deadline
+// (see orderFiringDeadlineReserve), so once the budget is already spent
+// before the loop even starts, the stalled order degrades to its
+// tail-derived classification (annotated as unconfirmed) instead of the
+// whole check going blank with a generic "lookup timed out" message.
+func TestOrderFiringCurrent_StalledLastRun_DegradesInsteadOfBlindingWholeCheck(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
 	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stalled-history", "cron", "0 */4 * * *")
@@ -650,20 +665,102 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
+	lastRunCalled := false
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
+	// 20ms « the default 1s deadline reserve: the shared budget is already
+	// negative before the per-order loop starts, so the attempt must be
+	// skipped outright rather than raced against a real timer.
 	check.historyTimeout = 20 * time.Millisecond
 	check.lastRun = func(orders.Order) (time.Time, error) {
+		lastRunCalled = true
 		<-release
 		return time.Time{}, nil
 	}
 
 	result := check.Run(&CheckContext{CityPath: cityPath})
-	if result.Status != StatusError {
-		t.Fatalf("status = %v, want error; msg = %s", result.Status, result.Message)
+	if lastRunCalled {
+		t.Fatalf("lastRun was called; want the already-exhausted shared deadline to skip the attempt outright")
 	}
-	if !strings.Contains(result.Message, "order history lookup timed out after 20ms") {
-		t.Fatalf("message = %q, want timeout diagnostic", result.Message)
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error (tail-derived classification is genuinely CRITICAL: stale on its own); msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if strings.Contains(result.Message, "order history lookup timed out") {
+		t.Fatalf("message = %q, want the whole check to classify from tail data instead of blanking itself with a lookup-timeout message", result.Message)
+	}
+	details := strings.Join(result.Details, "\n")
+	if !strings.Contains(details, "CRITICAL: stale") {
+		t.Fatalf("details = %v, want the tail-derived stale classification to still surface", result.Details)
+	}
+	if !strings.Contains(details, "confirmation timed out") {
+		t.Fatalf("details = %v, want an unconfirmed-lookup annotation", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_MultipleStalledLastRuns_ShareWholeCheckBudget pins
+// the core of the aggregate-budget fix (persona-marcus review, 2026-07-26):
+// a FIXED per-order lastRun bound does not bound the AGGREGATE — enough
+// orders needing the fallback at once can still sum past the whole-check
+// budget and trip Run's outer timeout, discarding every order's result
+// (including ones that already resolved cleanly from the event tail). Three
+// orders here each need the fallback and would block if actually attempted;
+// the shared deadline must let the first two spend their full per-order
+// bound, then skip the third's attempt outright once the budget is gone —
+// and a fourth, healthy order must resolve from the tail completely
+// unaffected, exactly as in the single-stall test above.
+func TestOrderFiringCurrent_MultipleStalledLastRuns_ShareWholeCheckBudget(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "stall-a", "cooldown", "1h")
+	writeOrderFiringTestOrder(t, cityPath, "stall-b", "cooldown", "1h")
+	writeOrderFiringTestOrder(t, cityPath, "stall-c", "cooldown", "1h")
+	writeOrderFiringTestOrder(t, cityPath, "healthy-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-5 * time.Minute)},
+		events.Event{Type: events.OrderFired, Subject: "healthy-cooldown", Ts: now.Add(-10 * time.Minute)},
+	)
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var mu sync.Mutex
+	attempted := 0
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+		mu.Lock()
+		attempted++
+		mu.Unlock()
+		<-release // simulates ga-t2brh8 Dolt contention
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	check.lastRunTimeout = 100 * time.Millisecond
+	check.deadlineReserve = 100 * time.Millisecond
+	// 2 full 100ms attempts (200ms) + the 100ms reserve exhausts this budget
+	// before a 3rd attempt can start; ~100ms of slack over the 2-attempt
+	// case keeps this robust against scheduling jitter without making the
+	// test slow.
+	check.historyTimeout = 300 * time.Millisecond
+
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if strings.Contains(result.Message, "order history lookup timed out") {
+		t.Fatalf("whole check timed out and discarded every order's result — the exact aggregate-budget bug this test pins; details = %v", result.Details)
+	}
+	if result.Status != StatusWarning {
+		t.Fatalf("status = %v, want warning (degraded confirmations stay visible but must not escalate past warning on their own); msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	details := strings.Join(result.Details, "\n")
+	for _, name := range []string{"stall-a", "stall-b", "stall-c"} {
+		if !strings.Contains(details, name) {
+			t.Fatalf("details = %v, want %s to still appear (nothing discarded)", result.Details, name)
+		}
+	}
+	if !strings.Contains(details, "healthy-cooldown: last fired 10m ago") {
+		t.Fatalf("details = %v, want healthy-cooldown resolved normally, unaffected by its siblings' stalled lookups", result.Details)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempted != 2 {
+		t.Fatalf("lastRun attempted %d times across stall-a/b/c, want exactly 2 (the shared budget covers 2 full per-order attempts before the 3rd must skip outright); details = %v", attempted, result.Details)
 	}
 }
 
@@ -695,7 +792,7 @@ func TestLatestOrderFiredAt_LastRunTimeout_ReturnsTailDataWithSentinelError(t *t
 
 	got, err := check.latestOrderFiredAt(
 		[]events.Event{{Type: events.OrderFired, Subject: order.ScopedName(), Ts: staleEvent}},
-		order, expected, now,
+		order, expected, now, time.Time{},
 	)
 	if !errors.Is(err, errOrderHistoryLookupTimedOut) {
 		t.Fatalf("err = %v, want errOrderHistoryLookupTimedOut", err)
