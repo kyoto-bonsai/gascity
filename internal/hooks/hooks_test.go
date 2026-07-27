@@ -515,6 +515,138 @@ func TestInstallCodexIsByteStableAcrossRepeatedInstalls(t *testing.T) {
 	}
 }
 
+// TestInstallCodexIncludesGitClaimSnapshotHook covers ga-q07juy: a fresh
+// codex install must wire the git-claim-snapshot baseline command into
+// SessionStart, matching Claude's tracked .claude/settings.json wiring.
+// Prior to this fix, codex (and opencode) session-lifecycle hooks never
+// called bin/git-claim-snapshot.sh at all, leaving both providers at
+// near-zero claim-baseline coverage for the dirty-tree/commit-race check.
+func TestInstallCodexIncludesGitClaimSnapshotHook(t *testing.T) {
+	fs := fsys.NewFake()
+	if err := Install(fs, "/city", "/work", []string{"codex"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	entries := claudeHookEntries(t, fs.Files["/work/.codex/hooks.json"], "SessionStart")
+	if len(entries) != 1 {
+		t.Fatalf("SessionStart entries = %d, want 1:\n%s", len(entries), string(fs.Files["/work/.codex/hooks.json"]))
+	}
+	var found bool
+	for _, h := range entries[0].Hooks {
+		if strings.Contains(h.Command, "git-claim-snapshot.sh") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("fresh codex install missing git-claim-snapshot SessionStart hook:\n%s", string(fs.Files["/work/.codex/hooks.json"]))
+	}
+}
+
+// TestInstallCodexUpgradeAddsGitClaimSnapshotHookIdempotently covers an
+// already-managed, otherwise-current codex hooks.json (correct city
+// binding, has PreCompact) authored before the git-claim-snapshot hook
+// existed. Install must add it, and a repeated Install must not duplicate
+// it (addCodexGitClaimSnapshotHook's own missing-check must gate re-adds).
+func TestInstallCodexUpgradeAddsGitClaimSnapshotHookIdempotently(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/work/.codex/hooks.json"] = []byte(`{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city '/city' prime --hook --hook-format codex"
+      }]
+    }],
+    "PreCompact": [{
+      "hooks": [{
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc --city '/city' handoff --auto --hook-format codex \"context cycle\""
+      }]
+    }]
+  }
+}`)
+
+	if err := Install(fs, "/city", "/work", []string{"codex"}); err != nil {
+		t.Fatalf("first Install: %v", err)
+	}
+	afterFirst := string(fs.Files["/work/.codex/hooks.json"])
+	if !strings.Contains(afterFirst, "git-claim-snapshot.sh") {
+		t.Fatalf("upgrade did not add git-claim-snapshot hook:\n%s", afterFirst)
+	}
+
+	if err := Install(fs, "/city", "/work", []string{"codex"}); err != nil {
+		t.Fatalf("second Install: %v", err)
+	}
+	afterSecond := string(fs.Files["/work/.codex/hooks.json"])
+	entries := claudeHookEntries(t, fs.Files["/work/.codex/hooks.json"], "SessionStart")
+	if len(entries) != 1 {
+		t.Fatalf("SessionStart entries = %d, want 1:\n%s", len(entries), afterSecond)
+	}
+	snapshotHookCount := 0
+	for _, h := range entries[0].Hooks {
+		if strings.Contains(h.Command, "git-claim-snapshot.sh") {
+			snapshotHookCount++
+		}
+	}
+	if snapshotHookCount != 1 {
+		t.Fatalf("repeated Install duplicated the git-claim-snapshot hook entry (want exactly 1 matching hook object, got %d):\n%s", snapshotHookCount, afterSecond)
+	}
+	if afterFirst != afterSecond {
+		t.Fatalf("second Install rewrote hooks after idempotent add:\nfirst:\n%s\nsecond:\n%s", afterFirst, afterSecond)
+	}
+}
+
+// TestInstallCodexAddsGitClaimSnapshotToManagedEntryOnly covers a doc with a
+// user-added custom SessionStart entry ahead of the managed one: the
+// snapshot hook must land in the managed entry specifically, and the custom
+// entry must survive untouched.
+func TestInstallCodexAddsGitClaimSnapshotToManagedEntryOnly(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/work/.codex/hooks.json"] = []byte(`{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "",
+      "hooks": [{
+        "type": "command",
+        "command": "printf custom-session-start"
+      }]
+    }, {
+      "hooks": [{
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city '/city' prime --hook --hook-format codex"
+      }]
+    }],
+    "PreCompact": [{
+      "hooks": [{
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc --city '/city' handoff --auto --hook-format codex \"context cycle\""
+      }]
+    }]
+  }
+}`)
+
+	if err := Install(fs, "/city", "/work", []string{"codex"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	entries := claudeHookEntries(t, fs.Files["/work/.codex/hooks.json"], "SessionStart")
+	if len(entries) != 2 {
+		t.Fatalf("SessionStart entries = %d, want 2 (custom preserved + managed):\n%s", len(entries), string(fs.Files["/work/.codex/hooks.json"]))
+	}
+	if len(entries[0].Hooks) != 1 || entries[0].Hooks[0].Command != "printf custom-session-start" {
+		t.Fatalf("custom SessionStart entry was modified: %+v", entries[0])
+	}
+	var found bool
+	for _, h := range entries[1].Hooks {
+		if strings.Contains(h.Command, "git-claim-snapshot.sh") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("managed SessionStart entry missing git-claim-snapshot hook:\n%s", string(fs.Files["/work/.codex/hooks.json"]))
+	}
+}
+
 func TestCodexHooksMissingManagedPreCompact(t *testing.T) {
 	staleManaged := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"gc prime --hook --hook-format codex"}]}]}}`)
 	if !CodexHooksMissingManagedPreCompact(staleManaged) {
@@ -542,14 +674,19 @@ func TestCodexHooksNeedManagedUpgrade(t *testing.T) {
 		t.Fatal("managed Codex hooks with stale city binding were not reported stale")
 	}
 
-	currentCity := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city '/old/city' prime --hook --hook-format codex"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc --city '/old/city' handoff --auto --hook-format codex \"context cycle\""}]}]}}`)
+	currentCity := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city '/old/city' prime --hook --hook-format codex"},{"type":"command","command":"bash -c git-claim-snapshot.sh"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc --city '/old/city' handoff --auto --hook-format codex \"context cycle\""}]}]}}`)
 	if CodexHooksNeedManagedUpgrade(currentCity, "/old/city") {
-		t.Fatal("managed Codex hooks already bound to requested city were reported stale")
+		t.Fatal("managed Codex hooks already bound to requested city and current on git-claim-snapshot were reported stale")
 	}
 
 	custom := []byte(`{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"FOO=1 gc mail check --inject --hook-format codex"}]}]}}`)
 	if CodexHooksNeedManagedUpgrade(custom, "/city") {
 		t.Fatal("env-prefixed custom Codex hooks were reported stale")
+	}
+
+	missingGitClaimSnapshot := []byte(`{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city '/old/city' prime --hook --hook-format codex"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc --city '/old/city' handoff --auto --hook-format codex \"context cycle\""}]}]}}`)
+	if !CodexHooksNeedManagedUpgrade(missingGitClaimSnapshot, "/old/city") {
+		t.Fatal("managed Codex hooks missing git-claim-snapshot were not reported stale (ga-q07juy)")
 	}
 }
 
@@ -745,12 +882,18 @@ func TestInstallCodexPreservesExtraEnvOnManagedHooks(t *testing.T) {
 }
 
 func TestUpgradeCodexHooksSkipsWhenDesiredPreCompactUnavailable(t *testing.T) {
+	// SessionStart already carries the git-claim-snapshot hook so this test
+	// isolates the PreCompact-availability behavior it targets, rather than
+	// also picking up an unrelated addCodexGitClaimSnapshotHook change.
 	existing := []byte(`{
   "hooks": {
     "SessionStart": [{
       "hooks": [{
         "type": "command",
         "command": "GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex"
+      }, {
+        "type": "command",
+        "command": "bash -c git-claim-snapshot.sh"
       }]
     }]
   }
@@ -1702,6 +1845,9 @@ func TestInstallOverlayManagedProviders(t *testing.T) {
 			t.Errorf("codex prompt hooks missing bounded command %q:\n%s", want, codexHooksText)
 		}
 	}
+	if !strings.Contains(codexHooksText, "git-claim-snapshot.sh") {
+		t.Errorf("codex SessionStart missing git-claim-snapshot baseline hook (ga-q07juy):\n%s", codexHooksText)
+	}
 	geminiHooks := string(fs.Files["/work/.gemini/settings.json"])
 	for _, want := range []string{
 		`gc hook run --timeout 15s --timeout-exit-code 0 -- nudge drain --inject --hook-format gemini`,
@@ -1761,7 +1907,7 @@ func TestInstallOverlayManagedProviders(t *testing.T) {
 	}
 	opencodeHooks := string(fs.Files["/work/.opencode/plugins/gascity.js"])
 	for _, want := range []string{
-		"const GC_OPENCODE_HOOK_VERSION = 5",
+		"const GC_OPENCODE_HOOK_VERSION = 6",
 		`process.env.GC_BIN || "gc"`,
 		`/opt/homebrew/bin:/usr/local/bin:${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:`,
 		`"experimental.session.compacting"`,
@@ -1773,6 +1919,8 @@ func TestInstallOverlayManagedProviders(t *testing.T) {
 		"providerSessionEnv(sessionID)",
 		"GC_PROVIDER_SESSION_ID",
 		"GC_PROVIDER_SESSION_ID_REQUIRED",
+		"runGitClaimSnapshotBaseline(directory)",
+		"git-claim-snapshot.sh",
 	} {
 		if !strings.Contains(opencodeHooks, want) {
 			t.Errorf("OpenCode plugin missing marker %q:\n%s", want, opencodeHooks)
@@ -2167,7 +2315,7 @@ export default async function gascityPlugin() {
 		t.Fatal("stale OpenCode managed plugin was preserved; expected managed upgrade")
 	}
 	for _, want := range []string{
-		"const GC_OPENCODE_HOOK_VERSION = 5",
+		"const GC_OPENCODE_HOOK_VERSION = 6",
 		`process.env.GC_BIN || "gc"`,
 		`/opt/homebrew/bin:/usr/local/bin:${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:`,
 		`"experimental.session.compacting"`,
@@ -2176,6 +2324,8 @@ export default async function gascityPlugin() {
 		"logRunStderr",
 		"GC_PROVIDER_SESSION_ID",
 		"GC_PROVIDER_SESSION_ID_REQUIRED",
+		"runGitClaimSnapshotBaseline(directory)",
+		"git-claim-snapshot.sh",
 	} {
 		if !strings.Contains(data, want) {
 			t.Errorf("upgraded OpenCode plugin missing marker %q:\n%s", want, data)
@@ -2189,7 +2339,7 @@ export default async function gascityPlugin() {
 
 func TestOpenCodeHookNeedsUpgradeComparesParsedVersion(t *testing.T) {
 	current := []byte(`// Gas City hooks for OpenCode.
-const GC_OPENCODE_HOOK_VERSION = 5;
+const GC_OPENCODE_HOOK_VERSION = 6;
 const GC_BIN = process.env.GC_BIN || "gc";
 const PATH_PREFIX =
   "/opt/homebrew/bin:/usr/local/bin:${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:";
@@ -2197,16 +2347,19 @@ function logRunFailure(args, directory, err) {}
 function logRunStderr(stderr) {}
 async function runWithWarning(directory, ...args) {}
 function providerSessionEnv(sessionID) {}
+async function runGitClaimSnapshotBaseline(directory) {}
 "experimental.session.compacting";
 logRunStderr(stderr);
 runWithWarning(directory, "handoff", "--auto", "context cycle");
 output.context.push(handoff);
 GC_PROVIDER_SESSION_ID;
 GC_PROVIDER_SESSION_ID_REQUIRED;
+"git-claim-snapshot.sh";
 `)
-	stale := bytes.Replace(current, []byte("GC_OPENCODE_HOOK_VERSION = 5"), []byte("GC_OPENCODE_HOOK_VERSION = 4"), 1)
-	future := bytes.Replace(current, []byte("GC_OPENCODE_HOOK_VERSION = 5"), []byte("GC_OPENCODE_HOOK_VERSION = 6"), 1)
+	stale := bytes.Replace(current, []byte("GC_OPENCODE_HOOK_VERSION = 6"), []byte("GC_OPENCODE_HOOK_VERSION = 5"), 1)
+	future := bytes.Replace(current, []byte("GC_OPENCODE_HOOK_VERSION = 6"), []byte("GC_OPENCODE_HOOK_VERSION = 7"), 1)
 	missingStderrLog := bytes.Replace(current, []byte("logRunStderr(stderr);\n"), nil, 1)
+	missingGitClaimSnapshot := bytes.Replace(current, []byte(`"git-claim-snapshot.sh";`+"\n"), nil, 1)
 
 	if !opencodeHookNeedsUpgrade(stale) {
 		t.Fatal("stale OpenCode hook version did not request upgrade")
@@ -2219,6 +2372,9 @@ GC_PROVIDER_SESSION_ID_REQUIRED;
 	}
 	if !opencodeHookNeedsUpgrade(missingStderrLog) {
 		t.Fatal("OpenCode hook without child stderr logging did not request upgrade")
+	}
+	if !opencodeHookNeedsUpgrade(missingGitClaimSnapshot) {
+		t.Fatal("OpenCode hook without git-claim-snapshot call did not request upgrade (ga-q07juy)")
 	}
 }
 

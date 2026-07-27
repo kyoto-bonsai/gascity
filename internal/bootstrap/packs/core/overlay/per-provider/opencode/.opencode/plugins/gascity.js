@@ -8,7 +8,9 @@
 //
 // Gas City uses:
 //   - session.created / session.compacted → gc prime --hook (side effects such
-//     as session-id persistence and poller bootstrap)
+//     as session-id persistence and poller bootstrap) and a git-claim-snapshot
+//     baseline capture for the dirty-tree/commit-race check
+//     (doctrine/git-commit-discipline.md)
 //   - experimental.session.compacting → gc handoff --auto "context cycle"
 //     and inject the handoff confirmation into the compaction context
 //   - experimental.chat.system.transform → inject gc prime --hook, queued
@@ -20,7 +22,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const GC_OPENCODE_HOOK_VERSION = 5;
+const GC_OPENCODE_HOOK_VERSION = 6;
 const GC_BIN = process.env.GC_BIN || "gc";
 // GC_BIN is the explicit override. The fallback order matches Pi hooks so
 // sibling providers resolve the same installed gc before developer-local bins.
@@ -82,6 +84,29 @@ function logRunStderr(stderr) {
     }
   } catch {
     return;
+  }
+}
+
+// runGitClaimSnapshotBaseline captures a claim-time dirty-tree baseline
+// (bin/git-claim-snapshot.sh, see doctrine/git-commit-discipline.md) at
+// session start. Unlike run()/runWithWarning() above, this never invokes gc
+// itself and self-resolves the git root via `git rev-parse --show-toplevel`,
+// so it needs no city-path plumbing and works regardless of how deep
+// `directory` sits below the city root. Best-effort: a missing script, a
+// city without the script, or a non-git cwd all no-op rather than blocking
+// session start.
+async function runGitClaimSnapshotBaseline(directory) {
+  try {
+    await execFileAsync(
+      "bash",
+      [
+        "-c",
+        'root=$(git rev-parse --show-toplevel 2>/dev/null); if [ -n "$root" ] && [ -x "$root/bin/git-claim-snapshot.sh" ]; then exec "$root/bin/git-claim-snapshot.sh"; fi',
+      ],
+      { cwd: directory, encoding: "utf-8", timeout: 30000, env: process.env },
+    );
+  } catch (err) {
+    logRunFailure(["git-claim-snapshot.sh"], directory, err);
   }
 }
 
@@ -171,6 +196,7 @@ export default async function gascityPlugin({ directory, client }) {
           {
             const sessionID = sessionIDFromEvent(event);
             await readPrime(true, providerSessionEnv(sessionID));
+            await runGitClaimSnapshotBaseline(directory);
             await mirrorTranscript(directory, client, sessionID);
           }
           return;

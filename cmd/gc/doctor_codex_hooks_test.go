@@ -44,6 +44,9 @@ func TestCodexHooksDriftCheckPassesCurrentHooks(t *testing.T) {
       "hooks": [{
         "type": "command",
         "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city %s prime --hook --hook-format codex"
+      }, {
+        "type": "command",
+        "command": "bash -c git-claim-snapshot.sh"
       }]
     }],
     "PreCompact": [{
@@ -60,6 +63,51 @@ func TestCodexHooksDriftCheckPassesCurrentHooks(t *testing.T) {
 
 	if result.Status != doctor.StatusOK {
 		t.Fatalf("status = %v, want ok; message=%s", result.Status, result.Message)
+	}
+}
+
+// TestCodexHooksDriftCheckReportsAndFixesMissingGitClaimSnapshot covers
+// ga-q07juy: a managed codex hooks.json that predates the git-claim-snapshot
+// baseline hook (correct city binding, has PreCompact, but SessionStart
+// lacks the snapshot command) must be reported stale and repaired by Fix,
+// matching the same drift-check/fix contract already used for PreCompact.
+func TestCodexHooksDriftCheckReportsAndFixesMissingGitClaimSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	writeCodexHooksForDoctorTest(t, dir, fmt.Sprintf(`{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc --city %s prime --hook --hook-format codex"
+      }]
+    }],
+    "PreCompact": [{
+      "hooks": [{
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc --city %s handoff --auto --hook-format codex \"context cycle\""
+      }]
+    }]
+  }
+}`, shellquote.Quote(dir), shellquote.Quote(dir)))
+
+	check := newCodexHooksDriftCheck(dir, []string{dir})
+	result := check.Run(&doctor.CheckContext{})
+	if result.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want warning for missing git-claim-snapshot; message=%s", result.Status, result.Message)
+	}
+
+	if err := check.Fix(&doctor.CheckContext{}); err != nil {
+		t.Fatalf("Fix: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".codex", "hooks.json"))
+	if err != nil {
+		t.Fatalf("read hooks: %v", err)
+	}
+	if !strings.Contains(string(data), "git-claim-snapshot.sh") {
+		t.Fatalf("fixed hooks missing git-claim-snapshot baseline command:\n%s", string(data))
+	}
+	if result := check.Run(&doctor.CheckContext{}); result.Status != doctor.StatusOK {
+		t.Fatalf("status after fix = %v, want ok; message=%s", result.Status, result.Message)
 	}
 }
 

@@ -34,7 +34,7 @@ var supported = []string{"claude", "codex", "gemini", "antigravity", "kiro", "op
 
 const (
 	managedPiHookVersion       = 7
-	managedOpenCodeHookVersion = 5
+	managedOpenCodeHookVersion = 6
 	managedMimoCodeHookVersion = 2
 	managedOmpHookVersion      = 2
 )
@@ -297,7 +297,8 @@ func opencodeHookNeedsUpgrade(existing []byte) bool {
 		!strings.Contains(content, "logRunFailure") ||
 		!strings.Contains(content, "logRunStderr(stderr);") ||
 		!strings.Contains(content, "GC_PROVIDER_SESSION_ID") ||
-		!strings.Contains(content, "GC_PROVIDER_SESSION_ID_REQUIRED") {
+		!strings.Contains(content, "GC_PROVIDER_SESSION_ID_REQUIRED") ||
+		!strings.Contains(content, "git-claim-snapshot.sh") {
 		return true
 	}
 	for _, marker := range []string{
@@ -653,6 +654,9 @@ func upgradeCodexHooks(existing, desired []byte, cityDir string) ([]byte, bool, 
 	if addCodexPreCompactHook(root, desired) {
 		changed = true
 	}
+	if addCodexGitClaimSnapshotHook(root) {
+		changed = true
+	}
 	data, err := overlay.MarshalCanonicalJSON(root)
 	if err != nil {
 		return nil, false, err
@@ -671,6 +675,9 @@ func normalizeCodexHookCommands(existing []byte, cityDir string) ([]byte, bool, 
 	hasManagedCommand := codexHookValueHasManagedCommand(root, "")
 	changed := upgradeCodexHookValue(root, "", cityDir)
 	if normalizeCodexManagedHookEntries(root, cityDir) {
+		changed = true
+	}
+	if addCodexGitClaimSnapshotHook(root) {
 		changed = true
 	}
 	data, err := overlay.MarshalCanonicalJSON(root)
@@ -707,6 +714,9 @@ func CodexHooksNeedManagedUpgrade(data []byte, cityDir string) bool {
 func applyCodexManagedHookUpgrade(root any, desired []byte, cityDir string) bool {
 	changed := upgradeCodexHookValue(root, "", cityDir)
 	if addCodexPreCompactHook(root, desired) {
+		changed = true
+	}
+	if addCodexGitClaimSnapshotHook(root) {
 		changed = true
 	}
 	return changed
@@ -1241,6 +1251,105 @@ func codexHookDocLooksManaged(doc map[string]any) bool {
 	}
 	walk(doc)
 	return found
+}
+
+// codexGitClaimSnapshotCommand is the managed SessionStart hook command that
+// captures a claim-time dirty-tree baseline (bin/git-claim-snapshot.sh, see
+// doctrine/git-commit-discipline.md). Unlike the gc prime/handoff commands
+// above, it never invokes gc itself and self-resolves the git root at
+// runtime via `git rev-parse --show-toplevel`, so it needs no per-city
+// templating and works identically regardless of how deep the agent's
+// working directory sits below the city root. Best-effort: `|| true` plus
+// the non-empty-root and executable-bit guards mean a missing script, a
+// city without the script, or a non-git cwd never blocks session start.
+const codexGitClaimSnapshotCommand = `bash -c 'root=$(git rev-parse --show-toplevel 2>/dev/null); if [ -n "$root" ] && [ -x "$root/bin/git-claim-snapshot.sh" ]; then exec "$root/bin/git-claim-snapshot.sh"; fi' || true`
+
+// codexGitClaimSnapshotMarker identifies the git-claim-snapshot command body
+// within a codex hooks document, independent of the gc-command parsing
+// codexHookValueHasManagedCommand uses for the prime/handoff/nudge/mail
+// commands above (this command never invokes gc).
+const codexGitClaimSnapshotMarker = "git-claim-snapshot.sh"
+
+// codexHookDocMissingGitClaimSnapshot reports whether a managed codex hooks
+// document's SessionStart entries are missing the git-claim-snapshot
+// baseline command. Traced in ga-q07juy: codex and opencode session-lifecycle
+// hooks never called bin/git-claim-snapshot.sh, unlike Claude's tracked
+// .claude/settings.json wiring, leaving both providers at near-zero claim-
+// baseline coverage for the dirty-tree/commit-race check.
+func codexHookDocMissingGitClaimSnapshot(root any) bool {
+	doc, ok := root.(map[string]any)
+	if !ok || !codexHookDocLooksManaged(doc) {
+		return false
+	}
+	hooksMap, ok := doc["hooks"].(map[string]any)
+	if !ok {
+		return false
+	}
+	entries, ok := hooksMap["SessionStart"].([]any)
+	if !ok || len(entries) == 0 {
+		return false
+	}
+	return !codexHookValueHasCommandContaining(entries, codexGitClaimSnapshotMarker)
+}
+
+// codexHookValueHasCommandContaining reports whether any "command" string
+// value reachable from v contains substr. Used to detect the (non-gc)
+// git-claim-snapshot command, which codexHookValueHasManagedCommand's
+// gc-specific parsing does not recognize.
+func codexHookValueHasCommandContaining(v any, substr string) bool {
+	switch node := v.(type) {
+	case map[string]any:
+		for key, val := range node {
+			if key == "command" {
+				if command, ok := val.(string); ok && strings.Contains(command, substr) {
+					return true
+				}
+				continue
+			}
+			if codexHookValueHasCommandContaining(val, substr) {
+				return true
+			}
+		}
+	case []any:
+		for _, elem := range node {
+			if codexHookValueHasCommandContaining(elem, substr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// addCodexGitClaimSnapshotHook appends the git-claim-snapshot baseline
+// command to the managed SessionStart entry's hooks array (the entry
+// already carrying a recognized gc prime/handoff-style managed command), if
+// a managed codex hooks document exists and doesn't already have it.
+// Targets the managed entry specifically, rather than assuming entries[0],
+// so a user-added custom SessionStart entry ahead of the managed one in the
+// array is left untouched.
+func addCodexGitClaimSnapshotHook(root any) bool {
+	if !codexHookDocMissingGitClaimSnapshot(root) {
+		return false
+	}
+	doc := root.(map[string]any)
+	hooksMap := doc["hooks"].(map[string]any)
+	entries := hooksMap["SessionStart"].([]any)
+	for _, e := range entries {
+		entryMap, ok := e.(map[string]any)
+		if !ok || !codexHookValueHasManagedCommand(entryMap, "SessionStart") {
+			continue
+		}
+		cmds, ok := entryMap["hooks"].([]any)
+		if !ok {
+			continue
+		}
+		entryMap["hooks"] = append(cmds, map[string]any{
+			"type":    "command",
+			"command": codexGitClaimSnapshotCommand,
+		})
+		return true
+	}
+	return false
 }
 
 func desiredCodexPreCompactHook(desired []byte) any {

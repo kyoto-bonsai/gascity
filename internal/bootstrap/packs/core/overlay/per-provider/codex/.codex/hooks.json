@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex"
+          },
+          {
+            "type": "command",
+            "command": "bash -c 'root=$(git rev-parse --show-toplevel 2>/dev/null); if [ -n \"$root\" ] && [ -x \"$root/bin/git-claim-snapshot.sh\" ]; then exec \"$root/bin/git-claim-snapshot.sh\"; fi' || true"
           }
         ]
       }
