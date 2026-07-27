@@ -181,6 +181,47 @@ func TestMailSendMissingArgs(t *testing.T) {
 	}
 }
 
+// TestMailSendBodyFileRejectsPositionalBody covers the bespoke conflict
+// check in newMailSendCmd's RunE (ga-c3zu97): --body-file must refuse to
+// combine with a positional body under all three ways a recipient can be
+// given, rather than silently overwriting or concatenating with the file
+// content.
+func TestMailSendBodyFileRejectsPositionalBody(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"recipient and body both positional", []string{"mayor", "positional body"}},
+		{"--to flag with positional body", []string{"--to", "mayor", "positional body"}},
+		{"--all with positional body", []string{"--all", "positional body"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			cmd := newMailSendCmd(&stdout, &stderr)
+			cmd.SetArgs(append(append([]string{}, tt.args...), "--body-file", "/dev/null"))
+			if err := cmd.Execute(); err == nil {
+				t.Fatal("expected an error combining --body-file with a positional body, got nil")
+			}
+			if !strings.Contains(stderr.String(), "cannot combine --body-file with a positional body") {
+				t.Errorf("stderr = %q, want conflict message", stderr.String())
+			}
+		})
+	}
+}
+
+// TestMailSendBodyFileAndMessageMutuallyExclusive covers the cobra-level
+// MarkFlagsMutuallyExclusive("message", "body-file") wiring: passing both
+// -m and --body-file must fail rather than silently preferring one.
+func TestMailSendBodyFileAndMessageMutuallyExclusive(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	cmd := newMailSendCmd(&stdout, &stderr)
+	cmd.SetArgs([]string{"mayor", "-m", "hello", "--body-file", "/dev/null"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected an error combining -m/--message with --body-file, got nil")
+	}
+}
+
 func TestMailSendInvalidRecipient(t *testing.T) {
 	store := beads.NewMemStore()
 	mp := beadmail.New(store)
