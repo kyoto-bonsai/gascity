@@ -105,7 +105,7 @@ func controllerSocketPath(cityPath string) string {
 // Returns the locked file (caller must defer Close) or an error if another
 // controller is already running.
 func acquireControllerLock(cityPath string) (*os.File, error) {
-	path := filepath.Join(cityPath, ".gc", "controller.lock")
+	path := filepath.Join(normalizePathForCompare(cityPath), ".gc", "controller.lock")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("opening controller lock: %w", err)
