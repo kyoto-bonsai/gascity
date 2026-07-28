@@ -145,6 +145,91 @@ func TestInboxUsesSingleBothTierMessageScanAcrossRoutes(t *testing.T) {
 	if !query.Live {
 		t.Fatalf("message query = %+v, want live read for command-visible mail freshness", query)
 	}
+	// ga-jcnrqn: this recipient's routes all come from ONE session bead, so the
+	// multi-route scan must stay bounded and marked as one recipient's aliases
+	// — not silently discarded the way any 2+-route Assignees query used to be.
+	if query.Limit != messageCandidatesLimit {
+		t.Fatalf("message query = %+v, want Limit == messageCandidatesLimit (%d)", query, messageCandidatesLimit)
+	}
+	if !query.AssigneesAreAliases {
+		t.Fatalf("message query = %+v, want AssigneesAreAliases true for a single recipient's own routes", query)
+	}
+}
+
+// TestInboxSingleLiveNamedPersonaBoundsQueryLimit pins ga-jcnrqn's own FLOOR:
+// a live named persona session's routes are exactly len==3 (bead ID, alias,
+// session_name) — the dominant real-world shape any "gc mail inbox <persona>"
+// resolves through, per ga-mnl73s's literal repro. A fixture with a single
+// bare route (e.g. "mayor" with no seeded session bead, as in
+// TestMessageCandidatesAllBoundsQueryLimit) never enters this branch, so it
+// cannot validate this floor on its own.
+func TestInboxSingleLiveNamedPersonaBoundsQueryLimit(t *testing.T) {
+	store := &messageListProbeStore{MemStore: beads.NewMemStore()}
+	p := New(store)
+
+	sessionBead, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "persona-marcus",
+			"session_name": "qo-marcus-2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	if _, err := p.Send("human", "persona-marcus", "", "for marcus"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if _, err := p.Inbox("persona-marcus"); err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(store.messageQueries) != 1 {
+		t.Fatalf("message query count = %d, want 1; queries=%+v", len(store.messageQueries), store.messageQueries)
+	}
+	query := store.messageQueries[0]
+	wantRoutes := []string{"persona-marcus", sessionBead.ID, "qo-marcus-2"}
+	if !slices.Equal(query.Assignees, wantRoutes) {
+		t.Fatalf("message query Assignees = %v, want exactly the len==3 named-live-persona shape %v", query.Assignees, wantRoutes)
+	}
+	if query.Limit != messageCandidatesLimit {
+		t.Fatalf("message query = %+v, want Limit == messageCandidatesLimit (%d); a discarded Limit means "+
+			"BdStore.listEphemeral runs an unbounded `bd query --limit 0` full scan on every named-persona "+
+			"mail read under Dolt load (ga-jcnrqn)", query, messageCandidatesLimit)
+	}
+	if !query.AssigneesAreAliases {
+		t.Fatalf("message query = %+v, want AssigneesAreAliases true — these 3 routes are one live session's own aliases", query)
+	}
+}
+
+// TestInboxRecipientsMultiplePersonasAreNotTreatedAsAliases guards the scope
+// of ga-jcnrqn's fix: a genuine fan-out across DISTINCT recipients must keep
+// today's conservative (unbounded-scan, no Limit) behavior, since bounding
+// ahead of client-side filtering there could starve one recipient's results
+// in favor of another's — unlike one recipient's own aliases, which can only
+// ever match the same entity.
+func TestInboxRecipientsMultiplePersonasAreNotTreatedAsAliases(t *testing.T) {
+	store := &messageListProbeStore{MemStore: beads.NewMemStore()}
+	p := New(store)
+
+	if _, err := p.Send("human", "persona-a", "", "for a"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := p.Send("human", "persona-b", "", "for b"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	if _, err := p.InboxRecipients([]string{"persona-a", "persona-b"}); err != nil {
+		t.Fatalf("InboxRecipients: %v", err)
+	}
+	if len(store.messageQueries) != 1 {
+		t.Fatalf("message query count = %d, want 1; queries=%+v", len(store.messageQueries), store.messageQueries)
+	}
+	query := store.messageQueries[0]
+	if query.AssigneesAreAliases {
+		t.Fatalf("message query = %+v, want AssigneesAreAliases false — persona-a and persona-b are distinct recipients, not aliases of one", query)
+	}
 }
 
 func TestInboxBypassesPrimedCacheForFreshMessages(t *testing.T) {
