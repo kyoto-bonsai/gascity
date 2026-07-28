@@ -2390,7 +2390,15 @@ func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssig
 	if query.TierMode == TierIssues || query.TierMode == TierWisps {
 		return true
 	}
-	if serverQuery.Sort == SortCreatedAsc || clientFilteredAssignees {
+	if serverQuery.Sort == SortCreatedAsc {
+		return true
+	}
+	// clientFilteredAssignees alone would force an unbounded fetch — the same
+	// class of defect ga-jcnrqn found in listEphemeral's sibling wisps-tier
+	// query — but AssigneesAreAliases callers get the same Limit-safety
+	// argument already accepted for the zero-assignee AllowScan case (see
+	// ListQuery.AssigneesAreAliases).
+	if clientFilteredAssignees && !query.AssigneesAreAliases {
 		return true
 	}
 	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() {
@@ -2447,7 +2455,10 @@ func (s *BdStore) listWispsTier(query ListQuery) ([]Bead, error) {
 func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
 	serverQuery, clientFilteredAssignees := bdServerQueryForAssignees(query)
 	clauses := []string{"ephemeral=true"}
-	serverFilteredOnly := !clientFilteredAssignees
+	// AssigneesAreAliases exempts the multi-alias-of-one-recipient case from
+	// the usual clientFilteredAssignees Limit veto — see ListQuery's doc and
+	// bdListRequiresClientLimit's sibling exemption for the bd-list tier.
+	serverFilteredOnly := !clientFilteredAssignees || query.AssigneesAreAliases
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "label", serverQuery.Label)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "status", serverQuery.Status)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "type", serverQuery.Type)

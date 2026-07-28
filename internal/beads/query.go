@@ -72,7 +72,16 @@ type ListQuery struct {
 	// Assignees matches beads assigned to any listed assignee.
 	// It is mutually exclusive with Assignee; call Validate to enforce that contract.
 	Assignees []string
-	ParentID  string
+	// AssigneesAreAliases tells backends that every entry in Assignees is a
+	// stable-mailbox spelling of ONE logical recipient (e.g. a live session's
+	// bead ID, alias, and session_name), not a fan-out across distinct
+	// recipients. bd-CLI-backed stores cannot push a multi-value assignee
+	// filter server-side and must scan-then-client-filter instead; when this
+	// is set they may still apply Limit to that scan, because narrowing to
+	// one entity's own aliases cannot starve a DIFFERENT recipient's results
+	// the way limiting ahead of a genuine multi-recipient filter could.
+	AssigneesAreAliases bool
+	ParentID            string
 	// ParentIDs matches beads whose parent_id is any of the listed ids — a
 	// batched form of ParentID for graph/subtree walks. Backends that do not
 	// recognize it should ignore it (returning a superset); callers that need

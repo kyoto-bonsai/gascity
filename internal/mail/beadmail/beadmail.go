@@ -384,7 +384,7 @@ func (p *Provider) Archive(id string) error {
 // them.
 func (p *Provider) ArchiveCandidates(filter ArchiveFilter) ([]mail.Message, error) {
 	routes := p.recipientRoutesForAll(filter.Recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	candidates, err := p.messageCandidatesForRoutes(routes, len(filter.Recipients) == 1)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail archive matching: %w", err)
 	}
@@ -553,7 +553,7 @@ func (p *Provider) Check(recipient string) ([]mail.Message, error) {
 // mail so a recycle does not duplicate the UserPromptSubmit inbox injection.
 func (p *Provider) CheckAutoHandoffs(recipients []string) ([]mail.Message, error) {
 	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	candidates, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail: listing auto-handoff messages: %w", err)
 	}
@@ -768,7 +768,7 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 		return 0, 0, nil
 	}
 	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	candidates, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
 	if err != nil {
 		return 0, 0, fmt.Errorf("listing messages: %w", err)
 	}
@@ -798,7 +798,7 @@ func (p *Provider) filterMessages(recipient string, includeRead bool) ([]mail.Me
 // recipient route represented by recipients. Empty recipients mean all routes.
 func (p *Provider) filterMessagesForRecipients(recipients []string, includeRead bool) ([]mail.Message, error) {
 	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	candidates, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail: listing beads: %w", err)
 	}
@@ -1224,8 +1224,13 @@ func matchesRecipientRoute(routes []string, assignee string) bool {
 	return false
 }
 
-func (p *Provider) messageCandidatesForRoutes(routes []string) ([]beads.Bead, error) {
-	return p.messageCandidatesAll(routes)
+// aliasesOfOneRecipient reports whether routes are every stable-mailbox
+// spelling of a SINGLE input recipient (recipientRoutesForAll expanding one
+// name into its session's id/alias/session_name/history), as opposed to a
+// genuine fan-out across several distinct recipients — see
+// beads.ListQuery.AssigneesAreAliases for why that distinction matters.
+func (p *Provider) messageCandidatesForRoutes(routes []string, aliasesOfOneRecipient bool) ([]beads.Bead, error) {
+	return p.messageCandidatesAll(routes, aliasesOfOneRecipient)
 }
 
 // messageCandidatesAll returns all open message beads matching any route.
@@ -1233,7 +1238,7 @@ func (p *Provider) messageCandidatesForRoutes(routes []string) ([]beads.Bead, er
 // issue-tier and wisp-tier reads before deduping. Empty routes return all open
 // messages. Live reads are required so command-visible mail sees fresh wisps
 // even when the active store cache was primed earlier.
-func (p *Provider) messageCandidatesAll(routes []string) ([]beads.Bead, error) {
+func (p *Provider) messageCandidatesAll(routes []string, aliasesOfOneRecipient bool) ([]beads.Bead, error) {
 	query := beads.ListQuery{
 		Type:     messageBeadType,
 		Status:   "open",
@@ -1243,6 +1248,7 @@ func (p *Provider) messageCandidatesAll(routes []string) ([]beads.Bead, error) {
 	}
 	if len(routes) > 0 {
 		query.Assignees = routes
+		query.AssigneesAreAliases = aliasesOfOneRecipient
 	} else {
 		query.AllowScan = true
 	}

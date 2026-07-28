@@ -4422,6 +4422,96 @@ func TestBdStoreListBothTiersUnionsBdListAndEphemeralQuery(t *testing.T) {
 	}
 }
 
+// TestBdStoreListBothTiersAssigneeAliasesAppliesLimit pins ga-jcnrqn: a live
+// named persona session's recipientRoutes expansion is exactly this shape —
+// 3+ Assignees that are all stable-mailbox spellings of ONE session bead, not
+// a fan-out across distinct recipients. Before the fix, bdServerQueryForAssignees's
+// default (len>=2) case forced clientFilteredAssignees=true, which zeroed the
+// Limit on BOTH the bd-list and bd-query legs of a TierBoth read regardless of
+// what the caller asked for — an unbounded full scan on every named-persona
+// mail read under Dolt load. AssigneesAreAliases exempts exactly this case.
+func TestBdStoreListBothTiersAssigneeAliasesAppliesLimit(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		calls = append(calls, full)
+		if strings.HasPrefix(full, "bd query ") {
+			return []byte(`[
+				{"id":"bd-w","title":"wisp for persona","status":"open","issue_type":"message","assignee":"persona-marcus","created_at":"2026-05-02T00:00:00Z","ephemeral":true}
+			]`), nil
+		}
+		if !strings.HasPrefix(full, "bd list ") {
+			return nil, fmt.Errorf("unexpected: %s", full)
+		}
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{
+		Type:                "message",
+		Status:              "open",
+		TierMode:            beads.TierBoth,
+		Assignees:           []string{"persona-marcus", "sess-1", "qo-marcus-2"},
+		AssigneesAreAliases: true,
+		Limit:               500,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "bd-w" {
+		t.Fatalf("got = %+v, want the one matching wisp", got)
+	}
+	listCmd := firstCommandWithPrefix(calls, "bd list ")
+	queryCmd := firstCommandWithPrefix(calls, "bd query ")
+	if !strings.Contains(listCmd, "--limit 500") {
+		t.Fatalf("bd list command = %q, want --limit 500 for a single live session's own route aliases", listCmd)
+	}
+	if !strings.Contains(queryCmd, "--limit 500") {
+		t.Fatalf("bd query command = %q, want --limit 500, not an unbounded full scan", queryCmd)
+	}
+	if strings.Contains(queryCmd, "assignee=") {
+		t.Fatalf("bd query command = %q, must not push a single-value assignee clause for a 3-route query", queryCmd)
+	}
+}
+
+// TestBdStoreListBothTiersMultiRecipientWithoutAliasesFlagStaysUnbounded
+// guards the fix's scope: a genuine fan-out across DISTINCT recipients (no
+// AssigneesAreAliases) must keep the pre-existing unbounded-then-client-filter
+// behavior, since limiting ahead of that filter could starve one recipient's
+// results in favor of another's — unlike one recipient's own aliases, which
+// can only ever match the same entity.
+func TestBdStoreListBothTiersMultiRecipientWithoutAliasesFlagStaysUnbounded(t *testing.T) {
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		calls = append(calls, full)
+		if strings.HasPrefix(full, "bd query ") {
+			return []byte(`[]`), nil
+		}
+		if !strings.HasPrefix(full, "bd list ") {
+			return nil, fmt.Errorf("unexpected: %s", full)
+		}
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if _, err := s.List(beads.ListQuery{
+		Type:      "message",
+		Status:    "open",
+		TierMode:  beads.TierBoth,
+		Assignees: []string{"persona-a", "persona-b"},
+		Limit:     500,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	listCmd := firstCommandWithPrefix(calls, "bd list ")
+	queryCmd := firstCommandWithPrefix(calls, "bd query ")
+	if !strings.Contains(listCmd, "--limit 0") {
+		t.Fatalf("bd list command = %q, want unbounded --limit 0 for a genuine multi-recipient fan-out", listCmd)
+	}
+	if !strings.Contains(queryCmd, "--limit 0") {
+		t.Fatalf("bd query command = %q, want unbounded --limit 0 for a genuine multi-recipient fan-out", queryCmd)
+	}
+}
+
 func TestBdStoreListBothTiersAppliesCreatedBeforeBeforeMergedLimit(t *testing.T) {
 	before := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
 	var calls []string
