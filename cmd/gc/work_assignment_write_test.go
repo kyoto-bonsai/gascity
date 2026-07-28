@@ -77,6 +77,30 @@ func TestWorkAssignmentOpenAssignedToBasic_ByteIdenticalQuery(t *testing.T) {
 	}
 }
 
+// TestWorkAssignmentOpenAssignedToBasic_ExcludesMailMessageBeads is the
+// OpenAssignedToBasic sibling of TestWorkAssignmentOpenAssignedTo_ExcludesMailMessageBeads
+// (work_assignment_test.go) — this is the exact query releaseWorkFromClosedSessionBead
+// uses, the confirmed source of the ga-7p8d0b corruption.
+func TestWorkAssignmentOpenAssignedToBasic_ExcludesMailMessageBeads(t *testing.T) {
+	rec := newRecordingWriteWorkStore()
+	if _, err := rec.Create(beads.Bead{Title: "you have mail", Type: "message", Status: "open", Assignee: "agent-1"}); err != nil {
+		t.Fatalf("create mail bead: %v", err)
+	}
+	task, err := rec.Create(beads.Bead{Title: "do the thing", Type: "task", Status: "open", Assignee: "agent-1"})
+	if err != nil {
+		t.Fatalf("create task bead: %v", err)
+	}
+	wa := workAssignmentForStore(beads.WorkStore{Store: rec})
+
+	got, err := wa.OpenAssignedToBasic("agent-1", "open")
+	if err != nil {
+		t.Fatalf("OpenAssignedToBasic: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != task.ID {
+		t.Fatalf("OpenAssignedToBasic returned %#v, want only the task bead %q", got, task.ID)
+	}
+}
+
 // TestWorkAssignmentReleaseWorkBead_OpenStaysOpen asserts that releasing an
 // already-open bead emits Update{Assignee:"", Metadata:<clearedAffinity>} with
 // NO Status change (status reset is only for in_progress), byte-identical to the
@@ -105,6 +129,26 @@ func TestWorkAssignmentReleaseWorkBead_OpenStaysOpen(t *testing.T) {
 	wantMeta := clearedSessionAffinityMetadata()
 	if !reflect.DeepEqual(got.opts.Metadata, wantMeta) {
 		t.Fatalf("Metadata mismatch:\n got %#v\n want %#v", got.opts.Metadata, wantMeta)
+	}
+}
+
+// TestWorkAssignmentReleaseWorkBead_NoOpsOnMailMessageBead is the
+// defense-in-depth half of the ga-7p8d0b fix, on the actual mutating
+// primitive: even a mail message bead that somehow bypasses the query-level
+// filterOutMailMessageBeads guard (e.g. a future caller that sources item
+// from somewhere other than this façade's own query methods) must not be
+// released. This bug class has already recurred once in this codebase
+// (#4419, cmd_hook_claim.go's hookClaimCandidateIsMessage guard).
+func TestWorkAssignmentReleaseWorkBead_NoOpsOnMailMessageBead(t *testing.T) {
+	rec := newRecordingWriteWorkStore()
+	wa := workAssignmentForStore(beads.WorkStore{Store: rec})
+
+	mail := beads.Bead{ID: "m-1", Type: "message", Status: "open", Assignee: "persona-marcus-1"}
+	if err := wa.ReleaseWorkBead(mail, "persona-marcus"); err != nil {
+		t.Fatalf("ReleaseWorkBead: %v", err)
+	}
+	if len(rec.updates) != 0 {
+		t.Fatalf("expected no Update calls for a mail message bead, got %#v", rec.updates)
 	}
 }
 

@@ -7539,6 +7539,52 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadPreservesRunTargetRoute(t *testi
 	}
 }
 
+// ga-7p8d0b sibling coverage: unclaimWorkAssignedToRetiredSessionBead shares
+// releaseWorkFromClosedSessionBead's OpenAssignedTo/ReleaseWorkBead shape (same
+// missing type filter, retired- rather than closed-session trigger). See
+// TestReleaseWorkFromClosedSessionBeadNeverTouchesMailMessageBead for the
+// full incident writeup.
+func TestUnclaimWorkAssignedToRetiredSessionBeadNeverTouchesMailMessageBead(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "persona-marcus-1",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	mail, err := store.Create(beads.Bead{
+		Title:    "you have mail",
+		Type:     "message",
+		Status:   "open",
+		Assignee: "persona-marcus-1",
+	})
+	if err != nil {
+		t.Fatalf("create mail bead: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "fallback/worker", &stderr)
+
+	got, err := store.Get(mail.ID)
+	if err != nil {
+		t.Fatalf("get mail bead: %v", err)
+	}
+	if got.Assignee != "persona-marcus-1" {
+		t.Fatalf("assignee = %q, want unchanged persona-marcus-1 (mail must never be treated as stranded work)", got.Assignee)
+	}
+	if v, ok := got.Metadata["gc.run_target"]; ok {
+		t.Fatalf(`metadata["gc.run_target"] = %q, want absent — mail bead must not receive a fallback route`, v)
+	}
+}
+
 func TestUnclaimWorkAssignedToRetiredSessionBeadClearsSessionAffinity(t *testing.T) {
 	store := beads.NewMemStore()
 

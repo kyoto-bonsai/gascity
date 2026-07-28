@@ -202,3 +202,65 @@ func TestReleaseWorkFromClosedSessionBeadWithoutTemplateStillReleases(t *testing
 		t.Fatalf("gc.routed_to = %q, want empty (no template to recover a route from)", got.Metadata[beadmeta.RoutedToMetadataKey])
 	}
 }
+
+// ga-7p8d0b: mail addressed to a session-scoped identity (e.g.
+// "persona-marcus-1") sets that message bead's Assignee exactly the way a
+// real work bead's Assignee would look — the field mail's entire read path
+// (Inbox/Check/Count) keys on to mean "recipient". Before the
+// filterOutMailMessageBeads guard, releaseWorkFromClosedSessionBead's
+// OpenAssignedToBasic probe had no type filter, so when the addressed
+// session closed, it swept the mail in as if it were stranded work: cleared
+// Assignee (making the message invisible to Inbox/Check/Count), reset
+// session-affinity metadata, and — since the message bead carried neither
+// run_target nor routed_to — stamped the closing session's own template as a
+// fallback route, exactly the shape TestReleaseWorkFromClosedSessionBeadRestoresPoolRouteForUnroutedWork
+// above asserts for real orphaned work. A live occurrence corrupted two real
+// mail beads this way (ga-wisp-s53zts8, ga-wisp-p5twyxr on 2026-07-26,
+// confirmed via the raw city event log). This test reproduces the shape and
+// asserts the message bead now survives release completely untouched.
+func TestReleaseWorkFromClosedSessionBeadNeverTouchesMailMessageBead(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "persona-marcus-1",
+			"template":     "persona-marcus",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	mail, err := store.Create(beads.Bead{
+		Title:    "you have mail",
+		Type:     "message",
+		Status:   "open",
+		Assignee: "persona-marcus-1",
+	})
+	if err != nil {
+		t.Fatalf("create mail bead: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	releaseWorkFromClosedSessionBead(store, sessionBead, &stderr)
+
+	got, err := store.Get(mail.ID)
+	if err != nil {
+		t.Fatalf("get mail bead: %v", err)
+	}
+	if got.Assignee != "persona-marcus-1" {
+		t.Fatalf("assignee = %q, want unchanged persona-marcus-1 (mail must never be treated as stranded work)", got.Assignee)
+	}
+	if got.Status != "open" {
+		t.Fatalf("status = %q, want unchanged open", got.Status)
+	}
+	for _, key := range []string{beadmeta.RunTargetMetadataKey, beadmeta.RoutedToMetadataKey, beadmeta.SessionAffinityMetadataKey, beadmeta.ContinuationGroupMetadataKey} {
+		if v, ok := got.Metadata[key]; ok {
+			t.Fatalf("metadata[%q] = %q, want absent — mail bead must not receive dispatch-envelope metadata", key, v)
+		}
+	}
+}

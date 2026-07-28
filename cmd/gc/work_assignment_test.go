@@ -132,6 +132,56 @@ func TestWorkAssignmentCachedOpenAssignedWisps_UsesUnwrappedStore(t *testing.T) 
 	}
 }
 
+// TestWorkAssignmentOpenAssignedTo_ExcludesMailMessageBeads and its
+// CachedOpenAssignedWisps sibling below assert the ga-7p8d0b guard: a mail
+// message bead assigned to the queried identity must never appear in a
+// WORK-assignment query result. Every consumer of this façade
+// (ReleaseWorkBead, ReassignWorkBead, HasNonSessionWork) treats a returned
+// item as claimable/releasable/reassignable work — mail overloads the same
+// Assignee field for recipient addressing, so without this filter, a live
+// occurrence corrupted two real mail beads via releaseWorkFromClosedSessionBead
+// (see TestReleaseWorkFromClosedSessionBeadNeverTouchesMailMessageBead for the
+// full incident writeup).
+func TestWorkAssignmentOpenAssignedTo_ExcludesMailMessageBeads(t *testing.T) {
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{Title: "you have mail", Type: "message", Status: "open", Assignee: "agent-1"}); err != nil {
+		t.Fatalf("create mail bead: %v", err)
+	}
+	task, err := store.Create(beads.Bead{Title: "do the thing", Type: "task", Status: "open", Assignee: "agent-1"})
+	if err != nil {
+		t.Fatalf("create task bead: %v", err)
+	}
+	wa := workAssignmentForStore(beads.WorkStore{Store: store})
+
+	got, err := wa.OpenAssignedTo("agent-1", "open", beads.TierBoth, false)
+	if err != nil {
+		t.Fatalf("OpenAssignedTo: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != task.ID {
+		t.Fatalf("OpenAssignedTo returned %#v, want only the task bead %q", got, task.ID)
+	}
+}
+
+func TestWorkAssignmentCachedOpenAssignedWisps_ExcludesMailMessageBeads(t *testing.T) {
+	cache := &fakeCachingWorkStore{
+		MemStore: beads.NewMemStore(),
+		cachedHit: []beads.Bead{
+			{ID: "mail-1", Type: "message", Assignee: "agent-4"},
+			{ID: "w-1", Type: "task", Assignee: "agent-4"},
+		},
+		cachedOK: true,
+	}
+	wa := workAssignmentForStore(beads.WorkStore{Store: cache})
+
+	items, ok := wa.CachedOpenAssignedWisps("agent-4", "open")
+	if !ok {
+		t.Fatalf("expected cache hit, got ok=false")
+	}
+	if len(items) != 1 || items[0].ID != "w-1" {
+		t.Fatalf("CachedOpenAssignedWisps returned %#v, want only w-1", items)
+	}
+}
+
 // TestWorkAssignmentForStore_NilUnderlyingStoreSafe asserts the façade tolerates
 // a nil underlying store the same way the raw probes did (return empty, no
 // panic).

@@ -49,7 +49,8 @@ func (w workAssignment) unwrapped() beads.Store {
 // List{Assignee,Status,Live,TierMode} probe the reconciler ran directly.
 // status selects the bead status ("open" / "in_progress"); live mirrors the
 // raw ListQuery.Live flag. Session beads (and repairable session beads) are
-// filtered out, matching the raw probes.
+// filtered out, matching the raw probes. Mail message beads are filtered too
+// (ga-7p8d0b) — see filterOutMailMessageBeads.
 func (w workAssignment) OpenAssignedTo(assignee, status string, tierMode beads.TierMode, live bool) ([]beads.Bead, error) {
 	store := w.unwrapped()
 	if store == nil {
@@ -59,7 +60,37 @@ func (w workAssignment) OpenAssignedTo(assignee, status string, tierMode beads.T
 	if err != nil {
 		return nil, err
 	}
-	return items, nil
+	return filterOutMailMessageBeads(items), nil
+}
+
+// filterOutMailMessageBeads drops mail message beads (issue_type "message")
+// from a WORK-assignment query result in place, so every workAssignment query
+// method returns the same excluded set regardless of call site.
+//
+// Mail repurposes the generic Assignee field for recipient addressing: a
+// message sent to a session-scoped identity (e.g. "persona-marcus-1") sets
+// that bead's Assignee exactly the way a real work bead would. An
+// assignee-scoped query with no type filter cannot tell the two apart, so
+// without this guard, live unread mail flows into every consumer of this
+// façade — including ReleaseWorkBead and ReassignWorkBead, which then treat
+// someone's inbox as stranded/reassignable work: clearing Assignee (mail's
+// entire read path — Inbox/Check/Count — keys on it) and stamping dispatch
+// metadata mail never understands. Root-caused on ga-7p8d0b via
+// releaseWorkFromClosedSessionBead: mail addressed to a session instance that
+// later closes gets silently detached and re-routed as if it were the
+// session's leftover work. This is the session-assignment-reconciliation half
+// of the same bug class #4419 fixed at claim time via
+// hookClaimCandidateIsMessage (cmd_hook_claim.go) — reused here rather than
+// re-derived, so both halves share one definition of "is this bead mail."
+func filterOutMailMessageBeads(items []beads.Bead) []beads.Bead {
+	filtered := items[:0]
+	for _, item := range items {
+		if hookClaimCandidateIsMessage(item) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 // CachedOpenAssignedWisps returns cached open-assigned wisp-tier WORK beads when
@@ -79,7 +110,11 @@ func (w workAssignment) CachedOpenAssignedWisps(assignee, status string) ([]bead
 	if !ok {
 		return nil, false
 	}
-	return cache.CachedList(query)
+	items, ok := cache.CachedList(query)
+	if !ok {
+		return nil, false
+	}
+	return filterOutMailMessageBeads(items), true
 }
 
 // ReadyAssignedTo returns the ready (unblocked, actionable) WORK beads assigned
@@ -118,7 +153,11 @@ func (w workAssignment) OpenAssignedToBasic(assignee, status string) ([]beads.Be
 	if store == nil {
 		return nil, nil
 	}
-	return store.List(beads.ListQuery{Assignee: assignee, Status: status})
+	items, err := store.List(beads.ListQuery{Assignee: assignee, Status: status})
+	if err != nil {
+		return nil, err
+	}
+	return filterOutMailMessageBeads(items), nil
 }
 
 // ReleaseWorkBead detaches one WORK bead from its (closed/retired) session: it
@@ -131,9 +170,15 @@ func (w workAssignment) OpenAssignedToBasic(assignee, status string) ([]beads.Be
 // and unclaimWorkAssignedToRetiredSessionBead emitted (proven byte-identical by
 // the recording-fake write tests). Pass runTargetFallback="" for the close-
 // release path, which never stamps a fallback.
+//
+// No-ops on a mail message bead (ga-7p8d0b), belt-and-suspenders alongside the
+// query-level filterOutMailMessageBeads: every current caller already sources
+// item from a filtered query, but this is the actual mutating primitive, and
+// this bug class has already recurred once in this codebase (#4419) — a second
+// independent barrier here is cheap and directly proportionate to that history.
 func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string) error {
 	store := w.unwrapped()
-	if store == nil {
+	if store == nil || hookClaimCandidateIsMessage(item) {
 		return nil
 	}
 	empty := ""
