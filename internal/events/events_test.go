@@ -42,7 +42,7 @@ func TestFileRecorderWritesEvent(t *testing.T) {
 		t.Errorf("unexpected stderr: %q", stderr.String())
 	}
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestFileRecorderPayloadRoundTrip(t *testing.T) {
 		Payload: payload,
 	})
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestFileRecorderMonotonicSeq(t *testing.T) {
 		rec.Record(Event{Type: BeadCreated, Actor: "human"})
 	}
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestFileRecorderConcurrentSafe(t *testing.T) {
 	}
 	wg.Wait()
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestFileRecorderResumesSeq(t *testing.T) {
 	rec2.Record(Event{Type: BeadClosed, Actor: "human"})
 	rec2.Close() //nolint:errcheck // test cleanup
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestFileRecorderCoordinatesSeqAcrossStaleRecorders(t *testing.T) {
 	rec1.Record(Event{Type: BeadCreated, Actor: "rec1"})
 	rec2.Record(Event{Type: BeadUpdated, Actor: "rec2"})
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestFileRecorderFillsTimestamp(t *testing.T) {
 	rec.Record(Event{Type: BeadCreated, Actor: "human"})
 	after := time.Now()
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestFileRecorderPreservesTimestamp(t *testing.T) {
 	explicit := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
 	rec.Record(Event{Type: BeadCreated, Actor: "human", Ts: explicit})
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +365,7 @@ func TestFileRecorderNormalizesExplicitTsToLocalZone(t *testing.T) {
 		t.Fatalf("got %d lines, want 2:\n%s", len(lines), raw)
 	}
 
-	events, err := ReadAll(path)
+	events, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +442,7 @@ func TestFakeList(t *testing.T) {
 	f.Record(Event{Type: BeadClosed, Actor: "human", Subject: "gc-1"})
 	f.Record(Event{Type: SessionWoke, Actor: "gc", Subject: "session-alpha"})
 
-	all, err := f.List(Filter{})
+	all, err := f.List(context.Background(), Filter{})
 	if err != nil {
 		t.Fatalf("List(all): %v", err)
 	}
@@ -450,7 +450,7 @@ func TestFakeList(t *testing.T) {
 		t.Fatalf("List(all) = %d, want 3", len(all))
 	}
 
-	byType, err := f.List(Filter{Type: BeadCreated})
+	byType, err := f.List(context.Background(), Filter{Type: BeadCreated})
 	if err != nil {
 		t.Fatalf("List(type): %v", err)
 	}
@@ -467,7 +467,7 @@ func TestFakeListTailFiltersLimitModesAndErrors(t *testing.T) {
 	f.Record(Event{Type: BeadCreated, Actor: "gc", Subject: "wrong-actor"})
 	f.Record(Event{Type: BeadCreated, Actor: "human", Subject: "new"})
 
-	tail, err := f.ListTail(Filter{Type: BeadCreated, Actor: "human"}, 2)
+	tail, err := f.ListTail(context.Background(), Filter{Type: BeadCreated, Actor: "human"}, 2)
 	if err != nil {
 		t.Fatalf("ListTail(limit): %v", err)
 	}
@@ -478,7 +478,7 @@ func TestFakeListTailFiltersLimitModesAndErrors(t *testing.T) {
 		t.Fatalf("tail subjects = [%s %s], want [middle new]", tail[0].Subject, tail[1].Subject)
 	}
 
-	all, err := f.ListTail(Filter{Type: BeadCreated, Actor: "human"}, 0)
+	all, err := f.ListTail(context.Background(), Filter{Type: BeadCreated, Actor: "human"}, 0)
 	if err != nil {
 		t.Fatalf("ListTail(limit=0): %v", err)
 	}
@@ -486,7 +486,7 @@ func TestFakeListTailFiltersLimitModesAndErrors(t *testing.T) {
 		t.Fatalf("ListTail(limit=0) got %d events, want 3", len(all))
 	}
 
-	if _, err := NewFailFake().ListTail(Filter{}, 1); err == nil {
+	if _, err := NewFailFake().ListTail(context.Background(), Filter{}, 1); err == nil {
 		t.Fatal("ListTail on broken fake returned nil error")
 	}
 }
@@ -515,7 +515,7 @@ func TestFakeLatestSeq(t *testing.T) {
 func TestFailFakeErrors(t *testing.T) {
 	f := NewFailFake()
 
-	_, err := f.List(Filter{})
+	_, err := f.List(context.Background(), Filter{})
 	if err == nil {
 		t.Error("List: expected error, got nil")
 	}
@@ -538,7 +538,7 @@ func TestDiscardDoesNothing(_ *testing.T) {
 
 func TestReadAllEmpty(t *testing.T) {
 	// Missing file → nil, nil.
-	events, err := ReadAll("/nonexistent/path/events.jsonl")
+	events, err := ReadAll(context.Background(), "/nonexistent/path/events.jsonl")
 	if err != nil {
 		t.Fatalf("ReadAll(missing) error: %v", err)
 	}
@@ -552,7 +552,7 @@ func TestReadAllEmpty(t *testing.T) {
 	if err := writeEmpty(path); err != nil {
 		t.Fatal(err)
 	}
-	events, err = ReadAll(path)
+	events, err = ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatalf("ReadAll(empty) error: %v", err)
 	}
@@ -578,7 +578,7 @@ func TestReadFiltered(t *testing.T) {
 	rec.Close() //nolint:errcheck // test cleanup
 
 	t.Run("by_type", func(t *testing.T) {
-		got, err := ReadFiltered(path, Filter{Type: BeadCreated})
+		got, err := ReadFiltered(context.Background(), path, Filter{Type: BeadCreated})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -591,7 +591,7 @@ func TestReadFiltered(t *testing.T) {
 	})
 
 	t.Run("by_actor", func(t *testing.T) {
-		got, err := ReadFiltered(path, Filter{Actor: "gc"})
+		got, err := ReadFiltered(context.Background(), path, Filter{Actor: "gc"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -605,7 +605,7 @@ func TestReadFiltered(t *testing.T) {
 
 	t.Run("by_since", func(t *testing.T) {
 		since := now.Add(-1 * time.Hour)
-		got, err := ReadFiltered(path, Filter{Since: since})
+		got, err := ReadFiltered(context.Background(), path, Filter{Since: since})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -618,7 +618,7 @@ func TestReadFiltered(t *testing.T) {
 	})
 
 	t.Run("combined", func(t *testing.T) {
-		got, err := ReadFiltered(path, Filter{Type: BeadCreated, Actor: "human"})
+		got, err := ReadFiltered(context.Background(), path, Filter{Type: BeadCreated, Actor: "human"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -628,7 +628,7 @@ func TestReadFiltered(t *testing.T) {
 	})
 
 	t.Run("no_match", func(t *testing.T) {
-		got, err := ReadFiltered(path, Filter{Type: MailSent})
+		got, err := ReadFiltered(context.Background(), path, Filter{Type: MailSent})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -639,7 +639,7 @@ func TestReadFiltered(t *testing.T) {
 }
 
 func TestReadFilteredMissingFile(t *testing.T) {
-	got, err := ReadFiltered(filepath.Join(t.TempDir(), "missing.jsonl"), Filter{})
+	got, err := ReadFiltered(context.Background(), filepath.Join(t.TempDir(), "missing.jsonl"), Filter{})
 	if err != nil {
 		t.Fatalf("ReadFiltered(missing): %v", err)
 	}
@@ -660,7 +660,7 @@ func TestReadFilteredSkipsMalformedLines(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ReadFiltered(path, Filter{})
+	got, err := ReadFiltered(context.Background(), path, Filter{})
 	if err != nil {
 		t.Fatalf("ReadFiltered: %v", err)
 	}
@@ -681,7 +681,7 @@ func TestReadFilteredScannerError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ReadFiltered(path, Filter{})
+	got, err := ReadFiltered(context.Background(), path, Filter{})
 	if err == nil {
 		t.Fatal("ReadFiltered returned nil error, want scanner error")
 	}
@@ -705,7 +705,7 @@ func TestReadFilteredLimitStopsScanning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ReadFiltered(path, Filter{Limit: 1})
+	got, err := ReadFiltered(context.Background(), path, Filter{Limit: 1})
 	if err != nil {
 		t.Fatalf("ReadFiltered: %v", err)
 	}
@@ -730,7 +730,7 @@ func TestReadFilteredAfterSeq(t *testing.T) {
 	}
 	rec.Close() //nolint:errcheck // test cleanup
 
-	got, err := ReadFiltered(path, Filter{AfterSeq: 3})
+	got, err := ReadFiltered(context.Background(), path, Filter{AfterSeq: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -761,7 +761,7 @@ func TestReadFilteredAfterSeqCombined(t *testing.T) {
 	rec.Close()                                          //nolint:errcheck // test cleanup
 
 	// AfterSeq=2 AND Type=bead.created → only seq 3 and 5
-	got, err := ReadFiltered(path, Filter{AfterSeq: 2, Type: BeadCreated})
+	got, err := ReadFiltered(context.Background(), path, Filter{AfterSeq: 2, Type: BeadCreated})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -791,7 +791,7 @@ func TestReadFilteredTail(t *testing.T) {
 	rec.Record(Event{Type: BeadCreated, Actor: "human"}) // seq 5
 	rec.Close()                                          //nolint:errcheck // test cleanup
 
-	got, err := ReadFilteredTail(path, Filter{Type: BeadCreated}, 2)
+	got, err := ReadFilteredTail(context.Background(), path, Filter{Type: BeadCreated}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -837,7 +837,7 @@ func TestReadFilteredTailScansBackwardsAcrossChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ReadFilteredTail(path, Filter{
+	got, err := ReadFilteredTail(context.Background(), path, Filter{
 		AfterSeq: 1,
 		Type:     SessionWoke,
 		Actor:    "api",
@@ -889,7 +889,7 @@ func TestReadFilteredTailMaxScanBytesBoundsBackwardWalk(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bounded, err := ReadFilteredTail(path, Filter{Type: "target.type", MaxScanBytes: 64 * 1024}, 1)
+	bounded, err := ReadFilteredTail(context.Background(), path, Filter{Type: "target.type", MaxScanBytes: 64 * 1024}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +897,7 @@ func TestReadFilteredTailMaxScanBytesBoundsBackwardWalk(t *testing.T) {
 		t.Fatalf("bounded scan got %d events, want 0 (match sits outside the 64KB window)", len(bounded))
 	}
 
-	unbounded, err := ReadFilteredTail(path, Filter{Type: "target.type"}, 1)
+	unbounded, err := ReadFilteredTail(context.Background(), path, Filter{Type: "target.type"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -945,7 +945,7 @@ func TestReadFilteredTailMaxScanBytesNonAlignedLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bounded, err := ReadFilteredTail(path, Filter{Type: "target.type", MaxScanBytes: window}, 1)
+	bounded, err := ReadFilteredTail(context.Background(), path, Filter{Type: "target.type", MaxScanBytes: window}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -953,7 +953,7 @@ func TestReadFilteredTailMaxScanBytesNonAlignedLimit(t *testing.T) {
 		t.Fatalf("bounded scan got %d events, want 0 (match sits outside the %d-byte window; the chunk read must be clamped to it)", len(bounded), window)
 	}
 
-	unbounded, err := ReadFilteredTail(path, Filter{Type: "target.type"}, 1)
+	unbounded, err := ReadFilteredTail(context.Background(), path, Filter{Type: "target.type"}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -974,7 +974,7 @@ func TestReadFilteredTailLimitModesAndMissingFile(t *testing.T) {
 	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "closed"})
 	rec.Close() //nolint:errcheck // test cleanup
 
-	got, err := ReadFilteredTail(path, Filter{Actor: "human"}, 0)
+	got, err := ReadFilteredTail(context.Background(), path, Filter{Actor: "human"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -982,7 +982,7 @@ func TestReadFilteredTailLimitModesAndMissingFile(t *testing.T) {
 		t.Fatalf("limit=0 got %d events, want 2", len(got))
 	}
 
-	missing, err := ReadFilteredTail(filepath.Join(dir, "missing.jsonl"), Filter{}, 1)
+	missing, err := ReadFilteredTail(context.Background(), filepath.Join(dir, "missing.jsonl"), Filter{}, 1)
 	if err != nil {
 		t.Fatalf("missing file error: %v", err)
 	}
@@ -1180,7 +1180,7 @@ func TestFileRecorderList(t *testing.T) {
 	rec.Record(Event{Type: SessionWoke, Actor: "gc", Subject: "session-alpha"})
 
 	// List all
-	all, err := rec.List(Filter{})
+	all, err := rec.List(context.Background(), Filter{})
 	if err != nil {
 		t.Fatalf("List(all): %v", err)
 	}
@@ -1189,7 +1189,7 @@ func TestFileRecorderList(t *testing.T) {
 	}
 
 	// List filtered by type
-	created, err := rec.List(Filter{Type: BeadCreated})
+	created, err := rec.List(context.Background(), Filter{Type: BeadCreated})
 	if err != nil {
 		t.Fatalf("List(type): %v", err)
 	}
@@ -1215,7 +1215,7 @@ func TestFileRecorderListTail(t *testing.T) {
 	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "ignored"})
 	rec.Record(Event{Type: BeadCreated, Actor: "human", Subject: "new"})
 
-	got, err := rec.ListTail(Filter{Type: BeadCreated}, 1)
+	got, err := rec.ListTail(context.Background(), Filter{Type: BeadCreated}, 1)
 	if err != nil {
 		t.Fatalf("ListTail: %v", err)
 	}
@@ -1280,7 +1280,7 @@ func TestFileRecorderListTailFoldsInInFlightRotation(t *testing.T) {
 	// Active file has only the non-matching anchor -> 0 matches; archive has
 	// 1 (seq 1). ReadFilteredTail alone comes up short of limit=2, so this
 	// must check for and fold in the in-flight rotating file's match.
-	got, err := reader.ListTail(Filter{Type: ConvoyClosed}, 2)
+	got, err := reader.ListTail(context.Background(), Filter{Type: ConvoyClosed}, 2)
 	if err != nil {
 		t.Fatalf("ListTail: %v", err)
 	}
@@ -1316,7 +1316,7 @@ func TestFileRecorderListTailSkipsInFlightCheckWhenSatisfied(t *testing.T) {
 	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "active"})
 	defer rec.Close() //nolint:errcheck // test cleanup
 
-	got, err := rec.ListTail(Filter{Type: ConvoyClosed}, 1)
+	got, err := rec.ListTail(context.Background(), Filter{Type: ConvoyClosed}, 1)
 	if err != nil {
 		t.Fatalf("ListTail errored — it must not have opened the corrupted archive or checked in-flight rotation: %v", err)
 	}
@@ -1710,7 +1710,7 @@ func TestFileRecorderFlockSucceedsAfterShortContention(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Errorf("stderr = %q, want empty", stderr.String())
 	}
-	got, err := rec.List(Filter{})
+	got, err := rec.List(context.Background(), Filter{})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -245,7 +246,7 @@ func TestFormulaCookAttachEmitsTheWorkAssociation(t *testing.T) {
 
 	res := cookFormula(t, "graph-work", "--attach", source.ID)
 
-	recorded, err := events.ReadAll(filepath.Join(cityPath, ".gc", "events.jsonl"))
+	recorded, err := events.ReadAll(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read execution events: %v", err)
 	}

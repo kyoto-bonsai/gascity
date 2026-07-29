@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -265,11 +266,11 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 // readOrderOutcomeEvents returns order.completed and order.failed merged in Seq
 // order. events.Filter matches a single Type, hence two reads.
 func readOrderOutcomeEvents(eventPath string) ([]events.Event, error) {
-	completed, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderCompleted})
+	completed, err := events.ReadFiltered(context.Background(), eventPath, events.Filter{Type: events.OrderCompleted})
 	if err != nil {
 		return nil, err
 	}
-	failed, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderFailed})
+	failed, err := events.ReadFiltered(context.Background(), eventPath, events.Filter{Type: events.OrderFailed})
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +287,7 @@ func readOrderOutcomeEvents(eventPath string) ([]events.Event, error) {
 // check's latestControllerStartedAt returns only the newest, which is not enough
 // here — see nearControllerStart.
 func controllerStartTimes(eventPath string) ([]time.Time, error) {
-	startEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.ControllerStarted})
+	startEvents, err := events.ReadFiltered(context.Background(), eventPath, events.Filter{Type: events.ControllerStarted})
 	if err != nil {
 		return nil, err
 	}

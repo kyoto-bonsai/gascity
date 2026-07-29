@@ -1,6 +1,7 @@
 package executionevent
 
 import (
+	"context"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -21,9 +22,9 @@ type countingJournal struct {
 	latestSeqs int
 }
 
-func (j *countingJournal) List(filter events.Filter) ([]events.Event, error) {
+func (j *countingJournal) List(ctx context.Context, filter events.Filter) ([]events.Event, error) {
 	j.reads++
-	return j.Provider.List(filter)
+	return j.Provider.List(ctx, filter)
 }
 
 func (j *countingJournal) LatestSeq() (uint64, error) {

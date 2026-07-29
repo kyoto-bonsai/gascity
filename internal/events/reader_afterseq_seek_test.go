@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -119,7 +120,7 @@ func TestReadFilteredAfterSeqEquivalence(t *testing.T) {
 	const n = 300
 	path := writeSeqLog(t, n)
 
-	all, err := ReadFiltered(path, Filter{})
+	all, err := ReadFiltered(context.Background(), path, Filter{})
 	if err != nil {
 		t.Fatalf("ReadFiltered(all): %v", err)
 	}
@@ -129,7 +130,7 @@ func TestReadFilteredAfterSeqEquivalence(t *testing.T) {
 
 	for cursor := uint64(0); cursor <= n+1; cursor++ {
 		for _, typ := range []string{"", "a", "b"} {
-			got, err := ReadFiltered(path, Filter{AfterSeq: cursor, Type: typ})
+			got, err := ReadFiltered(context.Background(), path, Filter{AfterSeq: cursor, Type: typ})
 			if err != nil {
 				t.Fatalf("cursor=%d type=%q: %v", cursor, typ, err)
 			}
@@ -174,7 +175,7 @@ not json at all
 		3: {4},
 		4: nil,
 	} {
-		got, err := ReadFiltered(path, Filter{AfterSeq: cursor})
+		got, err := ReadFiltered(context.Background(), path, Filter{AfterSeq: cursor})
 		if err != nil {
 			t.Fatalf("cursor=%d: %v", cursor, err)
 		}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -266,7 +267,7 @@ func TestCompletionsStartupSweepRepairsCrashWindowGap(t *testing.T) {
 	if result.Emitted != 1 || !result.SweepComplete {
 		t.Fatalf("startup sweep = %+v, want one repaired fact and a complete traversal", result)
 	}
-	completed, err := ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
+	completed, err := ep.List(context.Background(), events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
 	if err != nil {
 		t.Fatal(err)
 	}

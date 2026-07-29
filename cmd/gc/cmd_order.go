@@ -1243,9 +1243,9 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 	if ep != nil {
 		filter := events.Filter{Type: events.OrderFired}
 		if tp, ok := ep.(events.TailProvider); ok {
-			firedEvents, _ = tp.ListTail(filter, orderCheckFiredEventTailLimit)
+			firedEvents, _ = tp.ListTail(context.Background(), filter, orderCheckFiredEventTailLimit)
 		} else {
-			firedEvents, _ = ep.List(filter)
+			firedEvents, _ = ep.List(context.Background(), filter)
 		}
 	}
 	latestFired := make(map[string]time.Time)

@@ -90,7 +90,7 @@ func TestList(t *testing.T) {
 	script := writeScript(t, dir, allOpsScript())
 	p := NewProvider(script, os.Stderr)
 
-	evts, err := p.List(events.Filter{})
+	evts, err := p.List(context.Background(), events.Filter{})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -116,7 +116,7 @@ esac
 `)
 	p := NewProvider(script, os.Stderr)
 
-	evts, err := p.List(events.Filter{})
+	evts, err := p.List(context.Background(), events.Filter{})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -140,7 +140,7 @@ esac
 `)
 	p := NewProvider(script, os.Stderr)
 
-	_, err := p.List(events.Filter{Type: events.BeadCreated, AfterSeq: 5})
+	_, err := p.List(context.Background(), events.Filter{Type: events.BeadCreated, AfterSeq: 5})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -176,7 +176,7 @@ esac
 	p := NewProvider(script, os.Stderr)
 	until := time.Date(2025, 6, 15, 10, 31, 0, 0, time.UTC)
 
-	evts, err := p.List(events.Filter{Subject: "gc-1", Until: until, Limit: 1})
+	evts, err := p.List(context.Background(), events.Filter{Subject: "gc-1", Until: until, Limit: 1})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -226,7 +226,7 @@ esac
 `)
 	p := NewProvider(script, os.Stderr)
 
-	evts, err := p.List(events.Filter{Subject: "gc-1", Limit: 1})
+	evts, err := p.List(context.Background(), events.Filter{Subject: "gc-1", Limit: 1})
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -251,7 +251,7 @@ esac
 `)
 	p := NewProvider(script, os.Stderr)
 
-	_, err := p.List(events.Filter{})
+	_, err := p.List(context.Background(), events.Filter{})
 	if err == nil {
 		t.Fatal("List returned nil error, want unmarshal error")
 	}
@@ -341,9 +341,9 @@ esac
 	p := NewProvider(script, os.Stderr)
 
 	// Multiple operations should only call ensure-running once.
-	p.List(events.Filter{}) //nolint:errcheck
-	p.LatestSeq()           //nolint:errcheck
-	p.List(events.Filter{}) //nolint:errcheck
+	p.List(context.Background(), events.Filter{}) //nolint:errcheck
+	p.LatestSeq()                                 //nolint:errcheck
+	p.List(context.Background(), events.Filter{}) //nolint:errcheck
 
 	data, _ := os.ReadFile(countFile)
 	count := strings.TrimSpace(string(data))
@@ -363,7 +363,7 @@ esac
 `)
 	p := NewProvider(script, os.Stderr)
 
-	evts, err := p.List(events.Filter{})
+	evts, err := p.List(context.Background(), events.Filter{})
 	if err != nil {
 		t.Fatalf("List after ensure-running exit 2: %v", err)
 	}
@@ -387,7 +387,7 @@ esac
 `)
 	p := NewProvider(script, os.Stderr)
 
-	_, err := p.List(events.Filter{})
+	_, err := p.List(context.Background(), events.Filter{})
 	if err == nil {
 		t.Fatal("expected error from exit 1, got nil")
 	}
@@ -412,7 +412,7 @@ esac
 	p.timeout = 500 * time.Millisecond
 
 	start := time.Now()
-	_, err := p.List(events.Filter{})
+	_, err := p.List(context.Background(), events.Filter{})
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}

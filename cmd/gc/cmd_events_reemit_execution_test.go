@@ -145,7 +145,7 @@ func TestEventsReemitExecutionApplyAppendsProjectedBatch(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("gc events reemit-execution --apply = %d; stderr=%s", code, stderr.String())
 	}
-	got, err := events.ReadAll(filepath.Join(cityPath, ".gc", "events.jsonl"))
+	got, err := events.ReadAll(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read emitted events: %v", err)
 	}

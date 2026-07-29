@@ -3,6 +3,7 @@
 package executionevent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1190,9 +1191,9 @@ func applyConvergenceStamp(graphStore beads.GraphStore, root beads.Bead, rowCoun
 // recovery fact; otherwise an event rotation can create a duplicate fact.
 func completedFacts(recorder events.Provider, filter events.Filter) ([]events.Event, error) {
 	if inFlight, ok := recorder.(events.InFlightProvider); ok {
-		return inFlight.ListInFlight(filter)
+		return inFlight.ListInFlight(context.Background(), filter)
 	}
-	return recorder.List(filter)
+	return recorder.List(context.Background(), filter)
 }
 
 type completedFactKey struct {

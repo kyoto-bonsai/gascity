@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1173,7 +1174,7 @@ title = "Do work for {{convoy_id}}"
 			t.Fatalf("source deps = %+v, want blocks dep to graph root %s", deps, root.ID)
 		}
 	}
-	recorded, err := events.ReadAll(filepath.Join(cityDir, ".gc", "events.jsonl"))
+	recorded, err := events.ReadAll(context.Background(), filepath.Join(cityDir, ".gc", "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read execution events: %v", err)
 	}
@@ -1274,7 +1275,7 @@ title = "Do work"
 	if got := root.Metadata[beadmeta.ScopeKindMetadataKey]; got != "formula-cook" {
 		t.Fatalf("root %s: gc.scope_kind = %q, want %q", res.RootID, got, "formula-cook")
 	}
-	recorded, err := events.ReadAll(filepath.Join(cityDir, ".gc", "events.jsonl"))
+	recorded, err := events.ReadAll(context.Background(), filepath.Join(cityDir, ".gc", "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read execution events: %v", err)
 	}

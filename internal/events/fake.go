@@ -62,7 +62,10 @@ func (f *Fake) RecordAck(e Event) error {
 }
 
 // List returns events matching the filter from the in-memory store.
-func (f *Fake) List(filter Filter) ([]Event, error) {
+func (f *Fake) List(ctx context.Context, filter Filter) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.broken {
@@ -72,7 +75,10 @@ func (f *Fake) List(filter Filter) ([]Event, error) {
 }
 
 // ListTail returns the trailing matching events from the in-memory store.
-func (f *Fake) ListTail(filter Filter, limit int) ([]Event, error) {
+func (f *Fake) ListTail(ctx context.Context, filter Filter, limit int) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.broken {

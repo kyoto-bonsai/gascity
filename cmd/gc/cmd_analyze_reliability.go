@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -102,7 +103,7 @@ func runAnalyzeReliability(opts reliabilityCmdOptions, stdout, _ io.Writer) erro
 		}
 	}
 
-	all, err := events.ReadAll(eventsPath)
+	all, err := events.ReadAll(context.Background(), eventsPath)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", eventsPath, err)
 	}

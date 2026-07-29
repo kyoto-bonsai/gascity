@@ -1,6 +1,7 @@
 package executionevent
 
 import (
+	"context"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -16,9 +17,9 @@ type filterRecordingJournal struct {
 	filters []events.Filter
 }
 
-func (j *filterRecordingJournal) List(filter events.Filter) ([]events.Event, error) {
+func (j *filterRecordingJournal) List(ctx context.Context, filter events.Filter) ([]events.Event, error) {
 	j.filters = append(j.filters, filter)
-	return j.Provider.List(filter)
+	return j.Provider.List(ctx, filter)
 }
 
 // TestCompletedFactIndexRewarmReadsOnlyTheJournalTail pins the cost shape of a

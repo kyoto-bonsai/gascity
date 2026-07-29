@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,7 +31,7 @@ func TestStreamArchiveHonorsAfterSeq(t *testing.T) {
 	}
 
 	var seen []uint64
-	if err := streamArchive(archive, Filter{AfterSeq: 3}, func(e Event) bool {
+	if err := streamArchive(context.Background(), archive, Filter{AfterSeq: 3}, func(e Event) bool {
 		seen = append(seen, e.Seq)
 		return true
 	}); err != nil {
@@ -55,7 +56,7 @@ func TestStreamArchiveSkipsAtBeforeSeq(t *testing.T) {
 	}
 
 	var seen []uint64
-	if err := streamArchive(archive, Filter{BeforeSeq: 3}, func(e Event) bool {
+	if err := streamArchive(context.Background(), archive, Filter{BeforeSeq: 3}, func(e Event) bool {
 		seen = append(seen, e.Seq)
 		return true
 	}); err != nil {
@@ -83,7 +84,7 @@ func TestStreamArchiveZeroFilterDeliversAll(t *testing.T) {
 	}
 
 	var seen []uint64
-	if err := streamArchive(archive, Filter{}, func(e Event) bool {
+	if err := streamArchive(context.Background(), archive, Filter{}, func(e Event) bool {
 		seen = append(seen, e.Seq)
 		return true
 	}); err != nil {
@@ -112,7 +113,7 @@ func TestStreamArchiveFallsBackWhenSeqNotFirst(t *testing.T) {
 	}
 
 	var seen []uint64
-	if err := streamArchive(archive, Filter{AfterSeq: 3}, func(e Event) bool {
+	if err := streamArchive(context.Background(), archive, Filter{AfterSeq: 3}, func(e Event) bool {
 		seen = append(seen, e.Seq)
 		return true
 	}); err != nil {

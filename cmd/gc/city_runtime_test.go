@@ -1684,7 +1684,7 @@ func TestCityRuntimeSweepReconcilesGraphStepClosedWithNoEvent(t *testing.T) {
 	}
 	completedFacts := func() []events.Event {
 		t.Helper()
-		got, listErr := ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
+		got, listErr := ep.List(context.Background(), events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
 		if listErr != nil {
 			t.Fatal(listErr)
 		}

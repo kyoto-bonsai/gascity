@@ -2769,7 +2769,7 @@ title = "Review {reviewer}"
 	if after.Metadata[beadmeta.FanoutStateMetadataKey] != beadmeta.SpawnStateSpawned {
 		t.Fatalf("fanout state = %q, want spawned", after.Metadata[beadmeta.FanoutStateMetadataKey])
 	}
-	recorded, err := events.ReadAll(filepath.Join(cityPath, ".gc", "events.jsonl"))
+	recorded, err := events.ReadAll(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read execution events: %v", err)
 	}
@@ -5704,7 +5704,7 @@ dir = "backend"
 	if err == nil {
 		t.Fatal("runWorkflowServe returned nil error, want query failure")
 	}
-	evts, readErr := events.ReadFiltered(filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
+	evts, readErr := events.ReadFiltered(context.Background(), filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
 	if readErr != nil {
 		t.Fatalf("read work-query failure events: %v", readErr)
 	}

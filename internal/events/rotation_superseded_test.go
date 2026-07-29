@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -72,7 +73,7 @@ func TestReadRotationSourcesSkipsRotatingTwinOfListedArchive(t *testing.T) {
 	}
 
 	listed := map[eventSeqWindow]struct{}{{first: 1, last: 2}: {}}
-	events, err := readRotationSources(active, Filter{}, listed)
+	events, err := readRotationSources(context.Background(), active, Filter{}, listed)
 	if err != nil {
 		t.Fatalf("readRotationSources opened the twin of an already-read archive: %v", err)
 	}

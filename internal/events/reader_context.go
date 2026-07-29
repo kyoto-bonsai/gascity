@@ -46,7 +46,7 @@ func readFilteredTrackedContext(ctx context.Context, path string, filter Filter)
 			continue
 		}
 		archivePath := filepath.Join(dir, info.Basename)
-		err := streamArchive(archivePath, filter, func(e Event) bool {
+		err := streamArchive(ctx, archivePath, filter, func(e Event) bool {
 			if !matchesFilter(e, filter) {
 				return true
 			}
@@ -99,7 +99,7 @@ func readFilteredTrackedContext(ctx context.Context, path string, filter Filter)
 // ReadFilteredContext does for ReadFiltered.
 func ReadFilteredWithInFlightContext(ctx context.Context, path string, filter Filter) ([]Event, error) {
 	base, listedArchives, baseErr := readFilteredTrackedContext(ctx, path, filter)
-	rotated, rotationErr := readRotationSources(path, filter, listedArchives)
+	rotated, rotationErr := readRotationSources(ctx, path, filter, listedArchives)
 	if len(rotated) == 0 {
 		if baseErr == nil {
 			return base, rotationErr

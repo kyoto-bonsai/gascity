@@ -671,7 +671,7 @@ func readLocalCityEvents(scope eventsAPIScope, apiErr error, typeFilter, sinceFl
 	// archive the tail read cannot see — and the window never invents events
 	// that are not in it.
 	if filter.Since.IsZero() {
-		all, err := events.ReadFilteredTail(path, filter, int(cityEventsPageLimit))
+		all, err := events.ReadFilteredTail(context.Background(), path, filter, int(cityEventsPageLimit))
 		if err != nil {
 			return nil, true, fmt.Errorf("reading local city events: %w", err)
 		}
@@ -681,7 +681,7 @@ func readLocalCityEvents(scope eventsAPIScope, apiErr error, typeFilter, sinceFl
 		return localWireEvents(all, warningWriter), true, nil
 	}
 
-	all, err := events.ReadFiltered(path, filter)
+	all, err := events.ReadFiltered(context.Background(), path, filter)
 	if err != nil {
 		return nil, true, fmt.Errorf("reading local city events: %w", err)
 	}
@@ -705,7 +705,7 @@ func localCityEventsHaveOlderMatches(path string, filter events.Filter, window [
 	if len(window) > 0 {
 		probe.BeforeSeq = window[0].Seq
 	}
-	older, err := events.ReadFiltered(path, probe)
+	older, err := events.ReadFiltered(context.Background(), path, probe)
 	if err != nil {
 		return int64(len(window)) >= cityEventsPageLimit
 	}

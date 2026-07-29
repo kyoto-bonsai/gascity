@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,7 +55,7 @@ func TestRecordAutoRotatesOnSizeThreshold(t *testing.T) {
 			200, dir)
 	}
 
-	all, err := ReadAll(path)
+	all, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +188,7 @@ func TestNewFileRecorderReapsOrphansOnOpen(t *testing.T) {
 	}
 
 	// The reaped archive should be visible to ReadAll.
-	all, err := ReadAll(path)
+	all, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +231,7 @@ func TestNewFileRecorderSeedsSeqFromArchives(t *testing.T) {
 
 	rec.Record(Event{Type: BeadCreated, Actor: "human", Subject: "post-recovery"})
 
-	all, err := ReadAll(path)
+	all, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}

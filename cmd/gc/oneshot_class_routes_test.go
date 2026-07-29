@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -458,7 +459,7 @@ func TestFormulaCookGraphV2StaysOnTheOneStoreOnSingleStoreCity(t *testing.T) {
 	if got := root.Metadata[beadmeta.RootStoreRefMetadataKey]; got != "city:cook-city" {
 		t.Errorf("cooked root %s: gc.root_store_ref = %q, want %q", res.RootID, got, "city:cook-city")
 	}
-	recorded, err := events.ReadAll(filepath.Join(cityDir, ".gc", "events.jsonl"))
+	recorded, err := events.ReadAll(context.Background(), filepath.Join(cityDir, ".gc", "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read execution events: %v", err)
 	}
@@ -822,7 +823,7 @@ func TestEmitFormulaCookExecutionFactsReadsTheConvoyFromTheWorkLeg(t *testing.T)
 	var stderr bytes.Buffer
 	emitFormulaCookExecutionFacts(graph, work, cityPath, &molecule.Result{RootID: root.ID, GraphWorkflow: true}, &stderr)
 
-	recorded, err := events.ReadAll(filepath.Join(cityPath, ".gc", "events.jsonl"))
+	recorded, err := events.ReadAll(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"))
 	if err != nil {
 		t.Fatalf("read execution events: %v", err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -122,7 +123,7 @@ func (f deadlockedFinalizeFixture) dispatchOnce(t *testing.T, store beads.Store,
 func (f deadlockedFinalizeFixture) recordedEvents(t *testing.T) []events.Event {
 	t.Helper()
 	path := filepath.Join(f.cityPath, ".gc", "events.jsonl")
-	recorded, err := events.ReadAll(path)
+	recorded, err := events.ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}

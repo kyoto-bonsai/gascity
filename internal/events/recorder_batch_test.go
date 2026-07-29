@@ -2,6 +2,7 @@ package events
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -29,7 +30,7 @@ func TestFileRecorderAppendBatchWritesContiguousEvents(t *testing.T) {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 
-	got, err := ReadAll(path)
+	got, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +60,7 @@ func TestFileRecorderAppendBatchMarshalsEverythingBeforeWriting(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "marshal") {
 		t.Fatalf("AppendBatch error = %v, want marshal error", err)
 	}
-	got, readErr := ReadAll(path)
+	got, readErr := ReadAll(context.Background(), path)
 	if readErr != nil {
 		t.Fatal(readErr)
 	}

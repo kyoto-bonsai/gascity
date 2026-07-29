@@ -68,7 +68,7 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 	// page) the boundary, ascending; the extra row is the has-more signal.
 	scanFilter := filter
 	scanFilter.BeforeSeq = beforeSeq
-	evts, scanned, err := fetchEventPageAscending(ep, scanFilter, limit)
+	evts, scanned, err := fetchEventPageAscending(ctx, ep, scanFilter, limit)
 	if err != nil {
 		return nil, apierr.Internal.Msg(err.Error())
 	}
@@ -171,10 +171,10 @@ func parseEventBeforeSeq(cursor string) (uint64, error) {
 // archives ListTail just walked — the original bug: a sparse or wholly absent
 // event type (zero historical occurrences is the worst case) always fell
 // through to an unconditional, unbounded scan of the entire retained log here.
-func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int) ([]events.Event, int, error) {
+func fetchEventPageAscending(ctx context.Context, ep events.Provider, filter events.Filter, limit int) ([]events.Event, int, error) {
 	fetch := limit + 1
 	if tp, ok := ep.(events.TailProvider); ok {
-		tail, err := tp.ListTail(filter, fetch)
+		tail, err := tp.ListTail(ctx, filter, fetch)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -185,7 +185,7 @@ func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int
 			return tail, len(tail), nil
 		}
 	}
-	all, err := listWithInFlight(ep, filter)
+	all, err := listWithInFlight(ctx, ep, filter)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -203,11 +203,11 @@ func fetchEventPageAscending(ep events.Provider, filter events.Filter, limit int
 // segment; the in-flight-aware read closes that gap so a descending keyset walk
 // cannot skip a whole seq range. Providers with no in-flight window fall back to
 // List unchanged.
-func listWithInFlight(ep events.Provider, filter events.Filter) ([]events.Event, error) {
+func listWithInFlight(ctx context.Context, ep events.Provider, filter events.Filter) ([]events.Event, error) {
 	if ip, ok := ep.(events.InFlightProvider); ok {
-		return ip.ListInFlight(filter)
+		return ip.ListInFlight(ctx, filter)
 	}
-	return ep.List(filter)
+	return ep.List(ctx, filter)
 }
 
 func filterIsEmpty(f events.Filter) bool {

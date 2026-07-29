@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -88,7 +89,7 @@ func readCityJournal(t *testing.T, cityPath string) []events.Event {
 		t.Fatalf("opening the city journal: %v", err)
 	}
 	defer rec.Close() //nolint:errcheck // read-only in a test
-	all, err := rec.List(events.Filter{})
+	all, err := rec.List(context.Background(), events.Filter{})
 	if err != nil {
 		t.Fatalf("reading the city journal: %v", err)
 	}
@@ -443,7 +444,7 @@ func TestClassStoreEmissionIsVisibleToACursorConsumer(t *testing.T) {
 		t.Fatalf("closing %s through the class front door: %v", bead.ID, err)
 	}
 
-	delta, err := consumer.List(events.Filter{AfterSeq: cursor})
+	delta, err := consumer.List(context.Background(), events.Filter{AfterSeq: cursor})
 	if err != nil {
 		t.Fatalf("reading the delta: %v", err)
 	}

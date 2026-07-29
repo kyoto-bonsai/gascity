@@ -2105,9 +2105,9 @@ type listCountingEventProvider struct {
 	lists atomic.Int64
 }
 
-func (p *listCountingEventProvider) List(filter events.Filter) ([]events.Event, error) {
+func (p *listCountingEventProvider) List(ctx context.Context, filter events.Filter) ([]events.Event, error) {
 	p.lists.Add(1)
-	return p.Fake.List(filter)
+	return p.Fake.List(ctx, filter)
 }
 
 // TestControllerStateBeadEventWatcherLeavesCompletionRepairToStartupSweep pins
@@ -2171,7 +2171,7 @@ func TestControllerStateBeadEventWatcherLeavesCompletionRepairToStartupSweep(t *
 	if reads := ep.lists.Load() - baseline; reads != 0 {
 		t.Fatalf("startBeadEventWatcher performed %d full-history journal read(s), want 0: the boot path must not run a whole-corpus completions reconcile", reads)
 	}
-	got, listErr := ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
+	got, listErr := ep.List(context.Background(), events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
 	if listErr != nil {
 		t.Fatal(listErr)
 	}
@@ -2208,7 +2208,7 @@ func TestControllerStateReconcileExecutionCompletionsScansConfiguredRigStores(t 
 	}
 	cs.reconcileExecutionCompletions()
 
-	completed, err := ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
+	completed, err := ep.List(context.Background(), events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2220,7 +2220,7 @@ func TestControllerStateReconcileExecutionCompletionsScansConfiguredRigStores(t 
 	}
 
 	cs.reconcileExecutionCompletions()
-	completed, err = ep.List(events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
+	completed, err = ep.List(context.Background(), events.Filter{Type: events.ExecutionStepCompleted, Subject: step.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3649,7 +3649,7 @@ func TestControllerStateCitySuspensionRecordsEvents(t *testing.T) {
 				t.Fatalf("runtime state ExplicitCity = (%v, %v), want (%v, true)", v, ok, tc.wantSuspended)
 			}
 
-			gotEvents, err := ep.List(events.Filter{})
+			gotEvents, err := ep.List(context.Background(), events.Filter{})
 			if err != nil {
 				t.Fatalf("list events: %v", err)
 			}

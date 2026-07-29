@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,7 +26,7 @@ type eventReadCall struct {
 func spyEventReader(calls *[]eventReadCall) orderFiringEventReadFunc {
 	return func(path string, filter events.Filter, limit int) ([]events.Event, error) {
 		*calls = append(*calls, eventReadCall{filter: filter, limit: limit})
-		return events.ReadFilteredTail(path, filter, limit)
+		return events.ReadFilteredTail(context.Background(), path, filter, limit)
 	}
 }
 
@@ -156,7 +157,7 @@ func TestOrderFiringCurrent_FiringOlderThanTailFallsBackToLastRun(t *testing.T) 
 		if filter.Type == events.OrderFired {
 			return nil, nil
 		}
-		return events.ReadFilteredTail(path, filter, limit)
+		return events.ReadFilteredTail(context.Background(), path, filter, limit)
 	}
 	check.lastRun = func(orders.Order) (time.Time, error) {
 		lastRunCalled = true
@@ -369,7 +370,7 @@ func TestOrderFiringCurrent_ReadsCityEventLogPath(t *testing.T) {
 	check.clock = func() time.Time { return now }
 	check.readEvents = func(path string, filter events.Filter, limit int) ([]events.Event, error) {
 		paths = append(paths, path)
-		return events.ReadFilteredTail(path, filter, limit)
+		return events.ReadFilteredTail(context.Background(), path, filter, limit)
 	}
 	check.Run(&CheckContext{CityPath: cityPath})
 

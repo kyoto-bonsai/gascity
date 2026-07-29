@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -135,11 +136,13 @@ type OrderFiringCurrentCheck struct {
 // NewOrderFiringCurrentCheck creates a check for cron and cooldown order freshness.
 func NewOrderFiringCurrentCheck(cfg *config.City, cityPath string, opts ...OrderFiringCurrentOption) *OrderFiringCurrentCheck {
 	check := &OrderFiringCurrentCheck{
-		cfg:             cfg,
-		cityPath:        cityPath,
-		clock:           time.Now,
-		historyTimeout:  orderFiringHistoryTimeout,
-		readEvents:      events.ReadFilteredTail,
+		cfg:            cfg,
+		cityPath:       cityPath,
+		clock:          time.Now,
+		historyTimeout: orderFiringHistoryTimeout,
+		readEvents: func(path string, filter events.Filter, limit int) ([]events.Event, error) {
+			return events.ReadFilteredTail(context.Background(), path, filter, limit)
+		},
 		lastRunTimeout:  orderFiringLastRunTimeout,
 		deadlineReserve: orderFiringDeadlineReserve,
 	}
@@ -716,7 +719,9 @@ func cronRangeForDoctor(rangePart string, lowerBound, upperBound int) (int, int,
 func (c *OrderFiringCurrentCheck) readEventTail(path string, filter events.Filter, limit int) ([]events.Event, error) {
 	read := c.readEvents
 	if read == nil {
-		read = events.ReadFilteredTail
+		read = func(path string, filter events.Filter, limit int) ([]events.Event, error) {
+			return events.ReadFilteredTail(context.Background(), path, filter, limit)
+		}
 	}
 	return read(path, filter, limit)
 }

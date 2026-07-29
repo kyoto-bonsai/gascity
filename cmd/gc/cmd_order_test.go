@@ -852,15 +852,15 @@ type countingTailEventProvider struct {
 	tailLimit int
 }
 
-func (p *countingTailEventProvider) List(filter events.Filter) ([]events.Event, error) {
+func (p *countingTailEventProvider) List(ctx context.Context, filter events.Filter) ([]events.Event, error) {
 	p.listCalls++
-	return p.Fake.List(filter)
+	return p.Fake.List(ctx, filter)
 }
 
-func (p *countingTailEventProvider) ListTail(filter events.Filter, limit int) ([]events.Event, error) {
+func (p *countingTailEventProvider) ListTail(ctx context.Context, filter events.Filter, limit int) ([]events.Event, error) {
 	p.tailCalls++
 	p.tailLimit = limit
-	return p.Fake.ListTail(filter, limit)
+	return p.Fake.ListTail(ctx, filter, limit)
 }
 
 // TestOrderCheckWithStoresResolverUsesBoundedEventTail confirms that gc order

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"testing"
 	"time"
@@ -197,13 +198,13 @@ type journalReadCounter struct {
 	latestSeqs int
 }
 
-func (p *journalReadCounter) List(filter events.Filter) ([]events.Event, error) {
+func (p *journalReadCounter) List(ctx context.Context, filter events.Filter) ([]events.Event, error) {
 	if filter.AfterSeq == 0 {
 		p.fullReads++
 	} else {
 		p.tailReads++
 	}
-	return p.Provider.List(filter)
+	return p.Provider.List(ctx, filter)
 }
 
 func (p *journalReadCounter) LatestSeq() (uint64, error) {

@@ -3,6 +3,7 @@ package storehealth
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -272,14 +273,14 @@ type recordingProvider struct {
 	listTailCalls int
 }
 
-func (r *recordingProvider) List(filter events.Filter) ([]events.Event, error) {
+func (r *recordingProvider) List(ctx context.Context, filter events.Filter) ([]events.Event, error) {
 	r.listCalls++
-	return r.Fake.List(filter)
+	return r.Fake.List(ctx, filter)
 }
 
-func (r *recordingProvider) ListTail(filter events.Filter, limit int) ([]events.Event, error) {
+func (r *recordingProvider) ListTail(ctx context.Context, filter events.Filter, limit int) ([]events.Event, error) {
 	r.listTailCalls++
-	return r.Fake.ListTail(filter, limit)
+	return r.Fake.ListTail(ctx, filter, limit)
 }
 
 // providerWithoutTail implements events.Provider but deliberately omits
@@ -289,8 +290,8 @@ type providerWithoutTail struct {
 	*events.Fake
 }
 
-func (p *providerWithoutTail) List(filter events.Filter) ([]events.Event, error) {
-	return p.Fake.List(filter)
+func (p *providerWithoutTail) List(ctx context.Context, filter events.Filter) ([]events.Event, error) {
+	return p.Fake.List(ctx, filter)
 }
 
 // TestLastMaintenanceUsesTailProviderFastPath is the regression for #4418:
@@ -398,7 +399,7 @@ func TestLastMaintenanceDoesNotReadRotatedArchives(t *testing.T) {
 
 	// Control: the archive-aware List path DOES see it, so an empty result
 	// below is archive-blindness and not a broken fixture.
-	viaList, err := rec.List(events.Filter{Type: events.StoreMaintenanceDone})
+	viaList, err := rec.List(context.Background(), events.Filter{Type: events.StoreMaintenanceDone})
 	if err != nil {
 		t.Fatal(err)
 	}

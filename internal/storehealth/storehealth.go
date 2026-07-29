@@ -9,6 +9,7 @@
 package storehealth
 
 import (
+	"context"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -180,9 +181,9 @@ func LastMaintenance(ep events.Provider) (time.Time, string) {
 			err  error
 		)
 		if hasTail {
-			evts, err = tp.ListTail(events.Filter{Type: spec.typ, MaxScanBytes: lastMaintenanceScanWindowBytes}, 1)
+			evts, err = tp.ListTail(context.Background(), events.Filter{Type: spec.typ, MaxScanBytes: lastMaintenanceScanWindowBytes}, 1)
 		} else {
-			evts, err = ep.List(events.Filter{Type: spec.typ})
+			evts, err = ep.List(context.Background(), events.Filter{Type: spec.typ})
 		}
 		if err != nil {
 			continue

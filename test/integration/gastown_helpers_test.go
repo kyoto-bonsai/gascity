@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -376,7 +377,7 @@ func verifyEvents(t *testing.T, cityDir, eventType string) {
 // assertions after the city controller has stopped and the live API is gone.
 func verifyEventLog(t *testing.T, cityDir, eventType string) {
 	t.Helper()
-	items, err := gcevents.ReadFiltered(filepath.Join(cityDir, ".gc", "events.jsonl"), gcevents.Filter{Type: eventType})
+	items, err := gcevents.ReadFiltered(context.Background(), filepath.Join(cityDir, ".gc", "events.jsonl"), gcevents.Filter{Type: eventType})
 	if err != nil {
 		t.Fatalf("read event log for %s: %v", eventType, err)
 	}
