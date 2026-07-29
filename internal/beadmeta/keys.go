@@ -41,6 +41,7 @@ const Namespace = "gc."
 const (
 	AttemptLogMetadataKey     = "gc.attempt_log"
 	AttemptMetadataKey        = "gc.attempt"
+	AwaitingMetadataKey       = "gc.awaiting"
 	BondMetadataKey           = "gc.bond"
 	BondVarsMetadataKey       = "gc.bond_vars"
 	BoundStepIDMetadataKey    = "gc.bound_step_id"
@@ -436,6 +437,7 @@ const OptionMetadataPrefix = "opt_"
 var KnownMetadataKeys = []string{
 	AttemptLogMetadataKey,
 	AttemptMetadataKey,
+	AwaitingMetadataKey,
 	BondMetadataKey,
 	BondVarsMetadataKey,
 	BoundStepIDMetadataKey,
