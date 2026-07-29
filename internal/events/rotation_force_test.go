@@ -188,7 +188,7 @@ func TestForceRotateConcurrentWithRecord(t *testing.T) {
 		t.Fatal("no rotations occurred during concurrency test")
 	}
 
-	all, err := ReadAll(path)
+	all, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}

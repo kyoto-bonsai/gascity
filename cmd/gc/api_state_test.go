@@ -3467,7 +3467,7 @@ func TestControllerStateCitySuspensionRecordsEvents(t *testing.T) {
 				t.Fatalf("runtime state ExplicitCity = (%v, %v), want (%v, true)", v, ok, tc.wantSuspended)
 			}
 
-			gotEvents, err := ep.List(events.Filter{})
+			gotEvents, err := ep.List(context.Background(), events.Filter{})
 			if err != nil {
 				t.Fatalf("list events: %v", err)
 			}

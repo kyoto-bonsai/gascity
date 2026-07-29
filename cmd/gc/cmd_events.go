@@ -643,7 +643,7 @@ func readLocalCityEvents(scope eventsAPIScope, apiErr error, typeFilter, sinceFl
 	} else if !cutoff.IsZero() {
 		filter.Since = cutoff
 	}
-	all, err := events.ReadFiltered(filepath.Join(scope.cityPath, ".gc", "events.jsonl"), filter)
+	all, err := events.ReadFiltered(context.Background(), filepath.Join(scope.cityPath, ".gc", "events.jsonl"), filter)
 	if err != nil {
 		return nil, true, fmt.Errorf("reading local city events: %w", err)
 	}

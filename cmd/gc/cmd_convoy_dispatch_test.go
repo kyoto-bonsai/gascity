@@ -4993,7 +4993,7 @@ dir = "backend"
 	if err == nil {
 		t.Fatal("runWorkflowServe returned nil error, want query failure")
 	}
-	evts, readErr := events.ReadFiltered(filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
+	evts, readErr := events.ReadFiltered(context.Background(), filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
 	if readErr != nil {
 		t.Fatalf("read work-query failure events: %v", readErr)
 	}

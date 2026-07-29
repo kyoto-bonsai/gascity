@@ -286,7 +286,7 @@ func (t *cityRunTailer) loop(ctx context.Context, wg *sync.WaitGroup) {
 		case <-ctx.Done():
 			return
 		case <-poll.C:
-			t.foldNext(proj, st)
+			t.foldNext(ctx, proj, st)
 			t.logDecodeMisses(proj, st)
 		}
 	}
@@ -329,7 +329,7 @@ var readTailEvents = events.ReadFrom
 // one poll. On a detected rotation it first catches up across archives by
 // sequence, then re-tails the fresh active file from the top; the seq filter
 // drops the overlap the catch-up already folded.
-func (t *cityRunTailer) foldNext(proj *runproj.Projector, st *tailState) {
+func (t *cityRunTailer) foldNext(ctx context.Context, proj *runproj.Projector, st *tailState) {
 	info, statErr := os.Stat(t.eventsPath)
 	if statErr != nil && st.activeInfo != nil {
 		// Once an active file has existed, an unavailable path can be the
@@ -358,7 +358,7 @@ func (t *cityRunTailer) foldNext(proj *runproj.Projector, st *tailState) {
 		// catch-up read error must leave the OLD identity in place and retry on
 		// the next poll — committing the fresh identity here would make the next
 		// poll see no rotation (SameFile) and lose that window until restart.
-		catchUp, err := readRotationCatchUp(t.eventsPath, events.Filter{AfterSeq: proj.LastSeq()})
+		catchUp, err := readRotationCatchUp(ctx, t.eventsPath, events.Filter{AfterSeq: proj.LastSeq()})
 		if err != nil {
 			t.markIncrementalReadFailure(&st.catchUpReadFailed, "rotation catch-up", err)
 			return
