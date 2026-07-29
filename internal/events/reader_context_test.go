@@ -73,7 +73,7 @@ func TestReadFilteredContextMatchesReadFilteredWhenNotCanceled(t *testing.T) {
 	dir := seedArchives(t)
 	path := filepath.Join(dir, "events.jsonl")
 
-	want, wantErr := ReadFiltered(path, Filter{})
+	want, wantErr := ReadFiltered(context.Background(), path, Filter{})
 	if wantErr != nil {
 		t.Fatalf("ReadFiltered: %v", wantErr)
 	}
@@ -96,9 +96,12 @@ func TestReadFilteredContextAbortsBetweenArchives(t *testing.T) {
 	path := filepath.Join(dir, "events.jsonl")
 
 	// Err() call #1 fires before archive 1 is processed (not yet canceled).
-	// Call #2 fires before archive 2 is processed -- that's where this
-	// cancels.
-	ctx := newCancelAfter(2)
+	// streamArchive itself now also checks ctx.Err() once per archive (at
+	// scan index 0, per ctxCheckInterval -- see ga-tk5mcg.10), so a fully
+	// processed 2-line archive 1 costs a SECOND call (#2) before the loop
+	// exits cleanly. Call #3 fires before archive 2 is processed -- that's
+	// where this cancels.
+	ctx := newCancelAfter(3)
 	got, err := ReadFilteredContext(ctx, path, Filter{})
 
 	if !errors.Is(err, context.Canceled) {
@@ -139,7 +142,10 @@ func TestReadFilteredWithInFlightContextAbortsBetweenArchives(t *testing.T) {
 	dir := seedArchives(t)
 	path := filepath.Join(dir, "events.jsonl")
 
-	ctx := newCancelAfter(2)
+	// See TestReadFilteredContextAbortsBetweenArchives: archive 1 costs 2
+	// Err() calls (outer-loop + streamArchive's own), so #3 is the first
+	// call that can land on archive 2.
+	ctx := newCancelAfter(3)
 	got, err := ReadFilteredWithInFlightContext(ctx, path, Filter{})
 
 	if !errors.Is(err, context.Canceled) {

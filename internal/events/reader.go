@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,11 @@ import (
 	"sort"
 	"time"
 )
+
+// ctxCheckInterval bounds how often a hot scan loop pays the cost of a
+// ctx.Err() check, so cancellation latency stays bounded even inside a
+// single large archive without checking on every line. See ga-tk5mcg.10.
+const ctxCheckInterval = 4096
 
 // readRotationDir is the directory snapshot used by rotation catch-up readers.
 // It is indirected so tests can deterministically promote a rotating file at
@@ -86,8 +92,8 @@ func limitReached(count int, filter Filter) bool {
 // seq order before the active file, yielding a single chronological
 // stream. Returns (nil, nil) if neither the active file nor any
 // archives exist.
-func ReadAll(path string) ([]Event, error) {
-	return ReadFiltered(path, Filter{})
+func ReadAll(ctx context.Context, path string) ([]Event, error) {
+	return ReadFiltered(ctx, path, Filter{})
 }
 
 // ReadFiltered reads events from path and sibling archives, returning
@@ -95,9 +101,10 @@ func ReadAll(path string) ([]Event, error) {
 // seq window is fully excluded by the filter's AfterSeq predicate are
 // skipped without gunzipping. Returns (nil, nil) if no events exist.
 // Scanner errors return the events parsed before the error alongside
-// the error.
-func ReadFiltered(path string, filter Filter) ([]Event, error) {
-	result, _, err := readFilteredTracked(path, filter)
+// the error. If ctx is canceled mid-scan, returns the events collected so
+// far alongside ctx.Err() — see ga-tk5mcg.10.
+func ReadFiltered(ctx context.Context, path string, filter Filter) ([]Event, error) {
+	result, _, err := readFilteredTracked(ctx, path, filter)
 	return result, err
 }
 
@@ -110,7 +117,7 @@ type eventSeqWindow struct {
 // initial directory snapshot. ReadFilteredWithInFlight uses that set to avoid
 // reopening stable archives (including later windows after a Limit is reached)
 // while still detecting an archive promoted after this scan.
-func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindow]struct{}, error) {
+func readFilteredTracked(ctx context.Context, path string, filter Filter) ([]Event, map[eventSeqWindow]struct{}, error) {
 	dir := filepath.Dir(path)
 	archives, err := archiveFilesIn(dir)
 	if err != nil {
@@ -126,11 +133,14 @@ func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindo
 		listed[eventSeqWindow{first: info.FirstSeq, last: info.LastSeq}] = struct{}{}
 	}
 	for _, info := range archives {
+		if err := ctx.Err(); err != nil {
+			return result, listed, err
+		}
 		if !archiveOverlapsFilter(info, filter) {
 			continue
 		}
 		archivePath := filepath.Join(dir, info.Basename)
-		err := streamArchive(archivePath, filter, func(e Event) bool {
+		err := streamArchive(ctx, archivePath, filter, func(e Event) bool {
 			if !matchesFilter(e, filter) {
 				return true
 			}
@@ -159,7 +169,12 @@ func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindo
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // handle lines up to 1MB
-	for scanner.Scan() {
+	for i := 0; scanner.Scan(); i++ {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return result, listed, err
+			}
+		}
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			continue // skip malformed lines
@@ -193,9 +208,14 @@ func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindo
 // is de-duplicated by seq and returned in seq order. Intended for the AfterSeq
 // catch-up path; a positive Filter.Limit bounds only ReadFiltered's own scan,
 // not newly discovered rotation sources merged by the recovery pass.
-func ReadFilteredWithInFlight(path string, filter Filter) ([]Event, error) {
-	base, listedArchives, baseErr := readFilteredTracked(path, filter)
-	rotated, rotationErr := readRotationSources(path, filter, listedArchives)
+func ReadFilteredWithInFlight(ctx context.Context, path string, filter Filter) ([]Event, error) {
+	base, listedArchives, baseErr := readFilteredTracked(ctx, path, filter)
+	if baseErr != nil && ctx.Err() != nil {
+		// Canceled mid-scan: don't compound it with a second full pass over
+		// the rotation sources. See ga-tk5mcg.10.
+		return base, baseErr
+	}
+	rotated, rotationErr := readRotationSources(ctx, path, filter, listedArchives)
 	if len(rotated) == 0 {
 		if baseErr == nil {
 			return base, rotationErr
@@ -221,7 +241,7 @@ func ReadFilteredWithInFlight(path string, filter Filter) ([]Event, error) {
 // window, so the normal cold-load path pays only a second directory listing
 // rather than decoding the full archive history twice. That includes later
 // archives the base intentionally did not open after satisfying Filter.Limit.
-func readRotationSources(path string, filter Filter, listedArchives map[eventSeqWindow]struct{}) ([]Event, error) {
+func readRotationSources(ctx context.Context, path string, filter Filter, listedArchives map[eventSeqWindow]struct{}) ([]Event, error) {
 	dir := filepath.Dir(path)
 	sources, err := listBackfillSources(dir, filter.AfterSeq)
 	if err != nil {
@@ -234,6 +254,9 @@ func readRotationSources(path string, filter Filter, listedArchives map[eventSeq
 	var result []Event
 	maxSeq := filter.AfterSeq
 	for _, src := range sources {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		if src.kind == sourceArchive {
 			if _, ok := listedArchives[eventSeqWindow{first: src.firstSeq, last: src.lastSeq}]; ok {
 				continue
@@ -344,8 +367,14 @@ func archiveFilesIn(dir string) ([]archiveInfo, error) {
 // streamArchive gunzip-streams the file at path, decoding each line
 // as an Event and invoking fn for every event. fn returns false to
 // abort iteration early. Returns nil if iteration completed cleanly
-// or fn requested abort; errors from gzip / scanner are wrapped.
-func streamArchive(path string, _ Filter, fn func(Event) bool) error {
+// or fn requested abort; errors from gzip / scanner are wrapped. If ctx
+// is canceled mid-stream, returns ctx.Err() — see ga-tk5mcg.10. The check
+// is periodic (every ctxCheckInterval lines), not per-line: this loop is
+// the actual multi-second-per-archive cost (up to ~85MB gzip today) that
+// motivated the fix, so cancellation latency matters here more than in any
+// other loop in this file, but a per-line context.Err() call on a hot
+// decode loop is needless overhead at this corpus's line rate.
+func streamArchive(ctx context.Context, path string, _ Filter, fn func(Event) bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -360,7 +389,12 @@ func streamArchive(path string, _ Filter, fn func(Event) bool) error {
 
 	scanner := bufio.NewScanner(gr)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
+	for i := 0; scanner.Scan(); i++ {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			continue
@@ -387,18 +421,18 @@ func streamArchive(path string, _ Filter, fn func(Event) bool) error {
 // matches are found. Only a type with fewer than limit matches in ALL of
 // retained history (including one with none at all) forces a full walk of
 // every archive — an unavoidable cost of proving that, not a regression.
-func ReadFilteredTail(path string, filter Filter, limit int) ([]Event, error) {
+func ReadFilteredTail(ctx context.Context, path string, filter Filter, limit int) ([]Event, error) {
 	if limit <= 0 {
-		return ReadFiltered(path, filter)
+		return ReadFiltered(ctx, path, filter)
 	}
-	active, err := activeFilteredTail(path, filter, limit)
+	active, err := activeFilteredTail(ctx, path, filter, limit)
 	if err != nil {
 		return nil, err
 	}
 	if len(active) >= limit {
 		return active, nil
 	}
-	older, err := archivesFilteredTail(filepath.Dir(path), filter, limit-len(active))
+	older, err := archivesFilteredTail(ctx, filepath.Dir(path), filter, limit-len(active))
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +448,7 @@ func ReadFilteredTail(path string, filter Filter, limit int) ([]Event, error) {
 // activeFilteredTail reads the trailing matching events from the active file
 // at path only, never its sibling archives. Returns (nil, nil) if the active
 // file doesn't exist yet.
-func activeFilteredTail(path string, filter Filter, limit int) ([]Event, error) {
+func activeFilteredTail(ctx context.Context, path string, filter Filter, limit int) ([]Event, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -428,7 +462,7 @@ func activeFilteredTail(path string, filter Filter, limit int) ([]Event, error) 
 	if err != nil {
 		return nil, fmt.Errorf("stat events tail: %w", err)
 	}
-	return readFilteredTailFromFile(f, info.Size(), filter, limit)
+	return readFilteredTailFromFile(ctx, f, info.Size(), filter, limit)
 }
 
 // archivesFilteredTail returns up to need trailing matching events from dir's
@@ -439,19 +473,22 @@ func activeFilteredTail(path string, filter Filter, limit int) ([]Event, error) 
 // when need is never met, which is the correct (and only possible) outcome
 // when a type has fewer than need matches in all of retained history. Returns
 // events in ascending seq order, matching ReadFiltered's contract.
-func archivesFilteredTail(dir string, filter Filter, need int) ([]Event, error) {
+func archivesFilteredTail(ctx context.Context, dir string, filter Filter, need int) ([]Event, error) {
 	archives, err := archiveFilesIn(dir) // ascending FirstSeq (oldest first)
 	if err != nil {
 		return nil, err
 	}
 	var collected []Event
 	for i := len(archives) - 1; i >= 0 && need > 0; i-- {
+		if err := ctx.Err(); err != nil {
+			return collected, err
+		}
 		info := archives[i]
 		if !archiveOverlapsFilter(info, filter) {
 			continue
 		}
 		archivePath := filepath.Join(dir, info.Basename)
-		tail, err := readArchiveTail(archivePath, filter, need)
+		tail, err := readArchiveTail(ctx, archivePath, filter, need)
 		if err != nil {
 			return nil, fmt.Errorf("reading archive %q: %w", info.Basename, err)
 		}
@@ -477,7 +514,7 @@ func archivesFilteredTail(dir string, filter Filter, need int) ([]Event, error) 
 // ~85MB archives, almost certainly the extra large-buffer allocation and GC
 // pressure of holding the full decompressed content live at once. See
 // ga-96zjze.
-func readArchiveTail(path string, filter Filter, need int) ([]Event, error) {
+func readArchiveTail(ctx context.Context, path string, filter Filter, need int) ([]Event, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -494,7 +531,12 @@ func readArchiveTail(path string, filter Filter, need int) ([]Event, error) {
 	count := 0 // total matches seen; ring[count % need] is the next slot to (over)write
 	scanner := bufio.NewScanner(gr)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
+	for i := 0; scanner.Scan(); i++ {
+		if i%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			continue // skip malformed lines, matching streamArchive's behavior
@@ -527,15 +569,26 @@ func readArchiveTail(path string, filter Filter, need int) ([]Event, error) {
 	return result, nil
 }
 
-func readFilteredTailFromFile(f *os.File, size int64, filter Filter, limit int) ([]Event, error) {
+func readFilteredTailFromFile(ctx context.Context, f *os.File, size int64, filter Filter, limit int) ([]Event, error) {
 	if size <= 0 {
 		return nil, nil
 	}
 	const chunkSize int64 = 64 * 1024
 	var reversed []Event
 	var pending []byte
+	var ctxErr error
 	end := size
 	for end > 0 && len(reversed) < limit {
+		if err := ctx.Err(); err != nil {
+			// Break rather than return here: reversed is still in
+			// newest-to-oldest scan order at this point, and the caller's
+			// contract is chronological order. Fall through to the same
+			// reversal every other exit from this loop gets, so a
+			// canceled scan's partial result is ordered the same as a
+			// completed one — see ga-tk5mcg.10.
+			ctxErr = err
+			break
+		}
 		n := chunkSize
 		if end < n {
 			n = end
@@ -574,7 +627,7 @@ func readFilteredTailFromFile(f *os.File, size int64, filter Filter, limit int) 
 	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
 		reversed[i], reversed[j] = reversed[j], reversed[i]
 	}
-	return reversed, nil
+	return reversed, ctxErr
 }
 
 // ReadLatestSeq returns the highest complete event Seq visible in the

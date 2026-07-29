@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -215,7 +216,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext, deadline time.Time) *Ch
 	}
 
 	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
-	firedEvents, err := events.ReadFilteredTail(eventPath, events.Filter{Type: events.OrderFired}, orderFiringEventTailLimit)
+	firedEvents, err := events.ReadFilteredTail(context.Background(), eventPath, events.Filter{Type: events.OrderFired}, orderFiringEventTailLimit)
 	if err != nil {
 		result.Status = StatusError
 		result.Message = fmt.Sprintf("read order firing events: %v", err)
@@ -658,7 +659,7 @@ func latestControllerStartedAt(eventPath string) (time.Time, error) {
 	// Only the single newest controller.started event matters here, so a
 	// tail read of 1 is sufficient — see orderFiringEventTailLimit above for
 	// why an unbounded scan of this file is worth avoiding.
-	startEvents, err := events.ReadFilteredTail(eventPath, events.Filter{Type: events.ControllerStarted}, 1)
+	startEvents, err := events.ReadFilteredTail(context.Background(), eventPath, events.Filter{Type: events.ControllerStarted}, 1)
 	if err != nil {
 		return time.Time{}, err
 	}

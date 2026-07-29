@@ -149,7 +149,7 @@ work_query = "kill -9 $$"
 	if code != 1 {
 		t.Fatalf("cmdHookWithFormat() = %d, want 1 for killed work query; stderr=%s", code, stderr.String())
 	}
-	evts, err := events.ReadFiltered(filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
+	evts, err := events.ReadFiltered(context.Background(), filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
 	if err != nil {
 		t.Fatalf("read work-query failure events: %v", err)
 	}
@@ -209,7 +209,7 @@ work_query = "kill -9 $$"
 	if code != 1 {
 		t.Fatalf("cmdHookWithFormat(explicit other) = %d, want 1 for killed work query; stderr=%s", code, stderr.String())
 	}
-	evts, err := events.ReadFiltered(filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
+	evts, err := events.ReadFiltered(context.Background(), filepath.Join(cityDir, ".gc", "events.jsonl"), events.Filter{Type: events.SessionWorkQueryFailed})
 	if err != nil {
 		t.Fatalf("read work-query failure events: %v", err)
 	}

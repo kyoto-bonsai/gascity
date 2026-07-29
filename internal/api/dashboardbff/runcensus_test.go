@@ -190,7 +190,7 @@ func TestRunCensusSourceUsesIncrementalTailAfterColdLoad(t *testing.T) {
 		ID: "run-one.step", Title: "step", Type: "task", Status: "in_progress",
 		Metadata: beads.StringMap{beadmeta.RootBeadIDMetadataKey: "run-one"},
 	}))
-	tailer.foldNext(projector, state)
+	tailer.foldNext(context.Background(), projector, state)
 	if projector.LastSeq() != 2 {
 		t.Fatalf("incremental tail cursor = %d, want 2", projector.LastSeq())
 	}
@@ -254,7 +254,7 @@ func TestRunCensusSourceMarksIncrementalDecodeMissPartial(t *testing.T) {
 	appendEvents(t, logPath, events.Event{
 		Seq: 2, Type: events.BeadUpdated, Payload: json.RawMessage(`{"status":"open"}`),
 	})
-	tailer.foldNext(projector, state)
+	tailer.foldNext(context.Background(), projector, state)
 
 	got := tailer.runCensus(context.Background())
 	if !got.Ready || !got.Partial {

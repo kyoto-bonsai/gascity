@@ -378,7 +378,7 @@ func TestRunTailerRotationCatchUp(t *testing.T) {
 
 	// One fold must reconcile the archived pre-rotation runs AND the fresh
 	// active-file run — no sequence gap, no stale lane.
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 
 	got := map[string]bool{}
 	for _, lane := range tl.summary.Lanes {
@@ -463,7 +463,7 @@ func TestRunTailerRotationCatchUpInFlightArchive(t *testing.T) {
 	// One fold must reconcile the in-flight pre-rotation runs AND the fresh
 	// active-file run — the drop happens only if the catch-up ignores the
 	// rotating file.
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 
 	got := map[string]bool{}
 	for _, lane := range tl.summary.Lanes {
@@ -523,7 +523,7 @@ func TestRunTailerStartupCursorRotationRaceDoesNotSkip(t *testing.T) {
 	st.offset = staleOffset
 	st.activeInfo = freshInfo
 
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 
 	if !lanePresent(tl, "run4") {
 		t.Errorf("run4 skipped: a fresh event below the stale startup offset was dropped; lanes=%v", laneIDsOf(tl.summary.Lanes))
@@ -566,7 +566,7 @@ func TestRunTailerRotationDuringActiveReadDoesNotCommitUnverifiedCursor(t *testi
 		return evts, nextOffset, err
 	}
 
-	tailer.foldNext(projector, state)
+	tailer.foldNext(context.Background(), projector, state)
 	if got := projector.LastSeq(); got != 1 {
 		t.Fatalf("projector cursor = %d, want 1 until active read identity is verified", got)
 	}
@@ -578,7 +578,7 @@ func TestRunTailerRotationDuringActiveReadDoesNotCommitUnverifiedCursor(t *testi
 	}
 
 	readTailEvents = previous
-	tailer.foldNext(projector, state)
+	tailer.foldNext(context.Background(), projector, state)
 	for _, want := range []string{"run1", "run2", "run3"} {
 		if !lanePresent(tailer, want) {
 			t.Errorf("lane %q missing after verified rotation recovery; lanes=%v", want, laneIDsOf(tailer.summary.Lanes))
@@ -627,7 +627,9 @@ func TestRunTailerRotationCatchUpErrorRetriesNextPoll(t *testing.T) {
 	writeEventLog(t, logPath, runMoleculeEvent(4, "run4", "mol-adopt-pr-v2", "worker-4"))
 
 	// Fail the first catch-up read, then fall through to the real reader.
-	defer func(prev func(string, events.Filter) ([]events.Event, error)) { readRotationCatchUp = prev }(readRotationCatchUp)
+	defer func(prev func(context.Context, string, events.Filter) ([]events.Event, error)) {
+		readRotationCatchUp = prev
+	}(readRotationCatchUp)
 	realCatchUp := events.ReadFilteredWithInFlight
 	var logs bytes.Buffer
 	previousLog := log.Writer()
@@ -635,19 +637,19 @@ func TestRunTailerRotationCatchUpErrorRetriesNextPoll(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(previousLog) })
 
 	calls := 0
-	readRotationCatchUp = func(path string, f events.Filter) ([]events.Event, error) {
+	readRotationCatchUp = func(ctx context.Context, path string, f events.Filter) ([]events.Event, error) {
 		calls++
 		if calls <= 2 {
 			return nil, errors.New("transient catch-up read error")
 		}
-		return realCatchUp(path, f)
+		return realCatchUp(ctx, path, f)
 	}
 
 	// First poll: catch-up errors. Nothing folds, and the tailer must not advance
 	// its active identity or the next poll can no longer re-detect the rotation.
 	// It must also publish the projection as incomplete until a cursor-preserving
 	// retry proves that the failed rotation window was recovered.
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 	if lanePresent(tl, "run2") || lanePresent(tl, "run3") || lanePresent(tl, "run4") {
 		t.Fatalf("events folded despite a catch-up error; lanes=%v", laneIDsOf(tl.summary.Lanes))
 	}
@@ -671,7 +673,7 @@ func TestRunTailerRotationCatchUpErrorRetriesNextPoll(t *testing.T) {
 			_ = os.Rename(gapPath, logPath)
 		}
 	})
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 	if !tl.summary.LanesPartial {
 		t.Fatal("ENOENT rotation gap cleared an unresolved catch-up failure")
 	}
@@ -681,13 +683,13 @@ func TestRunTailerRotationCatchUpErrorRetriesNextPoll(t *testing.T) {
 
 	// A repeated poll in the same failed episode remains partial but does not
 	// flood the log at the tailer's one-second production cadence.
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 	if got := strings.Count(logs.String(), "rotation catch-up failed"); got != 1 {
 		t.Fatalf("catch-up failure log count = %d, want 1 for one failure transition; logs=%q", got, logs.String())
 	}
 
 	// Third poll: catch-up succeeds and recovers the whole rotation window.
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 	for _, want := range []string{"run1", "run2", "run3", "run4"} {
 		if !lanePresent(tl, want) {
 			t.Errorf("lane %q missing after catch-up retry; lanes=%v", want, laneIDsOf(tl.summary.Lanes))
@@ -727,8 +729,8 @@ func TestRunTailerReadErrorPreservesCursorAndMarksProjectionIncomplete(t *testin
 		}
 		return previous(path, offset)
 	}
-	tl.foldNext(proj, st)
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
+	tl.foldNext(context.Background(), proj, st)
 
 	if st.offset != oldOffset {
 		t.Fatalf("offset advanced on read error: got %d, want %d", st.offset, oldOffset)
@@ -750,7 +752,7 @@ func TestRunTailerReadErrorPreservesCursorAndMarksProjectionIncomplete(t *testin
 			_ = os.Rename(gapPath, logPath)
 		}
 	})
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 	if !tl.summary.LanesPartial {
 		t.Fatal("ENOENT active-path gap cleared an unresolved tail-read failure")
 	}
@@ -758,7 +760,7 @@ func TestRunTailerReadErrorPreservesCursorAndMarksProjectionIncomplete(t *testin
 		t.Fatalf("restore active path after gap: %v", err)
 	}
 
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 	if !lanePresent(tl, "run2") {
 		t.Fatalf("retry from preserved cursor did not recover run2; lanes=%v", laneIDsOf(tl.summary.Lanes))
 	}
@@ -768,12 +770,12 @@ func TestRunTailerReadErrorPreservesCursorAndMarksProjectionIncomplete(t *testin
 
 	appendEvents(t, logPath, runMoleculeEvent(3, "run3", "mol-bugflow-v1", "worker-3"))
 	failRead = true
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 	if got := strings.Count(logs.String(), "active-log tail failed"); got != 2 {
 		t.Fatalf("active-tail failure log count after recovery = %d, want 2 transitions; logs=%q", got, logs.String())
 	}
 	failRead = false
-	tl.foldNext(proj, st)
+	tl.foldNext(context.Background(), proj, st)
 	if !lanePresent(tl, "run3") || tl.summary.LanesPartial {
 		t.Fatalf("second retry did not recover a complete run3 projection; lanes=%v partial=%v", laneIDsOf(tl.summary.Lanes), tl.summary.LanesPartial)
 	}
@@ -797,13 +799,13 @@ func TestRunTailerSuccessfulEmptyRetryClearsIncrementalFailure(t *testing.T) {
 	readTailEvents = func(string, int64) ([]events.Event, int64, error) {
 		return nil, 0, errors.New("transient empty-tail failure")
 	}
-	tailer.foldNext(projector, state)
+	tailer.foldNext(context.Background(), projector, state)
 	if !tailer.summary.LanesPartial {
 		t.Fatal("read failure did not mark projection partial")
 	}
 
 	readTailEvents = previous
-	tailer.foldNext(projector, state)
+	tailer.foldNext(context.Background(), projector, state)
 	if tailer.summary.LanesPartial {
 		t.Fatal("successful retry with no new events did not clear recoverable incompleteness")
 	}
