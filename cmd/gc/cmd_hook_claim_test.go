@@ -233,3 +233,212 @@ func TestDoHookClaimSkipsBlockedRoutedHeadAndClaimsReadyBehindIt(t *testing.T) {
 		t.Fatalf("claimedBead = %q, want ready-behind (blocked-head must be skipped)", claimedBead)
 	}
 }
+
+// The tests below pin ruling ga-982pdy section 6 (R3): hookClaimJSONResult
+// surfaces gc.awaiting, verbatim and unparsed, at all three construction
+// sites, so a claiming session is told why a bead is parked instead of
+// reconstructing the gate from the comment thread.
+
+func TestDoHookClaimSurfacesAwaitingOnFreshClaim(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "bead-1", Status: "open", Metadata: map[string]string{"gc.routed_to": "route-1", "gc.awaiting": "validator"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) { return string(output), nil },
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress", Metadata: candidates[0].Metadata}, true, nil
+		},
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decoding stdout JSON: %v; stdout=%s", err, stdout.String())
+	}
+	if result.Reason != "claimed" {
+		t.Fatalf("reason = %q, want claimed", result.Reason)
+	}
+	if result.Awaiting != "validator" {
+		t.Fatalf("awaiting = %q, want validator", result.Awaiting)
+	}
+}
+
+func TestDoHookClaimSurfacesAwaitingOnExistingInProgressAssignment(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "bead-1", Status: "in_progress", Assignee: "worker-1", Metadata: map[string]string{"gc.routed_to": "route-1", "gc.awaiting": "operator_decision"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	ops := hookClaimOps{
+		Runner:   func(string, string) (string, error) { return string(output), nil },
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decoding stdout JSON: %v; stdout=%s", err, stdout.String())
+	}
+	if result.Reason != "existing_assignment" {
+		t.Fatalf("reason = %q, want existing_assignment", result.Reason)
+	}
+	if result.Awaiting != "operator_decision" {
+		t.Fatalf("awaiting = %q, want operator_decision", result.Awaiting)
+	}
+}
+
+func TestDoHookClaimSurfacesAwaitingOnReadyAssignment(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "bead-1", Status: "open", Assignee: "worker-1", Metadata: map[string]string{"gc.routed_to": "route-1", "gc.awaiting": "dependency:ga-1234"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	ops := hookClaimOps{
+		Runner:   func(string, string) (string, error) { return string(output), nil },
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decoding stdout JSON: %v; stdout=%s", err, stdout.String())
+	}
+	if result.Reason != "ready_assignment" {
+		t.Fatalf("reason = %q, want ready_assignment", result.Reason)
+	}
+	if result.Awaiting != "dependency:ga-1234" {
+		t.Fatalf("awaiting = %q, want dependency:ga-1234", result.Awaiting)
+	}
+}
+
+// TestDoHookClaimPassesThroughOffVocabularyAwaitingValueUnmodified pins ruling
+// ga-982pdy section 6, item 3: gc.awaiting is emitted verbatim, never
+// validated, normalized, or mapped. "cass" was a live off-vocabulary value
+// (ga-6ud310) at ruling time — vocabulary enforcement is ga-gzgggk's job on
+// the producer side, not this read path's.
+func TestDoHookClaimPassesThroughOffVocabularyAwaitingValueUnmodified(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "bead-1", Status: "open", Metadata: map[string]string{"gc.routed_to": "route-1", "gc.awaiting": "cass"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) { return string(output), nil },
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress", Metadata: candidates[0].Metadata}, true, nil
+		},
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decoding stdout JSON: %v; stdout=%s", err, stdout.String())
+	}
+	if result.Awaiting != "cass" {
+		t.Fatalf("awaiting = %q, want verbatim passthrough of off-vocabulary value \"cass\"", result.Awaiting)
+	}
+}
+
+// TestDoHookClaimStillClaimsBeadWithAwaitingSet is the executable form of
+// ruling ga-982pdy R1: gc.awaiting is a routing hint, never a claim-eligibility
+// gate. It must go red if a future change adds an awaiting-based exclusion to
+// hookCandidateClaimable or filterUnreadyHookCandidates — verified by
+// temporarily introducing exactly such an exclusion and confirming this test
+// fails before reverting (see ga-8gq4ff close notes).
+func TestDoHookClaimStillClaimsBeadWithAwaitingSet(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "bead-1", Status: "open", Metadata: map[string]string{"gc.routed_to": "route-1", "gc.awaiting": "validator"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	var claimedBead string
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) { return string(output), nil },
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			claimedBead = beadID
+			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress", Metadata: candidates[0].Metadata}, true, nil
+		},
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if claimedBead != "bead-1" {
+		t.Fatalf("claimedBead = %q, want bead-1 (a bead with gc.awaiting set must remain claimable — ruling ga-982pdy R1)", claimedBead)
+	}
+
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decoding stdout JSON: %v; stdout=%s", err, stdout.String())
+	}
+	if !result.OK || result.Reason != "claimed" {
+		t.Fatalf("result = %#v, want ok=true reason=claimed", result)
+	}
+}

@@ -73,6 +73,7 @@ type hookClaimJSONResult struct {
 	BeadID               string   `json:"bead_id,omitempty"`
 	Assignee             string   `json:"assignee,omitempty"`
 	Route                string   `json:"route,omitempty"`
+	Awaiting             string   `json:"awaiting,omitempty"`
 	ContinuationAssigned []string `json:"continuation_assigned,omitempty"`
 	DrainAcknowledged    bool     `json:"drain_acknowledged,omitempty"`
 }
@@ -243,6 +244,7 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 			BeadID:        claimed.ID,
 			Assignee:      claimed.Assignee,
 			Route:         hookClaimRoute(claimed),
+			Awaiting:      claimed.Metadata[beadmeta.AwaitingMetadataKey],
 		}
 		if result.BeadID == "" {
 			result.BeadID = candidate.ID
@@ -322,6 +324,7 @@ func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions)
 				BeadID:        candidate.ID,
 				Assignee:      candidate.Assignee,
 				Route:         hookClaimRoute(candidate),
+				Awaiting:      candidate.Metadata[beadmeta.AwaitingMetadataKey],
 			}
 			return result, candidate, true
 		}
@@ -338,6 +341,7 @@ func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions)
 				BeadID:        candidate.ID,
 				Assignee:      candidate.Assignee,
 				Route:         hookClaimRoute(candidate),
+				Awaiting:      candidate.Metadata[beadmeta.AwaitingMetadataKey],
 			}
 			return result, candidate, true
 		}
