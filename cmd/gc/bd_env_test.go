@@ -4195,6 +4195,7 @@ func TestEmitPostgresCredentialResolved_DedupsWithinProcess(t *testing.T) {
 	}
 
 	got, err := events.ReadFiltered(
+		context.Background(),
 		filepath.Join(cityPath, ".gc", "events.jsonl"),
 		events.Filter{Type: events.PostgresCredentialResolved},
 	)

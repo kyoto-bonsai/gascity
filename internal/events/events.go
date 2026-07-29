@@ -338,8 +338,10 @@ type Recorder interface {
 type Provider interface {
 	Recorder
 
-	// List returns events matching the filter.
-	List(filter Filter) ([]Event, error)
+	// List returns events matching the filter. Implementations that scan
+	// (rather than serve from memory) must check ctx periodically so an
+	// abandoned caller's scan actually stops — see ga-tk5mcg.10.
+	List(ctx context.Context, filter Filter) ([]Event, error)
 
 	// LatestSeq returns the highest sequence number, or 0 if empty.
 	LatestSeq() (uint64, error)
@@ -362,7 +364,7 @@ type Provider interface {
 // TailProvider is an optional extension for providers that can return the
 // trailing matching events without scanning or materializing the whole history.
 type TailProvider interface {
-	ListTail(filter Filter, limit int) ([]Event, error)
+	ListTail(ctx context.Context, filter Filter, limit int) ([]Event, error)
 }
 
 // InFlightProvider is an optional extension for providers whose plain List can
@@ -375,7 +377,7 @@ type TailProvider interface {
 // a whole seq range mid-rotation. Providers with no such window (in-memory
 // fakes, exec scripts) need not implement it.
 type InFlightProvider interface {
-	ListInFlight(filter Filter) ([]Event, error)
+	ListInFlight(ctx context.Context, filter Filter) ([]Event, error)
 }
 
 // ExhaustiveTailProvider is an optional extension of TailProvider for

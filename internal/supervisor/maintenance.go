@@ -691,7 +691,7 @@ func SeedLastRunAt(provider events.Provider) time.Time {
 	if provider == nil {
 		return time.Time{}
 	}
-	evts, err := provider.List(events.Filter{Type: events.StoreMaintenanceDone})
+	evts, err := provider.List(context.Background(), events.Filter{Type: events.StoreMaintenanceDone})
 	if err != nil {
 		return time.Time{}
 	}

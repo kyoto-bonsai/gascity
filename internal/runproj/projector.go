@@ -1,6 +1,8 @@
 package runproj
 
 import (
+	"context"
+
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 )
@@ -46,7 +48,7 @@ func NewProjector() *Projector {
 // call once on a fresh projector before the incremental tail begins; Apply is
 // seq-idempotent so the transient .gz/rotating overlap folds cleanly.
 func (p *Projector) ColdLoad(path string) error {
-	evts, err := events.ReadFilteredWithInFlight(path, events.Filter{})
+	evts, err := events.ReadFilteredWithInFlight(context.Background(), path, events.Filter{})
 	if err != nil {
 		return err
 	}

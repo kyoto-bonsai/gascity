@@ -20,13 +20,13 @@ type exhaustiveShortTailProvider struct {
 
 func (p *exhaustiveShortTailProvider) Record(events.Event) {}
 
-func (p *exhaustiveShortTailProvider) List(events.Filter) ([]events.Event, error) {
+func (p *exhaustiveShortTailProvider) List(context.Context, events.Filter) ([]events.Event, error) {
 	panic("fetchEventPageAscending must not fall back to List for an ExhaustiveTailProvider's " +
 		"short ListTail result — this is the ga-96zjze regression: a sparse/absent event type " +
 		"used to always pay a second, unconditional full-history scan here")
 }
 
-func (p *exhaustiveShortTailProvider) ListTail(events.Filter, int) ([]events.Event, error) {
+func (p *exhaustiveShortTailProvider) ListTail(context.Context, events.Filter, int) ([]events.Event, error) {
 	return p.tail, nil
 }
 
@@ -66,7 +66,7 @@ func TestFetchEventPageAscendingTrustsExhaustiveShortTail(t *testing.T) {
 	// limit=1000 -> fetch=1001; ListTail returns only 2, far short of fetch.
 	// This must not panic (i.e. must not call List) and must trust the 2 as
 	// final rather than treating "short" as ambiguous.
-	got, scanned, err := fetchEventPageAscending(p, events.Filter{Type: "convoy.closed"}, 1000)
+	got, scanned, err := fetchEventPageAscending(context.Background(), p, events.Filter{Type: "convoy.closed"}, 1000)
 	if err != nil {
 		t.Fatalf("fetchEventPageAscending: %v", err)
 	}
@@ -89,12 +89,12 @@ type nonExhaustiveShortTailProvider struct {
 
 func (p *nonExhaustiveShortTailProvider) Record(events.Event) {}
 
-func (p *nonExhaustiveShortTailProvider) List(events.Filter) ([]events.Event, error) {
+func (p *nonExhaustiveShortTailProvider) List(context.Context, events.Filter) ([]events.Event, error) {
 	p.listCalled = true
 	return p.all, nil
 }
 
-func (p *nonExhaustiveShortTailProvider) ListTail(events.Filter, int) ([]events.Event, error) {
+func (p *nonExhaustiveShortTailProvider) ListTail(context.Context, events.Filter, int) ([]events.Event, error) {
 	return p.tail, nil
 }
 
@@ -130,7 +130,7 @@ func TestFetchEventPageAscendingStillFallsBackWithoutExhaustiveMarker(t *testing
 		all:  fallbackAll,
 	}
 
-	got, scanned, err := fetchEventPageAscending(p, events.Filter{Type: "convoy.closed"}, 1000)
+	got, scanned, err := fetchEventPageAscending(context.Background(), p, events.Filter{Type: "convoy.closed"}, 1000)
 	if err != nil {
 		t.Fatalf("fetchEventPageAscending: %v", err)
 	}

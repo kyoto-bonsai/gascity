@@ -428,8 +428,8 @@ func (r *FileRecorder) rotateLocked() (RotationResult, error) {
 }
 
 // List returns events matching the filter from the underlying file.
-func (r *FileRecorder) List(filter Filter) ([]Event, error) {
-	return ReadFiltered(r.path, filter)
+func (r *FileRecorder) List(ctx context.Context, filter Filter) ([]Event, error) {
+	return ReadFiltered(ctx, r.path, filter)
 }
 
 // ListInFlight returns events matching the filter, including any still stranded
@@ -437,8 +437,8 @@ func (r *FileRecorder) List(filter Filter) ([]Event, error) {
 // compression window that plain List cannot see. Results are seq-ordered and
 // de-duplicated by seq. It implements [InFlightProvider] so the event-list
 // keyset walk cannot skip a just-rotated segment mid-rotation.
-func (r *FileRecorder) ListInFlight(filter Filter) ([]Event, error) {
-	return ReadFilteredWithInFlight(r.path, filter)
+func (r *FileRecorder) ListInFlight(ctx context.Context, filter Filter) ([]Event, error) {
+	return ReadFilteredWithInFlight(ctx, r.path, filter)
 }
 
 // ListTail returns trailing matching events from the underlying file.
@@ -449,8 +449,11 @@ func (r *FileRecorder) ListInFlight(filter Filter) ([]Event, error) {
 // ReadFilteredWithInFlight) — checked here cheaply (a directory listing, no
 // archive reopened) so the expensive in-flight-aware rescan is only paid in
 // that narrow, rare window, not on every sparse-type query. See ga-96zjze.
-func (r *FileRecorder) ListTail(filter Filter, limit int) ([]Event, error) {
-	tail, err := ReadFilteredTail(r.path, filter, limit)
+func (r *FileRecorder) ListTail(ctx context.Context, filter Filter, limit int) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tail, err := ReadFilteredTail(ctx, r.path, filter, limit)
 	if err != nil || limit <= 0 || len(tail) >= limit {
 		return tail, err
 	}
@@ -461,7 +464,7 @@ func (r *FileRecorder) ListTail(filter Filter, limit int) ([]Event, error) {
 	if !inFlight {
 		return tail, nil
 	}
-	full, err := ReadFilteredWithInFlight(r.path, filter)
+	full, err := ReadFilteredWithInFlight(ctx, r.path, filter)
 	if err != nil {
 		return nil, err
 	}

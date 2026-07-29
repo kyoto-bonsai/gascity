@@ -379,7 +379,7 @@ func checkEvent(a Order, ep events.Provider, cursorFn CursorFunc) TriggerResult 
 		cursor = cursorFn(a.ScopedName())
 	}
 
-	matched, err := ep.List(events.Filter{
+	matched, err := ep.List(context.Background(), events.Filter{
 		Type:     a.On,
 		AfterSeq: cursor,
 	})

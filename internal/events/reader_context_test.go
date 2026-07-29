@@ -73,7 +73,7 @@ func TestReadFilteredContextMatchesReadFilteredWhenNotCanceled(t *testing.T) {
 	dir := seedArchives(t)
 	path := filepath.Join(dir, "events.jsonl")
 
-	want, wantErr := ReadFiltered(path, Filter{})
+	want, wantErr := ReadFiltered(context.Background(), path, Filter{})
 	if wantErr != nil {
 		t.Fatalf("ReadFiltered: %v", wantErr)
 	}
@@ -96,9 +96,13 @@ func TestReadFilteredContextAbortsBetweenArchives(t *testing.T) {
 	path := filepath.Join(dir, "events.jsonl")
 
 	// Err() call #1 fires before archive 1 is processed (not yet canceled).
-	// Call #2 fires before archive 2 is processed -- that's where this
-	// cancels.
-	ctx := newCancelAfter(2)
+	// Call #2 fires INSIDE streamArchive's own per-archive check (ga-tk5mcg.10:
+	// streamArchive now takes ctx directly and checks it once per archive at
+	// i==0, since a single archive can be large enough that "between archives"
+	// alone isn't fine-grained enough) -- archive 1 has fewer lines than
+	// ctxCheckInterval so this doesn't abort mid-archive, just consumes a call.
+	// Call #3 fires before archive 2 is processed -- that's where this cancels.
+	ctx := newCancelAfter(3)
 	got, err := ReadFilteredContext(ctx, path, Filter{})
 
 	if !errors.Is(err, context.Canceled) {
@@ -139,7 +143,10 @@ func TestReadFilteredWithInFlightContextAbortsBetweenArchives(t *testing.T) {
 	dir := seedArchives(t)
 	path := filepath.Join(dir, "events.jsonl")
 
-	ctx := newCancelAfter(2)
+	// See TestReadFilteredContextAbortsBetweenArchives: cancelAt=3, not 2,
+	// because streamArchive's own ga-tk5mcg.10 ctx check adds one call per
+	// archive ahead of the outer between-archives check.
+	ctx := newCancelAfter(3)
 	got, err := ReadFilteredWithInFlightContext(ctx, path, Filter{})
 
 	if !errors.Is(err, context.Canceled) {

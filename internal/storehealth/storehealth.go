@@ -9,6 +9,7 @@
 package storehealth
 
 import (
+	"context"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -119,7 +120,7 @@ func LastMaintenance(ep events.Provider) (time.Time, string) {
 		{events.StoreMaintenanceDone, "success"},
 		{events.StoreMaintenanceFailed, "failed"},
 	} {
-		evts, err := ep.List(events.Filter{Type: spec.typ})
+		evts, err := ep.List(context.Background(), events.Filter{Type: spec.typ})
 		if err != nil {
 			continue
 		}
