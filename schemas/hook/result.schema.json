@@ -52,6 +52,9 @@
     "continuation_group": {
       "type": "string"
     },
+    "awaiting": {
+      "type": "string"
+    },
     "continuation_assigned": {
       "type": "array",
       "items": {
