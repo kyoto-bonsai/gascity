@@ -2086,6 +2086,72 @@ func TestNewSessionWithCommandAndEnv(t *testing.T) {
 	}
 }
 
+func TestNewSessionWithCommandAndEnvDoesNotLeakValuesToProcessTable(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+
+	cfg := DefaultConfig()
+	cfg.SocketName = fmt.Sprintf("gctest-secret-%d-%d", os.Getpid(), time.Now().UnixNano())
+	tm := NewTmuxWithConfig(cfg)
+	sessionName := fmt.Sprintf("gt-test-secret-env-%d", time.Now().UnixNano()%100000)
+	cleanupShellEnvFiles(t, sessionName)
+
+	unique := fmt.Sprintf("gc-argv-secret-%d-%d", os.Getpid(), time.Now().UnixNano())
+	env := map[string]string{
+		"OPENAI_API_KEY":       unique + "-openai",
+		"GOOGLE_API_KEY":       unique + "-google",
+		"BEADS_HOLDER_TOKEN":   unique + "-beads",
+		"GC_INSTANCE_TOKEN":    unique + "-instance",
+		"QUOTED_PROVIDER_DATA": unique + " with 'quote'",
+	}
+
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, "", "sleep 5", env); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() {
+		_ = tm.KillSession(sessionName)
+		_, _ = tm.run("kill-server")
+	}()
+
+	got, err := tm.GetEnvironment(sessionName, "OPENAI_API_KEY")
+	if err != nil {
+		t.Fatalf("GetEnvironment OPENAI_API_KEY: %v", err)
+	}
+	if got != env["OPENAI_API_KEY"] {
+		t.Fatal("OPENAI_API_KEY was not preserved in the tmux session environment")
+	}
+	gotQuoted, err := tm.GetEnvironment(sessionName, "QUOTED_PROVIDER_DATA")
+	if err != nil {
+		t.Fatalf("GetEnvironment QUOTED_PROVIDER_DATA: %v", err)
+	}
+	if gotQuoted != env["QUOTED_PROVIDER_DATA"] {
+		t.Fatal("quoted provider data was not preserved in the tmux session environment")
+	}
+
+	for _, pattern := range env {
+		if hits := countProcessTableCommandHits(t, pattern); hits != 0 {
+			t.Fatalf("process table exposed generated test secret in %d command lines", hits)
+		}
+	}
+}
+
+func countProcessTableCommandHits(t *testing.T, pattern string) int {
+	t.Helper()
+
+	out, err := exec.Command("ps", "-eo", "pid=,ppid=,command=").Output()
+	if err != nil {
+		t.Fatalf("ps process table probe: %v", err)
+	}
+	hits := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, pattern) {
+			hits++
+		}
+	}
+	return hits
+}
+
 func TestSetGetRemoveEnvironment(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
