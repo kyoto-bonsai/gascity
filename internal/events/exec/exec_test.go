@@ -342,7 +342,7 @@ esac
 
 	// Multiple operations should only call ensure-running once.
 	p.List(context.Background(), events.Filter{}) //nolint:errcheck
-	p.LatestSeq()           //nolint:errcheck
+	p.LatestSeq()                                 //nolint:errcheck
 	p.List(context.Background(), events.Filter{}) //nolint:errcheck
 
 	data, _ := os.ReadFile(countFile)
