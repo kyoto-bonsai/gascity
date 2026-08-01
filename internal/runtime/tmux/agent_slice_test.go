@@ -44,6 +44,7 @@ func TestAgentSliceWrapsNewSessionWithCommand(t *testing.T) {
 
 func TestAgentSliceWrapsNewSessionWithCommandAndEnv(t *testing.T) {
 	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
+	cleanupShellEnvFiles(t, "gc-test-slice-env")
 	tm, exec := newSliceTestTmux(t)
 
 	env := map[string]string{"LANG": "en_US.UTF-8", "LC_ALL": ""}
@@ -55,16 +56,28 @@ func TestAgentSliceWrapsNewSessionWithCommandAndEnv(t *testing.T) {
 	}
 	args := exec.calls[0]
 	got := args[len(args)-1]
-	// The env -u prefix must end up INSIDE the scope wrapper so the unset
-	// still applies to the agent process.
-	want := "systemd-run --user --scope --slice=gascity-agents.slice --collect --quiet -- sh -c 'env -u LC_ALL claude'"
-	if got != want {
-		t.Fatalf("pane command = %q, want %q", got, want)
+	if !strings.HasPrefix(got, "systemd-run --user --scope --slice=gascity-agents.slice --collect --quiet -- sh -c ") {
+		t.Fatalf("pane command = %q, want systemd-run scope wrapper", got)
 	}
-	// The -e session env flags must survive wrapping.
+	if !strings.Contains(got, "__gc_env=") || !strings.Contains(got, "exec claude") {
+		t.Fatalf("pane command = %q, want shell env source wrapper inside scope", got)
+	}
 	joined := strings.Join(args, "\x00")
-	if !strings.Contains(joined, "\x00-e\x00LANG=en_US.UTF-8\x00") {
-		t.Fatalf("new-session args missing LANG -e flag: %v", args)
+	if strings.Contains(joined, "\x00-e\x00") || strings.Contains(joined, "LANG=en_US.UTF-8") {
+		t.Fatalf("new-session argv leaked env values/flags: %v", args)
+	}
+	if !hasTmuxSourceFileCall(exec.calls) {
+		t.Fatalf("tmux env source-file call missing: %v", exec.calls)
+	}
+	shellFile := soleShellEnvFile(t, "gc-test-slice-env")
+	defer func() { _ = os.Remove(shellFile) }()
+	body, err := os.ReadFile(shellFile)
+	if err != nil {
+		t.Fatalf("read shell env file: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "export LANG='en_US.UTF-8'") || !strings.Contains(text, "unset LC_ALL") {
+		t.Fatalf("shell env file missing expected env lines:\n%s", text)
 	}
 }
 
@@ -152,16 +165,22 @@ func TestAgentSliceProbeFailureFallsBackPlainWithWarning(t *testing.T) {
 
 func TestAgentSliceEmptyCommandNotWrapped(t *testing.T) {
 	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
+	cleanupShellEnvFiles(t, "gc-test-empty")
 	tm, exec := newSliceTestTmux(t)
 
-	// Empty command + env-only session must keep the empty trailing arg so
-	// tmux still starts the default shell.
+	// Empty command + env-only session still needs a bootstrap shell so the
+	// default login shell inherits the source-file environment.
 	if err := tm.NewSessionWithCommandAndEnv("gc-test-empty", "/work", "", map[string]string{"LANG": "C"}); err != nil {
 		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
 	}
 	args := exec.calls[0]
-	if got := args[len(args)-1]; got != "" {
-		t.Fatalf("pane command = %q, want empty", got)
+	got := args[len(args)-1]
+	if !strings.Contains(got, "__gc_env=") || !strings.Contains(got, "exec ${SHELL:-/bin/sh} -l") {
+		t.Fatalf("pane command = %q, want env bootstrap into default shell", got)
+	}
+	joined := strings.Join(args, "\x00")
+	if strings.Contains(joined, "\x00-e\x00") || strings.Contains(joined, "LANG=C") {
+		t.Fatalf("new-session argv leaked env values/flags: %v", args)
 	}
 }
 

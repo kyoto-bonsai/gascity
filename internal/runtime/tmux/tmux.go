@@ -433,16 +433,11 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 	return nil
 }
 
-// NewSessionWithCommandAndEnv creates a new detached tmux session with environment
-// variables set via -e flags. This ensures the initial shell process inherits the
-// correct environment from the session, rather than inheriting from the tmux server
-// or parent process. The -e flags set session-level environment before the shell
-// starts, preventing stale env vars (e.g., GT_ROLE from a parent mayor session)
-// from leaking into crew/polecat shells.
-//
-// The command should still use 'exec env' for WaitForCommand detection compatibility,
-// but -e provides defense-in-depth for the initial shell environment.
-// Requires tmux >= 3.2.
+// NewSessionWithCommandAndEnv creates a new detached tmux session with the supplied
+// environment. Values are never passed through tmux argv: the pane receives them
+// from a mode-0600 shell source file, while the tmux session environment is updated
+// through a mode-0600 tmux source-file. This keeps credentials out of the process
+// table while preserving GetEnvironment/SetMeta compatibility.
 func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) error {
 	if err := validateSessionName(name); err != nil {
 		return err
@@ -450,47 +445,196 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	if err := t.probeServerAlive(); err != nil {
 		return err
 	}
+	envFiles, err := writeSessionEnvFiles(name, env)
+	if err != nil {
+		return err
+	}
+	if envFiles.shellPath != "" {
+		command = commandWithShellEnvFile(command, envFiles.shellPath)
+	}
 	args := []string{"new-session", "-d", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	// Add -e flags to set environment variables in the session before the shell starts.
-	// Keys are sorted for deterministic behavior.
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var unsetKeys []string
-	for _, k := range keys {
-		if env[k] == "" {
-			// Empty values mean "unset this var". Collect for env -u prefix.
-			unsetKeys = append(unsetKeys, k)
-		} else {
-			args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
-		}
-	}
-	// For vars that need unsetting, prefix the command with env -u flags.
-	// tmux -e sets session-level env but the shell process still inherits
-	// from the tmux server's global environment. env -u ensures the var
-	// is actually absent from the child process.
-	if len(unsetKeys) > 0 && command != "" {
-		var prefix string
-		for _, k := range unsetKeys {
-			prefix += " -u " + k
-		}
-		command = "env" + prefix + " " + command
-	}
 	// Add the command as the last argument
 	args = append(args, t.wrapPaneCommand(command))
-	_, err := t.run(args...)
+	_, err = t.run(args...)
 	if err != nil {
+		_ = removeSensitiveFile(envFiles.shellPath)
+		_ = removeSensitiveFile(envFiles.tmuxPath)
 		return err
+	}
+	if envFiles.tmuxPath != "" {
+		_, err = t.run("source-file", envFiles.tmuxPath)
+		removeErr := removeSensitiveFile(envFiles.tmuxPath)
+		if err != nil {
+			_ = removeSensitiveFile(envFiles.shellPath)
+			_ = t.KillSessionWithProcesses(name)
+			if removeErr != nil {
+				return errors.Join(err, removeErr)
+			}
+			return err
+		}
+		if removeErr != nil {
+			_ = t.KillSessionWithProcesses(name)
+			return removeErr
+		}
 	}
 	_ = t.ConfigureServer()
 	// tmux 3.3+: reset window-size from manual to latest (see NewSession).
 	t.run("set-option", "-wt", name, "window-size", "latest") //nolint:errcheck // best-effort
 	return nil
+}
+
+type sessionEnvFiles struct {
+	shellPath string
+	tmuxPath  string
+}
+
+func writeSessionEnvFiles(sessionName string, env map[string]string) (sessionEnvFiles, error) {
+	if len(env) == 0 {
+		return sessionEnvFiles{}, nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if !isEnvName(k) {
+			return sessionEnvFiles{}, fmt.Errorf("invalid environment key %q", k)
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	dir, err := ensureSessionEnvDir()
+	if err != nil {
+		return sessionEnvFiles{}, err
+	}
+	shellFile, err := writeShellEnvSourceFile(dir, sessionName, keys, env)
+	if err != nil {
+		return sessionEnvFiles{}, err
+	}
+	tmuxFile, err := writeTmuxEnvSourceFile(dir, sessionName, keys, env)
+	if err != nil {
+		_ = removeSensitiveFile(shellFile)
+		return sessionEnvFiles{}, err
+	}
+	return sessionEnvFiles{shellPath: shellFile, tmuxPath: tmuxFile}, nil
+}
+
+func ensureSessionEnvDir() (string, error) {
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf(".gc-%d", os.Getuid()), "tmux-env")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("creating tmux env dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", fmt.Errorf("chmod tmux env dir: %w", err)
+	}
+	return dir, nil
+}
+
+func writeShellEnvSourceFile(dir, sessionName string, keys []string, env map[string]string) (string, error) {
+	f, err := os.CreateTemp(dir, "gc-"+sessionName+"-*.shenv")
+	if err != nil {
+		return "", fmt.Errorf("creating shell env file: %w", err)
+	}
+	path := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("chmod shell env file: %w", err)
+	}
+	var b strings.Builder
+	for _, k := range keys {
+		if env[k] == "" {
+			fmt.Fprintf(&b, "unset %s\n", k)
+			continue
+		}
+		fmt.Fprintf(&b, "export %s=%s\n", k, shellquote.Quote(env[k]))
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		_ = f.Close()
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("writing shell env file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("closing shell env file: %w", err)
+	}
+	return path, nil
+}
+
+func writeTmuxEnvSourceFile(dir, sessionName string, keys []string, env map[string]string) (string, error) {
+	f, err := os.CreateTemp(dir, "gc-"+sessionName+"-*.tmuxenv")
+	if err != nil {
+		return "", fmt.Errorf("creating tmux env file: %w", err)
+	}
+	path := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("chmod tmux env file: %w", err)
+	}
+	var b strings.Builder
+	target := "=" + sessionName
+	for _, k := range keys {
+		if env[k] == "" {
+			fmt.Fprintf(&b, "set-environment -t %s -u %s\n", shellquote.Quote(target), k)
+			continue
+		}
+		fmt.Fprintf(&b, "set-environment -t %s %s %s\n", shellquote.Quote(target), k, shellquote.Quote(env[k]))
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		_ = f.Close()
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("writing tmux env file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("closing tmux env file: %w", err)
+	}
+	return path, nil
+}
+
+func commandWithShellEnvFile(command, shellEnvFile string) string {
+	quotedEnvFile := shellquote.Quote(shellEnvFile)
+	tail := "exec ${SHELL:-/bin/sh} -l"
+	if strings.TrimSpace(command) != "" {
+		tail = "exec " + command
+	}
+	script := fmt.Sprintf(`__gc_env=%s; . "$__gc_env"; __gc_status=$?; : > "$__gc_env"; rm -f "$__gc_env"; [ "$__gc_status" -eq 0 ] || exit "$__gc_status"; %s`, quotedEnvFile, tail)
+	return "sh -c " + shellquote.Quote(script)
+}
+
+func removeSensitiveFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		if size := info.Size(); size > 0 {
+			_ = os.WriteFile(path, make([]byte, size), 0o600)
+		}
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func isEnvName(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i, r := range key {
+		switch {
+		case r == '_':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	first := key[0]
+	return first == '_' || (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z')
 }
 
 // EnsureSessionFresh ensures a session is available and healthy.
