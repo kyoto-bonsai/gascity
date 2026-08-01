@@ -3,6 +3,9 @@ package tmux
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -45,6 +48,7 @@ func (f *fakeExecutor) executeCtx(_ context.Context, args []string) (string, err
 }
 
 func TestNewSessionWithCommandAndEnvClearsEmptyVars(t *testing.T) {
+	cleanupShellEnvFiles(t, "gc-test-locale-clear")
 	exec := &fakeExecutor{}
 	tm := NewTmux()
 	tm.exec = exec
@@ -63,12 +67,140 @@ func TestNewSessionWithCommandAndEnvClearsEmptyVars(t *testing.T) {
 
 	args := exec.calls[0]
 	joined := strings.Join(args, "\x00")
-	if !strings.Contains(joined, "\x00-e\x00LANG=en_US.UTF-8\x00") {
-		t.Fatalf("new-session args missing LANG -e flag: %v", args)
+	if strings.Contains(joined, "\x00-e\x00") {
+		t.Fatalf("new-session args must not carry -e env flags: %v", args)
 	}
-	if got := args[len(args)-1]; got != "env -u LC_ALL -u LC_CTYPE claude" {
-		t.Fatalf("command = %q, want env -u LC_ALL -u LC_CTYPE claude", got)
+	if strings.Contains(joined, "LANG=en_US.UTF-8") {
+		t.Fatalf("new-session argv leaked env value: %v", args)
 	}
+	if got := args[len(args)-1]; !strings.Contains(got, "__gc_env=") || !strings.Contains(got, "exec claude") {
+		t.Fatalf("command = %q, want shell env source wrapper around claude", got)
+	}
+	if !hasTmuxSourceFileCall(exec.calls) {
+		t.Fatalf("tmux env source-file call missing: %v", exec.calls)
+	}
+
+	shellFile := soleShellEnvFile(t, "gc-test-locale-clear")
+	defer func() { _ = os.Remove(shellFile) }()
+	body, err := os.ReadFile(shellFile)
+	if err != nil {
+		t.Fatalf("read shell env file: %v", err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"export LANG='en_US.UTF-8'",
+		"unset LC_ALL",
+		"unset LC_CTYPE",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("shell env file missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestNewSessionWithCommandAndEnvKeepsSecretsOutOfTmuxArgv(t *testing.T) {
+	cleanupShellEnvFiles(t, "gc-test-secret-argv")
+	exec := &fakeExecutor{}
+	tm := NewTmux()
+	tm.exec = exec
+
+	env := map[string]string{
+		"OPENAI_API_KEY":       "sk-proj-test-secret",
+		"GEMINI_API_KEY":       "gemini-test-secret",
+		"GOOGLE_API_KEY":       "AIzaSy-test-secret",
+		"BEADS_HOLDER_TOKEN":   "holder-test-secret",
+		"GC_INSTANCE_TOKEN":    "instance-test-secret",
+		"VISIBLE_NON_SECRET":   "plain-value",
+		"EMPTY_INHERITED_VAR":  "",
+		"QUOTED_PROVIDER_DATA": "value with spaces and 'quote'",
+	}
+	if err := tm.NewSessionWithCommandAndEnv("gc-test-secret-argv", "", "codex resume", env); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	if len(exec.calls) == 0 {
+		t.Fatal("no tmux calls recorded")
+	}
+
+	for _, call := range exec.calls {
+		joined := strings.Join(call, "\x00")
+		for _, forbidden := range []string{
+			"sk-proj-test-secret",
+			"gemini-test-secret",
+			"AIzaSy-test-secret",
+			"holder-test-secret",
+			"instance-test-secret",
+			"plain-value",
+			"value with spaces",
+			"\x00-e\x00",
+		} {
+			if strings.Contains(joined, forbidden) {
+				t.Fatalf("tmux argv leaked %q in call %v", forbidden, call)
+			}
+		}
+	}
+	if !hasTmuxSourceFileCall(exec.calls) {
+		t.Fatalf("tmux env source-file call missing: %v", exec.calls)
+	}
+
+	shellFile := soleShellEnvFile(t, "gc-test-secret-argv")
+	defer func() { _ = os.Remove(shellFile) }()
+	body, err := os.ReadFile(shellFile)
+	if err != nil {
+		t.Fatalf("read shell env file: %v", err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"export OPENAI_API_KEY='sk-proj-test-secret'",
+		"export GOOGLE_API_KEY='AIzaSy-test-secret'",
+		"unset EMPTY_INHERITED_VAR",
+		"export QUOTED_PROVIDER_DATA='value with spaces and '\\''quote'\\'''",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("shell env file missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func hasTmuxSourceFileCall(calls [][]string) bool {
+	for _, call := range calls {
+		for i, arg := range call {
+			if arg == "source-file" && i+1 < len(call) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func soleShellEnvFile(t *testing.T, sessionName string) string {
+	t.Helper()
+	matches := shellEnvFiles(t, sessionName)
+	if len(matches) != 1 {
+		t.Fatalf("shell env files for %s = %v, want exactly 1", sessionName, matches)
+	}
+	return matches[0]
+}
+
+func cleanupShellEnvFiles(t *testing.T, sessionName string) {
+	t.Helper()
+	for _, path := range shellEnvFiles(t, sessionName) {
+		_ = os.Remove(path)
+	}
+	t.Cleanup(func() {
+		for _, path := range shellEnvFiles(t, sessionName) {
+			_ = os.Remove(path)
+		}
+	})
+}
+
+func shellEnvFiles(t *testing.T, sessionName string) []string {
+	t.Helper()
+	pattern := filepath.Join(os.TempDir(), fmt.Sprintf(".gc-%d", os.Getuid()), "tmux-env", "gc-"+sessionName+"-*.shenv")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("glob shell env file: %v", err)
+	}
+	return matches
 }
 
 // The controller token is withheld from agent panes by an EMPTY value, not by
@@ -78,7 +210,14 @@ func TestNewSessionWithCommandAndEnvClearsEmptyVars(t *testing.T) {
 // flag, because -e alone would leave the tmux server's global copy visible to
 // the shell. A key the caller dropped emits neither, which is why dropping
 // withholds nothing.
+// Withholding is now carried by the shell env source file (ga-mwylzp/f486366f4
+// rebase resolution), not an `env -u` argv prefix: NewSessionWithCommandAndEnv
+// stages every value, so there is no bare `-e KEY=` for a withheld key to avoid
+// in the first place, and the assertion moves to the file the pane actually
+// sources. End-to-end coverage against a real pane child lives in
+// TestNewSessionWithCommandAndEnvWithholdsEmptyVarFromPaneChild (tmux_test.go).
 func TestNewSessionWithCommandAndEnvUnsetsControllerToken(t *testing.T) {
+	cleanupShellEnvFiles(t, "gc-test-token-pin")
 	exec := &fakeExecutor{}
 	tm := NewTmux()
 	tm.exec = exec
@@ -99,8 +238,15 @@ func TestNewSessionWithCommandAndEnvUnsetsControllerToken(t *testing.T) {
 	if strings.Contains(joined, "\x00-e\x00GC_CONTROLLER_TOKEN=") {
 		t.Fatalf("new-session exported GC_CONTROLLER_TOKEN with -e instead of unsetting it: %v", args)
 	}
-	if got := args[len(args)-1]; got != "env -u GC_CONTROLLER_TOKEN claude" {
-		t.Fatalf("command = %q, want %q", got, "env -u GC_CONTROLLER_TOKEN claude")
+
+	shellFile := soleShellEnvFile(t, "gc-test-token-pin")
+	defer func() { _ = os.Remove(shellFile) }()
+	body, err := os.ReadFile(shellFile)
+	if err != nil {
+		t.Fatalf("read shell env file: %v", err)
+	}
+	if !strings.Contains(string(body), "unset GC_CONTROLLER_TOKEN") {
+		t.Fatalf("shell env file did not unset GC_CONTROLLER_TOKEN:\n%s", body)
 	}
 }
 
@@ -663,7 +809,21 @@ func TestMarkSessionEnvRemovedFailsClosedWhenSessionIsAlive(t *testing.T) {
 
 // The create path must ALSO plant the durable marker, not only the one-shot
 // prefix — otherwise the very first relaunch of a freshly provisioned box leaks.
+// Durable session-environment removal is now carried by the tmux env source
+// file's own `set-environment -u` lines (ga-mwylzp/f486366f4 rebase
+// resolution), written for every empty-valued key unconditionally — not just
+// the markSessionEnvRemoved-selected controller/BEADS_ subset a bare `-r`
+// argv call would show (that selective distinction, see durableWithholdKeys,
+// still matters for adapter.go's separate respawn call site, not this one).
+// NewSessionWithCommandAndEnv shreds the tmux env file (removeSensitiveFile)
+// immediately after a successful source-file, so unlike the shell env file —
+// whose own cleanup is text inside a command the fake executor never actually
+// runs — there is nothing left on disk to inspect post-hoc here; this pins
+// the mechanism (file written, sourced, no bare -e for the token) rather than
+// re-deriving its content. TestNewSessionWithCommandAndEnvWithholdsEmptyVarFromPaneChild
+// (tmux_test.go) is the real, end-to-end proof the removal actually works.
 func TestNewSessionWithCommandAndEnvMarksUnsetKeysRemovedFromSessionEnv(t *testing.T) {
+	cleanupShellEnvFiles(t, "gc-test-token-pin")
 	exec := &fakeExecutor{}
 	tm := NewTmux()
 	tm.exec = exec
@@ -676,18 +836,12 @@ func TestNewSessionWithCommandAndEnvMarksUnsetKeysRemovedFromSessionEnv(t *testi
 	if err := tm.NewSessionWithCommandAndEnv("gc-test-token-pin", "", "claude", env); err != nil {
 		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
 	}
-
-	var marked bool
-	for _, call := range exec.calls {
-		joined := strings.Join(call, " ")
-		if strings.Contains(joined, "set-environment") && strings.Contains(joined, "-r GC_CONTROLLER_TOKEN") {
-			marked = true
-		}
-		if strings.Contains(joined, "set-environment") && strings.Contains(joined, "CLAUDECODE") {
-			t.Errorf("new-session marked the nesting flag CLAUDECODE in the session env: %v", call)
-		}
+	if !hasTmuxSourceFileCall(exec.calls) {
+		t.Fatalf("tmux env source-file call missing: %v", exec.calls)
 	}
-	if !marked {
-		t.Errorf("new-session never marked GC_CONTROLLER_TOKEN removed from the session env; the first respawn would leak it: %v", exec.calls)
+	create := exec.calls[0]
+	joined := strings.Join(create, "\x00")
+	if strings.Contains(joined, "\x00-e\x00GC_CONTROLLER_TOKEN=") {
+		t.Fatalf("new-session exported GC_CONTROLLER_TOKEN with -e instead of unsetting it: %v", create)
 	}
 }
