@@ -5748,6 +5748,13 @@
               "null"
             ]
           },
+          "MaxSeats": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "Name": {
             "type": "string"
           },
@@ -5793,6 +5800,7 @@
           "PromptFlag",
           "ReadyDelayMs",
           "AcceptStartupDialogs",
+          "MaxSeats",
           "Env",
           "EnvRemove",
           "Replace"
