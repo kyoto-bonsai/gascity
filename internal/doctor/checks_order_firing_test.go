@@ -382,6 +382,71 @@ func TestOrderFiringCurrent_Stale(t *testing.T) {
 	}
 }
 
+func TestOrderFiringCurrent_StaleWithParkedPool_IsAdvisory(t *testing.T) {
+	// ga-gfdfdc: mol-dog-stale-db is routed to the "dog" pool, which is
+	// deliberately scaled to zero standing instances (min_active_sessions=0,
+	// doctrine/token-cost-evaluation-2026-06-07.md — "dog is min=0/stopped").
+	// Staleness there reflects the intended scaling policy, not a
+	// detection-worthy outage, so it must stay visible (Status still Error)
+	// but must not gate BlockingFailed the way a live pool's staleness does.
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	cfg.Agents = []config.Agent{{Name: "dog", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}
+	writeOrderFiringRawOrder(t, cityPath, "mol-dog-stale-db", `[order]
+formula = "mol-dog-stale-db"
+trigger = "cron"
+schedule = "0 */4 * * *"
+pool = "dog"
+`)
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "mol-dog-stale-db", Ts: now.Add(-13 * time.Hour)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "(CRITICAL: stale)") {
+		t.Fatalf("details = %v, want stale detail preserved for visibility", result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "pool scaled to 0 standing instances") {
+		t.Fatalf("details = %v, want parked-pool annotation", result.Details)
+	}
+	if result.Severity != SeverityAdvisory {
+		t.Fatalf("Severity = %v, want SeverityAdvisory for a stale order whose pool is parked (min=0)", result.Severity)
+	}
+}
+
+func TestOrderFiringCurrent_StaleWithLiveMinPool_StaysBlocking(t *testing.T) {
+	// Adjacent-class control for the parked-pool advisory carve-out above: a
+	// pool with a real standing minimum (min_active_sessions=1) that still
+	// fails to fire its order is a genuine outage and must keep gating
+	// BlockingFailed — the carve-out must not blanket every pool-routed order,
+	// only ones whose pool is deliberately scaled to zero.
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	cfg.Agents = []config.Agent{{Name: "dog", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(2)}}
+	writeOrderFiringRawOrder(t, cityPath, "mol-dog-stale-db", `[order]
+formula = "mol-dog-stale-db"
+trigger = "cron"
+schedule = "0 */4 * * *"
+pool = "dog"
+`)
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "mol-dog-stale-db", Ts: now.Add(-13 * time.Hour)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if result.Severity != SeverityBlocking {
+		t.Fatalf("Severity = %v, want SeverityBlocking — pool has a live standing minimum, so staleness is a real outage", result.Severity)
+	}
+}
+
 func TestOrderFiringCurrent_IgnoresManualAndEventTriggers(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
