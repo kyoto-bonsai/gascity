@@ -327,6 +327,15 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// (gc -> bd.real -> dolt) that operators routinely misread as CPU saturation.
 	// Advisory + read-only (/proc/stat); no config needed.
 	register(newForkRateCheck())
+	// Build-lineage drift guards (ga-tk5mcg.11.4, Unit D). Host-level, no
+	// city config needed — catch the recurring failure mode where a new gc
+	// binary is built from a stale/wrong base and silently drops local-only
+	// hardening that never merged upstream (ga-tk5mcg.11, confirmed for real
+	// by ga-89t7e2). Both degrade to advisory when their precondition isn't
+	// met on this host (no source checkout, no go toolchain) rather than
+	// ever blocking doctor on an environment where they're not applicable.
+	register(doctor.NewBuildLineageStalenessCheck())
+	register(doctor.NewHardeningSymbolsCheck())
 	if cfgErr == nil && doctorWorkspaceHasPostgresScope(cityPath, cfg) {
 		register(doctorchecks.NewPostgresAuthCheck(cityPath, cfg))
 	}
