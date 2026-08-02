@@ -729,7 +729,7 @@ func checkTargetDispatchable(opts SlingOpts, deps SlingDeps) error {
 // handle this case, so refusing here first would block the one flag that
 // already fixes it.
 func shouldCheckTargetAssigneeConflict(opts SlingOpts) bool {
-	return !opts.Reassign && !opts.IsFormula && !(opts.DryRun && opts.InlineText)
+	return !opts.Reassign && !opts.IsFormula && (!opts.DryRun || !opts.InlineText)
 }
 
 // checkTargetAssigneeConflict refuses to route opts.BeadOrFormula onto
