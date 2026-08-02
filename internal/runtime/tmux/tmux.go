@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1861,8 +1862,19 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	sendEnter := func() error { _, err := t.run("send-keys", "-t", target, "Enter"); return err }
 	wake := func() { t.WakePaneIfDetached(session) }
 	if t.submitVerifyEligible(target) {
-		if _, err := submitEnterAndConfirm(sendEnter, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep); err != nil {
+		confirmed, err := submitEnterAndConfirm(sendEnter, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep)
+		if err != nil {
 			return fmt.Errorf("failed to send Enter: %w", err)
+		}
+		if !confirmed {
+			// Enter reached tmux on every attempt but the pane never went busy
+			// within budget. This still fail-opens by the historical "nil ==
+			// handed to tmux" contract below, so the caller sees success even
+			// though the message may be drafted but never actually submitted
+			// (ga-9rqtdh). Logged so that failure mode is measurable instead
+			// of silent, pending a decision on whether the contract itself
+			// should change.
+			log.Printf("tmux nudge: submit Enter delivered to %q after %d attempt(s) but busy-transition never observed — message may be drafted but not submitted (see ga-9rqtdh)", target, submitEnterMaxSends)
 		}
 		return nil
 	}
