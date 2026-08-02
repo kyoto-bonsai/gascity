@@ -460,16 +460,30 @@ func orderFiringCurrentOrderSuspended(suspended map[string]bool, order orders.Or
 
 // orderFiringCurrentZeroMinPools returns the set of agent identities
 // (both QualifiedName and bare Name, to tolerate however order.Pool happens
-// to be spelled) whose min_active_sessions resolves to zero — i.e. pools
-// deliberately scaled to no standing instances rather than pools that
-// should be running and aren't.
+// to be spelled) whose min_active_sessions is EXPLICITLY zero — i.e. pools
+// deliberately scaled to no standing instances, not pools that simply never
+// configured the field.
+//
+// Deliberately checks a.MinActiveSessions == nil (unset) vs *a.MinActiveSessions
+// == 0 (explicit) directly, rather than EffectiveMinActiveSessions() > 0: that
+// helper treats nil and explicit-0 identically (both scale to zero), which is
+// correct for its own callers (a scaling floor, where "no minimum configured"
+// and "minimum configured to zero" behave the same) but wrong here, where the
+// question isn't "how many standing instances does this pool scale to" but
+// "did an operator assert this pool is parked on purpose." 88 of this city's
+// 92 agents simply never set the field; treating that as an assertion of
+// intent would silently make order-firing-current permanently advisory for
+// the next cron/cooldown order routed to any of them (persona-marcus
+// validation, ga-gfdfdc, 2026-08-02) — the same blindness this check exists
+// to catch, one step later. MinActiveSessions != nil as the intent
+// discriminator matches the existing precedent at session_capacity.go:123.
 func orderFiringCurrentZeroMinPools(cfg *config.City) map[string]bool {
 	out := make(map[string]bool)
 	if cfg == nil {
 		return out
 	}
 	for _, a := range cfg.Agents {
-		if a.EffectiveMinActiveSessions() > 0 {
+		if a.MinActiveSessions == nil || *a.MinActiveSessions != 0 {
 			continue
 		}
 		if qn := a.QualifiedName(); qn != "" {
