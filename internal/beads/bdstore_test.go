@@ -4390,15 +4390,26 @@ func TestBdStoreListBothTiersUnionsBdListAndEphemeralQuery(t *testing.T) {
 // Limit on BOTH the bd-list and bd-query legs of a TierBoth read regardless of
 // what the caller asked for — an unbounded full scan on every named-persona
 // mail read under Dolt load. AssigneesAreAliases exempts exactly this case.
+// TestBdStoreListBothTiersAssigneeAliasesAppliesLimit pins the ga-0pg093
+// fix shape: one Limit-bounded, ASSIGNEE-FILTERED query per alias, merged —
+// not a single Limit-bounded query with no assignee predicate at all. The
+// prior version of this test asserted the opposite (no assignee= clause
+// pushed for a multi-alias query); that was the unsafe combination this bug
+// shipped as desired behavior — see ga-0pg093. The mock here is
+// assignee-aware specifically so the test can tell "found this alias's own
+// wisp" apart from "found whatever the fixture always returns."
 func TestBdStoreListBothTiersAssigneeAliasesAppliesLimit(t *testing.T) {
 	var calls []string
 	runner := func(_, name string, args ...string) ([]byte, error) {
 		full := name + " " + strings.Join(args, " ")
 		calls = append(calls, full)
 		if strings.HasPrefix(full, "bd query ") {
-			return []byte(`[
-				{"id":"bd-w","title":"wisp for persona","status":"open","issue_type":"message","assignee":"persona-marcus","created_at":"2026-05-02T00:00:00Z","ephemeral":true}
-			]`), nil
+			if strings.Contains(full, "assignee=persona-marcus") {
+				return []byte(`[
+					{"id":"bd-w","title":"wisp for persona","status":"open","issue_type":"message","assignee":"persona-marcus","created_at":"2026-05-02T00:00:00Z","ephemeral":true}
+				]`), nil
+			}
+			return []byte(`[]`), nil
 		}
 		if !strings.HasPrefix(full, "bd list ") {
 			return nil, fmt.Errorf("unexpected: %s", full)
@@ -4418,18 +4429,33 @@ func TestBdStoreListBothTiersAssigneeAliasesAppliesLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got[0].ID != "bd-w" {
-		t.Fatalf("got = %+v, want the one matching wisp", got)
+		t.Fatalf("got = %+v, want the one matching wisp found via its own alias's query", got)
 	}
-	listCmd := firstCommandWithPrefix(calls, "bd list ")
-	queryCmd := firstCommandWithPrefix(calls, "bd query ")
-	if !strings.Contains(listCmd, "--limit 500") {
-		t.Fatalf("bd list command = %q, want --limit 500 for a single live session's own route aliases", listCmd)
+	queryCalls := commandsWithPrefix(calls, "bd query ")
+	if len(queryCalls) != 3 {
+		t.Fatalf("bd query calls = %v, want exactly one per alias (3)", queryCalls)
 	}
-	if !strings.Contains(queryCmd, "--limit 500") {
-		t.Fatalf("bd query command = %q, want --limit 500, not an unbounded full scan", queryCmd)
+	for _, alias := range []string{"persona-marcus", "sess-1", "qo-marcus-2"} {
+		cmd := firstCommandWithPrefix(queryCalls, "bd query --json ephemeral=true AND status=open AND type=message AND assignee="+alias)
+		if cmd == "" {
+			t.Fatalf("bd query calls = %v, want one carrying assignee=%s", queryCalls, alias)
+		}
+		if !strings.Contains(cmd, "--limit 500") {
+			t.Fatalf("bd query command = %q, want --limit 500 per alias, not an unbounded full scan", cmd)
+		}
 	}
-	if strings.Contains(queryCmd, "assignee=") {
-		t.Fatalf("bd query command = %q, must not push a single-value assignee clause for a 3-route query", queryCmd)
+	listCalls := commandsWithPrefix(calls, "bd list ")
+	if len(listCalls) != 3 {
+		t.Fatalf("bd list calls = %v, want exactly one per alias (3)", listCalls)
+	}
+	for _, alias := range []string{"persona-marcus", "sess-1", "qo-marcus-2"} {
+		cmd := firstCommandWithPrefix(listCalls, "bd list --json --assignee="+alias)
+		if cmd == "" {
+			t.Fatalf("bd list calls = %v, want one carrying --assignee=%s", listCalls, alias)
+		}
+		if !strings.Contains(cmd, "--limit 500") {
+			t.Fatalf("bd list command = %q, want --limit 500 per alias, not an unbounded full scan", cmd)
+		}
 	}
 }
 
@@ -4679,6 +4705,16 @@ func firstCommandWithPrefix(calls []string, prefix string) string {
 		}
 	}
 	return ""
+}
+
+func commandsWithPrefix(calls []string, prefix string) []string {
+	var matched []string
+	for _, call := range calls {
+		if strings.HasPrefix(call, prefix) {
+			matched = append(matched, call)
+		}
+	}
+	return matched
 }
 
 func TestBdStoreListBothTiersReturnsWholeReadError(t *testing.T) {

@@ -2294,6 +2294,9 @@ func (s *BdStore) List(query ListQuery) ([]Bead, error) {
 
 func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	serverQuery, clientFilteredAssignees := bdServerQueryForAssignees(query)
+	if clientFilteredAssignees && query.AssigneesAreAliases {
+		return s.listByAliasesUnion(query, s.listViaBDList)
+	}
 	limit := serverQuery.Limit
 	if bdListRequiresClientLimit(query, serverQuery, clientFilteredAssignees) {
 		limit = 0
@@ -2370,12 +2373,15 @@ func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssig
 	if serverQuery.Sort == SortCreatedAsc {
 		return true
 	}
-	// clientFilteredAssignees alone would force an unbounded fetch — the same
-	// class of defect ga-jcnrqn found in listEphemeral's sibling wisps-tier
-	// query — but AssigneesAreAliases callers get the same Limit-safety
-	// argument already accepted for the zero-assignee AllowScan case (see
-	// ListQuery.AssigneesAreAliases).
-	if clientFilteredAssignees && !query.AssigneesAreAliases {
+	// clientFilteredAssignees forces an unbounded fetch — the same class of
+	// defect ga-jcnrqn found in listEphemeral's sibling wisps-tier query.
+	// AssigneesAreAliases callers never reach here with clientFilteredAssignees
+	// true: listViaBDList intercepts that combination earlier and fans out
+	// through listByAliasesUnion instead (ga-0pg093), so no exemption is
+	// needed — a query that actually gets this far and is client-filtered is,
+	// by construction, a genuine multi-recipient filter that must not be
+	// server-limited ahead of the filter.
+	if clientFilteredAssignees {
 		return true
 	}
 	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() {
@@ -2414,6 +2420,59 @@ func bdServerQueryForAssignees(query ListQuery) (ListQuery, bool) {
 	}
 }
 
+// listByAliasesUnion resolves an AssigneesAreAliases query by issuing one
+// Limit-bounded, server-filtered query per alias via fn (listViaBDList or
+// listEphemeral) and merging the results, instead of applying Limit to a
+// single unfiltered scan across every recipient (ga-0pg093: the latter can
+// crowd the recipient's own mail entirely out of the window with other
+// recipients' newer messages).
+//
+// Bounding each sub-query to query.Limit is sufficient, not just convenient:
+// any bead that belongs in the true top-Limit set across the whole alias
+// union must also rank within its own alias's top-Limit (removing every
+// other alias's beads from consideration can only improve a bead's rank
+// within its own alias's results). So the merged, re-sorted, re-truncated
+// output here is exactly the same top-Limit set an unbounded scan would have
+// produced — this is not a heuristic, it is the standard top-K-merge-from-
+// sorted-partitions argument.
+func (s *BdStore) listByAliasesUnion(query ListQuery, fn func(ListQuery) ([]Bead, error)) ([]Bead, error) {
+	merged := make([]Bead, 0, len(query.Assignees))
+	seen := make(map[string]bool, len(query.Assignees))
+	var errs []error
+	for _, alias := range query.Assignees {
+		aliasQuery := query
+		aliasQuery.Assignee = alias
+		aliasQuery.Assignees = nil
+		aliasQuery.AssigneesAreAliases = false
+		got, err := fn(aliasQuery)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("assignee %s: %w", alias, err))
+			continue
+		}
+		for _, b := range got {
+			if seen[b.ID] {
+				continue
+			}
+			seen[b.ID] = true
+			merged = append(merged, b)
+		}
+	}
+
+	sortBeadsForQuery(merged, query.Sort)
+	if query.Limit > 0 && len(merged) > query.Limit {
+		merged = merged[:query.Limit]
+	}
+
+	if len(errs) == 0 {
+		return merged, nil
+	}
+	joined := errors.Join(errs...)
+	if len(merged) > 0 {
+		return merged, &PartialResultError{Op: "list by assignee aliases", Err: joined}
+	}
+	return merged, joined
+}
+
 func (s *BdStore) listWispsTier(query ListQuery) ([]Bead, error) {
 	listQ := query
 	listQ.TierMode = TierWisps
@@ -2431,11 +2490,15 @@ func (s *BdStore) listWispsTier(query ListQuery) ([]Bead, error) {
 // TierWisps and TierBoth must union this path with bd list results.
 func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
 	serverQuery, clientFilteredAssignees := bdServerQueryForAssignees(query)
+	if clientFilteredAssignees && query.AssigneesAreAliases {
+		return s.listByAliasesUnion(query, s.listEphemeral)
+	}
 	clauses := []string{"ephemeral=true"}
-	// AssigneesAreAliases exempts the multi-alias-of-one-recipient case from
-	// the usual clientFilteredAssignees Limit veto — see ListQuery's doc and
-	// bdListRequiresClientLimit's sibling exemption for the bd-list tier.
-	serverFilteredOnly := !clientFilteredAssignees || query.AssigneesAreAliases
+	// A query that reaches here with clientFilteredAssignees true is, by
+	// construction, a genuine multi-recipient filter (the AssigneesAreAliases
+	// case fans out through listByAliasesUnion above instead) — the same
+	// unbounded-fetch requirement as bdListRequiresClientLimit's bd-list tier.
+	serverFilteredOnly := !clientFilteredAssignees
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "label", serverQuery.Label)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "status", serverQuery.Status)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "type", serverQuery.Type)
