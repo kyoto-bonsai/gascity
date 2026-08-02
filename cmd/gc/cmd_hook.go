@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -915,10 +916,11 @@ func workQueryHasReadyWork(output string) bool {
 
 // filterUnreadyHookCandidates strips beads from work_query output that fail
 // bd ready semantics: future defer_until, any open blocking dep in the row's
-// blocked_by array, or the row's own is_blocked / status=="blocked" marker.
-// The work_query is expected to gate these, but defensive filtering here
-// prevents a single broken query from cascading into agent action on a bead
-// it cannot progress.
+// blocked_by array, the row's own is_blocked / status=="blocked" marker, or a
+// non-empty gc.awaiting marker (parked on a decision/dependency/validator
+// outside this session's control, ga-5g6wdx). The work_query is expected to
+// gate these, but defensive filtering here prevents a single broken query
+// from cascading into agent action on a bead it cannot progress.
 // Pure function over JSON; takes time.Time so tests stay deterministic.
 func filterUnreadyHookCandidates(output string, now time.Time) string {
 	if output == "" {
@@ -949,6 +951,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			continue
 		}
 		if isSelfBlockedHookCandidate(obj) {
+			continue
+		}
+		if isAwaitingHookCandidate(obj) {
 			continue
 		}
 		filtered = append(filtered, obj)
@@ -1020,6 +1025,27 @@ func isSelfBlockedHookCandidate(item map[string]any) bool {
 func isClosedHookCandidate(item map[string]any) bool {
 	status, ok := item["status"].(string)
 	return ok && strings.EqualFold(strings.TrimSpace(status), "closed")
+}
+
+// isAwaitingHookCandidate reports whether item carries a non-empty
+// gc.awaiting metadata value — parked on an operator decision, a named
+// dependency, a validator, or a human edit, per this fleet's convention
+// (ga-5g6wdx). This is a status/assignee-independent park: an awaiting bead
+// can be status=in_progress with an assignee that matches this session's own
+// identity (looking exactly like the caller's own live work to
+// hookClaimExistingOrAssigned's adoption check) or status=open with an empty
+// assignee (looking exactly like ready pool work to
+// claimFirstEligibleHookCandidate). Filtering it here, upstream of both claim
+// paths, is the single choke point that protects both: a bead genuinely
+// awaiting a human/validator/dependency decision is not "ready work" for
+// ambient claiming regardless of which shape it happens to take.
+func isAwaitingHookCandidate(item map[string]any) bool {
+	meta, ok := item["metadata"].(map[string]any)
+	if !ok {
+		return false
+	}
+	awaiting, ok := meta[beadmeta.AwaitingMetadataKey].(string)
+	return ok && strings.TrimSpace(awaiting) != ""
 }
 
 func normalizeWorkQueryOutput(output string) string {
