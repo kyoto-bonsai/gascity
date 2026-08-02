@@ -319,3 +319,102 @@ func TestDoHookClaimSkipsBlockedRoutedHeadAndClaimsReadyBehindIt(t *testing.T) {
 		t.Fatalf("claimedBead = %q, want ready-behind (blocked-head must be skipped)", claimedBead)
 	}
 }
+
+// TestDoHookClaimSkipsAwaitingCloseDecisionExistingAssignment pins the
+// ga-owbb42 repro from ga-5g6wdx: a bead already status=in_progress with an
+// assignee matching this session's own identity candidates would normally be
+// adopted by hookClaimExistingOrAssigned as "your own existing work" — but
+// when it also carries gc.awaiting=close_decision, it is parked on an officer
+// ruling, not live work for this session to resume. The hook must fall
+// through to genuinely ready pool work instead of adopting the parked bead
+// (and must never attempt a claim mutation against it — adoption reads the
+// bead as-is, it does not call Claim, so any Claim attempt on the parked id
+// here would itself indicate a regression to a different code path).
+func TestDoHookClaimSkipsAwaitingCloseDecisionExistingAssignment(t *testing.T) {
+	candidates := []beads.Bead{
+		{
+			ID:       "ga-owbb42",
+			Status:   "in_progress",
+			Assignee: "worker-1",
+			Metadata: map[string]string{"gc.awaiting": "close_decision"},
+		},
+		{ID: "ga-ready", Status: "open", Metadata: map[string]string{"gc.routed_to": "route-1"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	var attempts []string
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) { return string(output), nil },
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			attempts = append(attempts, beadID)
+			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress"}, true, nil
+		},
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if got := strings.Join(attempts, ","); got != "ga-ready" {
+		t.Fatalf("claim attempts = %q, want only ga-ready (ga-owbb42 is parked on gc.awaiting=close_decision and must never be adopted or attempted)", got)
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.BeadID != "ga-ready" || result.Reason == "existing_assignment" || result.Reason == "ready_assignment" {
+		t.Fatalf("result = %+v, want a fresh claim of ga-ready, not adoption of the parked bead", result)
+	}
+}
+
+// TestDoHookClaimSkipsAwaitingValidatorPoolCandidate pins the ga-8lyhtw repro
+// from ga-5g6wdx: an unassigned, route-matched, status=open bead looks
+// exactly like ready pool work to claimFirstEligibleHookCandidate, but a
+// gc.awaiting=validator marker means it is finished work parked for a
+// specific (likely non-self) validator to pick up explicitly — not ambient
+// work for whichever session's hook tick reaches it first. The hook must
+// skip it and claim genuinely ready work instead.
+func TestDoHookClaimSkipsAwaitingValidatorPoolCandidate(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "ga-8lyhtw", Status: "open", Metadata: map[string]string{"gc.awaiting": "validator", "gc.routed_to": "route-1"}},
+		{ID: "ga-ready", Status: "open", Metadata: map[string]string{"gc.routed_to": "route-1"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	var attempts []string
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) { return string(output), nil },
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			attempts = append(attempts, beadID)
+			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress"}, true, nil
+		},
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if got := strings.Join(attempts, ","); got != "ga-ready" {
+		t.Fatalf("claim attempts = %q, want only ga-ready (ga-8lyhtw is parked on gc.awaiting=validator and must never be claimed)", got)
+	}
+}

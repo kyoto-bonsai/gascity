@@ -2734,3 +2734,67 @@ func TestFilterUnreadyHookCandidatesExcludesClosedBeadsFromReworkDrift(t *testin
 		t.Fatalf("filterUnreadyHookCandidates returned %d items for closed bead, want 0; got %q", len(items), got)
 	}
 }
+
+// TestFilterUnreadyHookCandidatesExcludesAwaitingBeads guards ga-5g6wdx: a bead
+// parked on ANY non-empty gc.awaiting value (close_decision, validator,
+// operator_decision, a named dependency, ...) is not ready work for ambient
+// claiming, regardless of its status/assignee shape. Covers both live repro
+// shapes in one table: an in_progress bead assigned to a matching identity
+// (the ga-owbb42 shape, which would otherwise reach
+// hookClaimExistingOrAssigned's adoption check) and an open, unassigned bead
+// (the ga-8lyhtw shape, which would otherwise reach
+// claimFirstEligibleHookCandidate's pool-claim path) — filterUnreadyHookCandidates
+// runs upstream of both, so one fix protects both paths.
+func TestFilterUnreadyHookCandidatesExcludesAwaitingBeads(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "in_progress assigned bead awaiting close_decision",
+			input: `[{"id":"ga-owbb42","status":"in_progress","assignee":"persona-marcus-ga-1gi2yl","metadata":{"gc.awaiting":"close_decision"}}]`,
+		},
+		{
+			name:  "open unassigned bead awaiting validator",
+			input: `[{"id":"ga-8lyhtw","status":"open","metadata":{"gc.awaiting":"validator"}}]`,
+		},
+		{
+			name:  "open unassigned bead awaiting a named dependency",
+			input: `[{"id":"ga-fuavfl","status":"open","metadata":{"gc.awaiting":"dependency:nils-standdown-2026-08-02"}}]`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterUnreadyHookCandidates(tc.input, now)
+			var items []map[string]any
+			if err := json.Unmarshal([]byte(got), &items); err != nil {
+				t.Fatalf("unmarshal result: %v; raw=%q", err, got)
+			}
+			if len(items) != 0 {
+				t.Fatalf("filterUnreadyHookCandidates returned %d items for an awaiting-parked bead, want 0; got %q", len(items), got)
+			}
+		})
+	}
+}
+
+// TestFilterUnreadyHookCandidatesKeepsBeadsWithoutAwaiting is the discriminating
+// control for the exclusion above: an empty gc.awaiting value and an absent
+// gc.awaiting key must both still pass through as ready. Without this, a
+// filter bug that dropped every candidate (not just awaiting-parked ones)
+// would pass the exclusion tests above vacuously.
+func TestFilterUnreadyHookCandidatesKeepsBeadsWithoutAwaiting(t *testing.T) {
+	now := time.Now()
+	input := `[
+		{"id":"ga-no-key","status":"open","metadata":{"gc.routed_to":"worker"}},
+		{"id":"ga-empty-awaiting","status":"open","metadata":{"gc.awaiting":"","gc.routed_to":"worker"}}
+	]`
+	got := filterUnreadyHookCandidates(input, now)
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(got), &items); err != nil {
+		t.Fatalf("unmarshal result: %v; raw=%q", err, got)
+	}
+	if len(items) != 2 {
+		t.Fatalf("filterUnreadyHookCandidates returned %d items, want 2 (no false-positive exclusion); got %q", len(items), got)
+	}
+}
