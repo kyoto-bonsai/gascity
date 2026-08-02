@@ -146,6 +146,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	// stay visible without converting an advisory error into a blocking gate.
 	var blockingErrors, advisoryErrors int
 	suspendedRigs := orderFiringCurrentSuspendedRigs(c.cfg)
+	zeroMinPools := orderFiringCurrentZeroMinPools(c.cfg)
 
 	for _, order := range allOrders {
 		if order.Trigger != "cron" && order.Trigger != "cooldown" {
@@ -175,7 +176,8 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt)
+		poolParked := orderFiringCurrentOrderPoolParked(zeroMinPools, order)
+		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt, poolParked)
 		worst = worseStatus(worst, status)
 		result.Details = append(result.Details, detail)
 		if status != StatusOK {
@@ -345,6 +347,51 @@ func orderFiringCurrentOrderSuspended(suspended map[string]bool, order orders.Or
 	// Defensive support for legacy qualified pool values. Bare pool names parse
 	// with an empty rig and intentionally do not imply suspension by themselves.
 	if rigName, _ := config.ParseQualifiedName(order.Pool); rigName != "" && suspended[rigName] {
+		return true
+	}
+	return false
+}
+
+// orderFiringCurrentZeroMinPools returns the set of agent identities
+// (both QualifiedName and bare Name, to tolerate however order.Pool happens
+// to be spelled) whose min_active_sessions resolves to zero — i.e. pools
+// deliberately scaled to no standing instances rather than pools that
+// should be running and aren't.
+func orderFiringCurrentZeroMinPools(cfg *config.City) map[string]bool {
+	out := make(map[string]bool)
+	if cfg == nil {
+		return out
+	}
+	for _, a := range cfg.Agents {
+		if a.EffectiveMinActiveSessions() > 0 {
+			continue
+		}
+		if qn := a.QualifiedName(); qn != "" {
+			out[qn] = true
+		}
+		if a.Name != "" {
+			out[a.Name] = true
+		}
+	}
+	return out
+}
+
+// orderFiringCurrentOrderPoolParked reports whether order's backing pool is a
+// deliberately-scaled-to-zero pool (min_active_sessions=0): a cron/cooldown
+// order routed there has no standing agent to pick it up, so its staleness
+// reflects an intentional scaling policy rather than a detection-worthy
+// outage (ga-gfdfdc). Matches order.Pool the same tolerant way
+// orderFiringCurrentOrderSuspended matches order.Rig: exact string first,
+// then its unqualified name via ParseQualifiedName.
+func orderFiringCurrentOrderPoolParked(zeroMinPools map[string]bool, order orders.Order) bool {
+	pool := strings.TrimSpace(order.Pool)
+	if pool == "" {
+		return false
+	}
+	if zeroMinPools[pool] {
+		return true
+	}
+	if _, name := config.ParseQualifiedName(pool); name != "" && zeroMinPools[name] {
 		return true
 	}
 	return false
@@ -594,20 +641,32 @@ func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
 	return latest
 }
 
-func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
+func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time, poolParked bool) (CheckStatus, CheckSeverity, string) {
 	name := orderDisplayName(order)
+	// A pool deliberately scaled to zero standing instances (min_active_sessions=0)
+	// has no agent to pick up cron/cooldown work; staleness there is the expected,
+	// intended state — not a detection-worthy outage (ga-gfdfdc) — so it stays
+	// advisory rather than gating dispatch/exit codes. Status is left at its normal
+	// (non-OK) value so the condition is still visible, just not blocking.
+	parkedNote := ""
+	blockingUnlessParked := SeverityBlocking
+	if poolParked {
+		parkedNote = " (pool scaled to 0 standing instances: advisory, not blocking)"
+		blockingUnlessParked = SeverityAdvisory
+	}
+
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
 			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
 		if uptime >= expected+expected/2 {
-			// Advisory only for cron: a cron order that has never fired since
-			// controller start may be the cron-scheduler bug (ga-97qngx), not
-			// a real outage. Cooldown never-fired/stale paths remain blocking
-			// because they indicate an execution gap.
-			if order.Trigger == "cron" {
-				return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
+			// Advisory for cron (may be the cron-scheduler bug, ga-97qngx) or for
+			// any order whose pool is deliberately parked. Cooldown never-fired/
+			// stale paths against a live pool remain blocking — they indicate a
+			// real execution gap.
+			if order.Trigger == "cron" || poolParked {
+				return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired since controller start %s ago%s", name, formatOrderFiringDuration(uptime), parkedNote)
 			}
 			return StatusError, SeverityBlocking, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
 		}
@@ -617,9 +676,9 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 	age := nonNegativeDuration(now.Sub(lastFired))
 	switch {
 	case age >= expected*3:
-		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusError, blockingUnlessParked, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)%s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected), parkedNote)
 	case age >= expected+expected/2:
-		return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (overdue)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusWarning, blockingUnlessParked, fmt.Sprintf("%s: last fired %s ago, expected every %s (overdue)%s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected), parkedNote)
 	default:
 		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
 	}
