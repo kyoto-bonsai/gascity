@@ -8393,3 +8393,63 @@ func TestSyncTailReturnsFreshStoreLoadNotLocalSlice(t *testing.T) {
 		t.Fatalf("returned snapshot open set %v != fresh store load %v", gotIDs, freshIDs)
 	}
 }
+
+// --- buildInProgressWorkOwnerSet / sessionOwnsInProgressWorkInfo (ga-zxr7gr) ---
+
+func TestBuildInProgressWorkOwnerSet_Empty(t *testing.T) {
+	if got := buildInProgressWorkOwnerSet(nil); got != nil {
+		t.Fatalf("buildInProgressWorkOwnerSet(nil) = %#v, want nil", got)
+	}
+	if got := buildInProgressWorkOwnerSet([]beads.Bead{}); got != nil {
+		t.Fatalf("buildInProgressWorkOwnerSet(empty) = %#v, want nil", got)
+	}
+}
+
+func TestBuildInProgressWorkOwnerSet_FiltersByStatus(t *testing.T) {
+	workBeads := []beads.Bead{
+		{ID: "w1", Status: "in_progress", Assignee: "session-a"},
+		{ID: "w2", Status: "open", Assignee: "session-b"},
+		{ID: "w3", Status: "closed", Assignee: "session-c"},
+		{ID: "w4", Status: "in_progress", Assignee: "  session-d  "}, // whitespace trimmed
+		{ID: "w5", Status: "in_progress", Assignee: ""},              // blank assignee dropped
+	}
+	got := buildInProgressWorkOwnerSet(workBeads)
+	want := map[string]bool{"session-a": true, "session-d": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildInProgressWorkOwnerSet() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSessionOwnsInProgressWorkInfo_NoOwners(t *testing.T) {
+	info := session.Info{ID: "session-a"}
+	if sessionOwnsInProgressWorkInfo(nil, info) {
+		t.Fatal("sessionOwnsInProgressWorkInfo(nil owners) = true, want false")
+	}
+	if sessionOwnsInProgressWorkInfo(map[string]bool{}, info) {
+		t.Fatal("sessionOwnsInProgressWorkInfo(empty owners) = true, want false")
+	}
+}
+
+func TestSessionOwnsInProgressWorkInfo_MatchesByID(t *testing.T) {
+	owners := map[string]bool{"session-a": true}
+	info := session.Info{ID: "session-a"}
+	if !sessionOwnsInProgressWorkInfo(owners, info) {
+		t.Fatal("sessionOwnsInProgressWorkInfo() = false, want true (matches by ID)")
+	}
+}
+
+func TestSessionOwnsInProgressWorkInfo_MatchesBySessionName(t *testing.T) {
+	owners := map[string]bool{"worker-3": true}
+	info := session.Info{ID: "session-a", SessionNameMetadata: "worker-3"}
+	if !sessionOwnsInProgressWorkInfo(owners, info) {
+		t.Fatal("sessionOwnsInProgressWorkInfo() = false, want true (matches by session_name)")
+	}
+}
+
+func TestSessionOwnsInProgressWorkInfo_NoMatch(t *testing.T) {
+	owners := map[string]bool{"someone-else": true}
+	info := session.Info{ID: "session-a", SessionNameMetadata: "worker-3"}
+	if sessionOwnsInProgressWorkInfo(owners, info) {
+		t.Fatal("sessionOwnsInProgressWorkInfo() = true, want false (no identifier overlaps owners)")
+	}
+}

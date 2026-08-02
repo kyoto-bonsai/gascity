@@ -6542,6 +6542,56 @@ func TestReconcileSessionBeads_HealsRunningPendingCreateToActive(t *testing.T) {
 	}
 }
 
+// TestReconcileSessionBeads_InProgressWorkExemptsFromRuntimeMissingHeal is the
+// regression test for ga-zxr7gr's runtime-missing reap guard. It reproduces
+// the RCA scenario directly: pool desired-count has collapsed to zero for
+// this template (the session is NOT in desiredState — omitted here, not just
+// unstarted), exactly as happens when all of a template's beads are
+// momentarily in_progress. A session whose assignee identity owns an
+// in_progress work bead must not be healed to asleep even though it has
+// fallen out of the desired set and its provider process is not running.
+func TestReconcileSessionBeads_InProgressWorkExemptsFromRuntimeMissingHeal(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Agents: []config.Agent{{Name: "worker", StartCommand: "test-cmd", MaxActiveSessions: intPtr(1)}},
+	}
+	// Deliberately NOT calling env.addDesired: this session's template must be
+	// absent from desiredState to exercise the `!desired` reap path ga-zxr7gr
+	// guards, not merely "registered but not started".
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+
+	task := createInProgressTaskWithWorkDir(t, env.store, session.ID, t.TempDir())
+
+	reconcileSessionBeadsWithTaskWorkDirSnapshot(t, env, session, []beads.Bead{task}, false)
+
+	got, _ := env.store.Get(session.ID)
+	if got.Metadata["state"] != "active" {
+		t.Fatalf("state = %q, want active (session owns in_progress work, must not be reaped)", got.Metadata["state"])
+	}
+}
+
+// TestReconcileSessionBeads_NoAssignedWorkStillHealsToAsleep is the negative
+// control for the test above: with no assignedWorkBeads, the SAME
+// fallen-out-of-desired-set session must still be healed to asleep — proving
+// the guard is gated on actual work ownership, not a fixture that never
+// reaches the heal at all.
+func TestReconcileSessionBeads_NoAssignedWorkStillHealsToAsleep(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Agents: []config.Agent{{Name: "worker", StartCommand: "test-cmd", MaxActiveSessions: intPtr(1)}},
+	}
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+
+	reconcileSessionBeadsWithTaskWorkDirSnapshot(t, env, session, nil, false)
+
+	got, _ := env.store.Get(session.ID)
+	if got.Metadata["state"] == "active" {
+		t.Fatalf("state = %q, want healed away from active (no assigned work, the undesired-session heal should proceed unguarded)", got.Metadata["state"])
+	}
+}
+
 // TestReconcileAndWake_RestartRequestBumpsContinuationEpoch is an end-to-end
 // test that chains reconcile (sets continuation_reset_pending) with
 // preWakeCommit (consumes the flag and bumps continuation_epoch). This covers

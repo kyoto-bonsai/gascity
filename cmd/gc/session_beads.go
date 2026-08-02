@@ -874,6 +874,46 @@ func sessionAssignmentIdentifiersInfo(info session.Info) []string {
 	return compactSessionAssignmentIdentifiers(sessionAssignmentIdentifierRawInfo(info))
 }
 
+// buildInProgressWorkOwnerSet builds a set of assignee identifiers that own
+// at least one in_progress work bead. Keys are raw assignee strings from the
+// bead (could be a session bead ID, session name, or template name). Used by
+// the runtime-missing reap guard (ga-zxr7gr) so a mid-task session is never
+// swept even when pool desired-count has collapsed to zero.
+func buildInProgressWorkOwnerSet(workBeads []beads.Bead) map[string]bool {
+	if len(workBeads) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(workBeads))
+	for _, wb := range workBeads {
+		if wb.Status != "in_progress" {
+			continue
+		}
+		if assignee := strings.TrimSpace(wb.Assignee); assignee != "" {
+			set[assignee] = true
+		}
+	}
+	return set
+}
+
+// sessionOwnsInProgressWorkInfo returns true when any of the session's
+// assignment identifiers (ID, session name, configured-named identity)
+// appears in the in-progress owner set built by buildInProgressWorkOwnerSet.
+// Uses the no-config-fallback identifier form (sessionAssignmentIdentifiersInfo)
+// to match the same scope as the pre-Info-refactor original (ga-zxr7gr,
+// commit 9b3fb7b2f): a configured-named fallback identity is not a session
+// assignee an in_progress bead could ever be stamped with.
+func sessionOwnsInProgressWorkInfo(owners map[string]bool, info session.Info) bool {
+	if len(owners) == 0 {
+		return false
+	}
+	for _, id := range sessionAssignmentIdentifiersInfo(info) {
+		if owners[id] {
+			return true
+		}
+	}
+	return false
+}
+
 func compactSessionAssignmentIdentifiers(raw []string) []string {
 	seen := make(map[string]struct{}, len(raw))
 	identifiers := make([]string, 0, len(raw))

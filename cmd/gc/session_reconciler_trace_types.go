@@ -130,6 +130,14 @@ const (
 	TraceSiteLifecycleStartTerminalProviderError TraceSiteCode = "reconciler.start.terminal_provider_error"
 	TraceSiteLifecycleStartRateLimitHold         TraceSiteCode = "reconciler.start.rate_limit_hold"
 	TraceSiteLifecycleShutdownPreserveSessions   TraceSiteCode = "lifecycle.shutdown.preserve_sessions"
+
+	// TraceSiteReconcilerInProgressWorkGuard marks the runtime-missing heal
+	// guard (ga-zxr7gr): a session whose assignee identity owns an in_progress
+	// work bead is exempt from the heal-to-asleep decision below, mirroring
+	// ComputeAwakeSet's existing "assigned-work" idle-sleep exemption
+	// (TraceReasonAssignedWork) on the undesired-session reap path, which had
+	// no equivalent guard until this site was added.
+	TraceSiteReconcilerInProgressWorkGuard TraceSiteCode = "reconciler.session.in_progress_work_guard"
 )
 
 type TraceReasonCode string

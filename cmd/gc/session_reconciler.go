@@ -1423,6 +1423,17 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			shadowStartSnaps[orderedInfos[i].ID] = snapshotComparedKeysFromInfo(orderedInfos[i])
 		}
 	}
+
+	// Build a set of session assignee identifiers that own in_progress work
+	// (ga-zxr7gr). Used by the runtime-missing reap guard below so a mid-task
+	// session is never swept even when pool desired-count has collapsed to
+	// zero. Uses the pre-fetched assignedWorkBeads slice to avoid extra store
+	// round-trips. ComputeAwakeSet already guards idle-sleep via
+	// TraceReasonAssignedWork; this closes the same gap on the
+	// undesired-session runtime-missing heal path, which had no equivalent
+	// guard.
+	inProgressWorkOwners := buildInProgressWorkOwnerSet(assignedWorkBeads)
+
 	// Phase 1: Forward pass (topo order) — wake sessions, handle alive state.
 	var startCandidates []startCandidate
 	var wakeTargets []wakeTarget
@@ -1737,6 +1748,27 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					continue
 				}
 			}
+
+			// Safety: never reap a session that owns an in_progress work bead
+			// (ga-zxr7gr). ComputeAwakeSet exempts these from idle-sleep, but
+			// the runtime-missing heal path below did not have that guard. A
+			// false-negative here (guard fires but the session already
+			// reassigned the work) is harmless — the next tick cleans it up
+			// once the bead is no longer in_progress.
+			if !preserveNamed && sessionOwnsInProgressWorkInfo(inProgressWorkOwners, infoByID[id]) {
+				template := normalizedSessionTemplateInfo(infoByID[id], cfg)
+				if template == "" {
+					template = infoByID[id].Template
+				}
+				if trace != nil {
+					trace.RecordDecision(TraceSiteReconcilerInProgressWorkGuard, TraceReasonAssignedWork, TraceOutcomeExempt, template, name, traceRecordPayload{
+						"provider_alive": providerAlive,
+						"state":          infoByID[id].MetadataState,
+					})
+				}
+				continue
+			}
+
 			// Heal state using provider liveness, not agent membership.
 			// rollbackAvailable mirrors the rollback gate at line ~639: when
 			// storeQueryPartial=true the formal rollback is deferred, so the
