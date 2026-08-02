@@ -17,18 +17,18 @@ import (
 // never canonicalizes its input (unlike its sibling controllerSocketPath).
 func TestControllerLockExclusion_SymlinkSpelling(t *testing.T) {
 	base := t.TempDir()
-	real := filepath.Join(base, "real-city")
-	if err := os.MkdirAll(filepath.Join(real, ".gc"), 0o755); err != nil {
+	realDir := filepath.Join(base, "real-city")
+	if err := os.MkdirAll(filepath.Join(realDir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	alias := filepath.Join(base, "alias-city")
-	if err := os.Symlink(real, alias); err != nil {
+	if err := os.Symlink(realDir, alias); err != nil {
 		t.Fatal(err)
 	}
 
-	lock1, err := acquireControllerLock(real)
+	lock1, err := acquireControllerLock(realDir)
 	if err != nil {
-		t.Fatalf("first lock via real path %q: %v", real, err)
+		t.Fatalf("first lock via real path %q: %v", realDir, err)
 	}
 	defer lock1.Close() //nolint:errcheck // test cleanup
 

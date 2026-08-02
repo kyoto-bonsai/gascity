@@ -280,7 +280,7 @@ func usesFormulaBackedRoute(opts SlingOpts) bool {
 // bypass is exactly what rigs/personas/ariadne-plan-persona-standards-2026-07-25.md
 // phase_2_slinggate ruling (a) retires ("no hotfix escape, no exceptions").
 func shouldCheckOfficerOfRecord(opts SlingOpts) bool {
-	return !opts.IsFormula && !(opts.DryRun && opts.InlineText)
+	return !opts.IsFormula && (!opts.DryRun || !opts.InlineText)
 }
 
 func shouldCheckDepCycle(opts SlingOpts) bool {
@@ -527,7 +527,7 @@ const (
 // requirement with "no exceptions" — a deliberate operator override stays
 // available. This governs applicability only.
 func shouldCheckLiveRoutingConflict(opts SlingOpts) bool {
-	return !opts.IsFormula && !(opts.DryRun && opts.InlineText) && !opts.Force
+	return !opts.IsFormula && (!opts.DryRun || !opts.InlineText) && !opts.Force
 }
 
 // checkLiveRoutingConflict enforces the live-routing guard: gc sling refuses
@@ -616,7 +616,7 @@ func checkLiveRoutingConflict(opts SlingOpts, deps SlingDeps) error {
 // !opts.Force: see checkTargetDispatchable's doc comment for why forcing
 // through is never a legitimate override here.
 func shouldCheckTargetDispatchable(opts SlingOpts) bool {
-	return !opts.IsFormula && !(opts.DryRun && opts.InlineText)
+	return !opts.IsFormula && (!opts.DryRun || !opts.InlineText)
 }
 
 // checkTargetDispatchable refuses to route opts.BeadOrFormula onto
@@ -719,7 +719,7 @@ func checkTargetDispatchable(opts SlingOpts, deps SlingDeps) error {
 // handle this case, so refusing here first would block the one flag that
 // already fixes it.
 func shouldCheckTargetAssigneeConflict(opts SlingOpts) bool {
-	return !opts.Reassign && !opts.IsFormula && !(opts.DryRun && opts.InlineText)
+	return !opts.Reassign && !opts.IsFormula && (!opts.DryRun || !opts.InlineText)
 }
 
 // checkTargetAssigneeConflict refuses to route opts.BeadOrFormula onto

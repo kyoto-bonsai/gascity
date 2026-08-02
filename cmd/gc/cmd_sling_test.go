@@ -997,7 +997,7 @@ func liveRoutingConflictTestCfg() *config.City {
 // ga-5m7fir's validation found production read those same wrong constants,
 // so the original fixture agreed with the buggy code by construction rather
 // than with any real session bead. For the live-routing-conflict tests below.
-func seedLiveSession(t *testing.T, store beads.Store, target, name, state string) {
+func seedLiveSession(t *testing.T, store beads.Store, target, name, state string) { //nolint:unparam // target kept explicit at call sites for readability; every current caller happens to route through "worker"
 	t.Helper()
 	_, err := store.Create(beads.Bead{
 		Title:  name,
@@ -1141,7 +1141,7 @@ func TestDoSlingLiveRoutingConflictForceBypasses(t *testing.T) {
 // treated as a live conflict requiring --force, whereas the original window
 // design would have allowed it through once the window elapsed. Flagging for
 // validator review rather than silently choosing — the reconciler's own
-// signal has no "not yet caught up" analogue to safely fall back to.
+// signal has no "not yet caught up" analog to safely fall back to.
 func TestDoSlingLiveRoutingConflictStaleHeartbeatAllowed(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

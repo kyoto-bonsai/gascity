@@ -37,19 +37,19 @@ func TestCanonicalTmuxTmpDir_IgnoresAmbientTMPDIR(t *testing.T) {
 // test isolation (test/tmuxtest.Guard) depends on — an explicit TMUX_TMPDIR
 // — still takes effect, resolved through symlinks.
 func TestCanonicalTmuxTmpDir_ExplicitTMUXTMPDIRWins(t *testing.T) {
-	real := t.TempDir()
+	realDir := t.TempDir()
 	alias := filepath.Join(t.TempDir(), "alias")
-	if err := os.Symlink(real, alias); err != nil {
+	if err := os.Symlink(realDir, alias); err != nil {
 		t.Skipf("symlinks not supported on this filesystem: %v", err)
 	}
-	realResolved, err := filepath.EvalSymlinks(real)
+	realResolved, err := filepath.EvalSymlinks(realDir)
 	if err != nil {
 		t.Fatalf("resolving real dir: %v", err)
 	}
 
 	t.Setenv("TMPDIR", "/should/not/matter")
 
-	t.Setenv("TMUX_TMPDIR", real)
+	t.Setenv("TMUX_TMPDIR", realDir)
 	if got := CanonicalTmuxTmpDir(); got != realResolved {
 		t.Errorf("real dir: got %q, want %q", got, realResolved)
 	}

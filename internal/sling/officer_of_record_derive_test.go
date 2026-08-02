@@ -1,6 +1,7 @@
 package sling
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -65,7 +66,8 @@ func TestDeriveOfficerOfRecord(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected MissingOfficerOfRecordError for an unmapped, non-exempt persona")
 		}
-		if _, ok := err.(*MissingOfficerOfRecordError); !ok {
+		var missingErr *MissingOfficerOfRecordError
+		if !errors.As(err, &missingErr) {
 			t.Errorf("error = %T (%v), want *MissingOfficerOfRecordError", err, err)
 		}
 	})

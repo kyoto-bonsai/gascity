@@ -14,7 +14,7 @@ import (
 // machine's PATH.
 func fakeLookPath(string) (string, error) { return "/usr/bin/fake", nil }
 
-func seatCapTestConfig(providerName string, maxSeats *int) *config.City {
+func seatCapTestConfig(providerName string, maxSeats *int) *config.City { //nolint:unparam // providerName kept explicit at call sites for readability; every current caller happens to route through "codex"
 	return &config.City{
 		Agents: []config.Agent{
 			{Name: "codex-worker", Provider: providerName},

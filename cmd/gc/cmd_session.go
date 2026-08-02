@@ -1558,7 +1558,7 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 			// reconciler/create path.
 			defaultArgs, err := resolved.ResolveDefaultArgs()
 			if err != nil {
-				fmt.Fprintf(stderr, "warning: session %s: option default not applied to resume command: %v\n", info.ID, err)
+				fmt.Fprintf(stderr, "warning: session %s: option default not applied to resume command: %v\n", info.ID, err) //nolint:errcheck // best-effort stderr
 				return
 			}
 			if len(defaultArgs) > 0 {
