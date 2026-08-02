@@ -76,10 +76,12 @@ type ListQuery struct {
 	// stable-mailbox spelling of ONE logical recipient (e.g. a live session's
 	// bead ID, alias, and session_name), not a fan-out across distinct
 	// recipients. bd-CLI-backed stores cannot push a multi-value assignee
-	// filter server-side and must scan-then-client-filter instead; when this
-	// is set they may still apply Limit to that scan, because narrowing to
-	// one entity's own aliases cannot starve a DIFFERENT recipient's results
-	// the way limiting ahead of a genuine multi-recipient filter could.
+	// filter server-side in one call; when this is set they instead issue one
+	// Limit-bounded, server-filtered query per alias and merge the results
+	// (see listByAliasesUnion), rather than applying Limit to a single
+	// unfiltered scan — the latter can silently drop the recipient's own mail
+	// entirely when other recipients' newer messages fill the window ahead of
+	// it (ga-0pg093).
 	AssigneesAreAliases bool
 	ParentID            string
 	// ParentIDs matches beads whose parent_id is any of the listed ids — a
