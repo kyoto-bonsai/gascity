@@ -447,6 +447,88 @@ pool = "dog"
 	}
 }
 
+func TestOrderFiringCurrent_StaleWithUnsetMinPool_StaysBlocking(t *testing.T) {
+	// Discriminating control persona-marcus's ga-gfdfdc validation demanded:
+	// MinActiveSessions left nil (never configured) is NOT the same claim as
+	// MinActiveSessions explicitly set to 0 (deliberately parked), and must
+	// not be treated as one. 88 of this city's 92 live agents have the field
+	// unset — TestOrderFiringCurrent_StaleWithParkedPool_IsAdvisory's intPtr(0)
+	// and TestOrderFiringCurrent_StaleWithLiveMinPool_StaysBlocking's intPtr(1)
+	// both leave this shape unexercised, so neither could have caught a
+	// regression back to EffectiveMinActiveSessions()'s nil-means-zero
+	// semantics, which is exactly what shipped here initially.
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	cfg.Agents = []config.Agent{{Name: "dog"}}
+	writeOrderFiringRawOrder(t, cityPath, "mol-dog-stale-db", `[order]
+formula = "mol-dog-stale-db"
+trigger = "cron"
+schedule = "0 */4 * * *"
+pool = "dog"
+`)
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "mol-dog-stale-db", Ts: now.Add(-13 * time.Hour)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if result.Severity != SeverityBlocking {
+		t.Fatalf("Severity = %v, want SeverityBlocking — MinActiveSessions unset is not an assertion the pool was deliberately parked", result.Severity)
+	}
+	if strings.Contains(strings.Join(result.Details, "\n"), "pool scaled to 0 standing instances") {
+		t.Fatalf("details = %v, must not carry the parked-pool annotation for an unset (never-configured) pool", result.Details)
+	}
+}
+
+func TestOrderFiringCurrent_ParkedPlusLiveStale_StaysBlocking(t *testing.T) {
+	// Pins the bead's actual claimed benefit (persona-marcus's ga-gfdfdc
+	// validation, probe 2), not just the demotion mechanism: a parked pool's
+	// advisory demotion must not mask a DIFFERENT, genuinely live pool's real
+	// stale-order incident sitting alongside it in the same check run. Both
+	// sibling tests above use a single-order city, so neither proves the
+	// mixed shape — 20+ monitored orders in production — actually keeps
+	// gating when it matters.
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	cfg.Agents = []config.Agent{
+		{Name: "dog", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)},
+		{Name: "content-writer", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(2)},
+	}
+	// Parked pool, stale — should be demoted to advisory.
+	writeOrderFiringRawOrder(t, cityPath, "mol-dog-stale-db", `[order]
+formula = "mol-dog-stale-db"
+trigger = "cron"
+schedule = "0 */4 * * *"
+pool = "dog"
+`)
+	// Live pool, ALSO stale — a real incident hiding underneath. Must still block.
+	writeOrderFiringRawOrder(t, cityPath, "real-incident-order", `[order]
+formula = "real-incident-order"
+trigger = "cron"
+schedule = "0 */4 * * *"
+pool = "content-writer"
+`)
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "mol-dog-stale-db", Ts: now.Add(-13 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "real-incident-order", Ts: now.Add(-13 * time.Hour)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	joined := strings.Join(result.Details, "\n")
+	if !strings.Contains(joined, "real-incident-order") {
+		t.Fatalf("details lost the live-pool order entirely: %v", result.Details)
+	}
+	if result.Severity != SeverityBlocking {
+		t.Fatalf("Severity = %v, want SeverityBlocking — a stale order on a LIVE pool "+
+			"must not be masked by a parked order's advisory demotion; details = %v",
+			result.Severity, result.Details)
+	}
+}
+
 func TestOrderFiringCurrent_IgnoresManualAndEventTriggers(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
