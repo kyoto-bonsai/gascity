@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A session that drain-acks while still holding an open or in-progress
+  work bead now releases that bead back to the pool instead of leaving it
+  permanently orphaned.** `DecideIdleTimeout` never consults assigned work
+  (only `DecideMaxSessionAge` does), so a non-pinned pool/adhoc session can
+  go idle and drain-ack mid-task while still assigned; the periodic orphan
+  sweep (`releaseOrphanedPoolAssignments`) can't catch the resulting strand
+  because the session bead stays open (asleep, not closed), so its identity
+  keeps satisfying the sweep's liveness check indefinitely — the bead was
+  observed stuck this way for days. `releaseStrandedAssignedWorkOnDrainAck`
+  now clears the stranded bead's assignee and reopens it at the point of
+  detection, alongside the existing `session.drain_acked_with_assigned_work`
+  signal, emitting `bead.dead_assignee_reopened`. Configured-named and
+  manual sessions are exempt: those identities persist across sleep/wake and
+  are the intended target of the reconciler's own assigned-work wake pass,
+  so their claim is preserved rather than handed to a stranger.
+
 - **The dolt pack's `run_bounded` python3 fallback now sends SIGTERM before
   SIGKILL, matching its documented contract.** The fallback (used when
   neither `timeout` nor `gtimeout` is on `PATH`, the default on stock macOS)

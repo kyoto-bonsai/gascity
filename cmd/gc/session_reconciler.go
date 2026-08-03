@@ -397,6 +397,11 @@ func confirmDrainAckRuntimeDead(cityPath string, store beads.Store, sp runtime.P
 	}
 }
 
+// recordDrainAckAssignedWorkEvent emits the Shape A mechanism-only signal
+// (gastownhall/gascity#2293) and returns the stranded bead it found, if any,
+// so the caller can additionally decide a recovery policy (see
+// releaseStrandedAssignedWorkOnDrainAck) without re-querying the store for
+// the same bead.
 func recordDrainAckAssignedWorkEvent(
 	cityPath string,
 	cfg *config.City,
@@ -408,16 +413,16 @@ func recordDrainAckAssignedWorkEvent(
 	name string,
 	rec events.Recorder,
 	stderr io.Writer,
-) {
+) (beads.Bead, bool) {
 	if rec == nil {
-		return
+		return beads.Bead{}, false
 	}
 	strandedBead, found, beadLookupErr := firstOpenAssignedWorkBeadForReachableStore(cityPath, cfg, store, rigStores, info)
 	if beadLookupErr != nil {
 		fmt.Fprintf(stderr, "session reconciler: locating stranded bead for drain-acked %s: %v\n", name, beadLookupErr) //nolint:errcheck
 	}
 	if !found {
-		return
+		return beads.Bead{}, false
 	}
 	rec.Record(events.Event{
 		Type:      events.SessionDrainAckedWithAssignedWork,
@@ -432,6 +437,70 @@ func recordDrainAckAssignedWorkEvent(
 			strandedBead.Status,
 			"drain_acked_with_assigned_work",
 		),
+	})
+	return strandedBead, true
+}
+
+// releaseStrandedAssignedWorkOnDrainAck clears the assignee on a work bead
+// left stranded by a drain-acked session so the pool can reclaim it, instead
+// of leaving it permanently orphaned on a seat that will not resume it. The
+// idle-timeout decider never consults assigned work (see DecideIdleTimeout),
+// so a non-pinned session can drain-ack while still holding an open or
+// in-progress bead. The periodic orphan sweep (releaseOrphanedPoolAssignments)
+// cannot catch the resulting strand because the session bead stays open
+// (asleep, not closed), so its identity keeps satisfying the sweep's
+// liveness check indefinitely.
+//
+// This reuses the sweep's own release primitive and safety gates rather than
+// writing a second bead-mutation path: releaseOrphanedPoolAssignment (CAS
+// release with a live-recheck fallback), detachedProbeAllowsOrphanRelease
+// (skip if a detached out-of-band process is still alive for this bead), and
+// SupportsGenericEphemeralSessions (template opts out of pool-demand
+// release). It additionally skips configured-named, manual, and
+// configured-identity sessions: those identities persist across sleep/wake
+// and are the intended target of the reconciler's own assigned-work wake
+// pass, so clearing their claim here would hand in-flight work to a
+// stranger while the rightful owner is merely asleep, not gone.
+func releaseStrandedAssignedWorkOnDrainAck(
+	cfg *config.City,
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	info sessionpkg.Info,
+	template string,
+	strandedBead beads.Bead,
+	clk clock.Clock,
+	rec events.Recorder,
+) {
+	if info.ConfiguredNamedSession || info.ManualSession || strings.TrimSpace(info.ConfiguredNamedIdentity) != "" {
+		return
+	}
+	agentCfg := findAgentByTemplate(cfg, template)
+	if agentCfg == nil || !agentCfg.SupportsGenericEphemeralSessions() {
+		return
+	}
+	ownerStore := storeForPoolAssignment(cfg, store, rigStores, strandedBead)
+	if ownerStore == nil {
+		return
+	}
+	allowsRelease, clearDetached := detachedProbeAllowsOrphanRelease(strandedBead)
+	if !allowsRelease {
+		return
+	}
+	deadAssignee := strings.TrimSpace(strandedBead.Assignee)
+	routedTo := strings.TrimSpace(strandedBead.Metadata[beadmeta.RoutedToMetadataKey])
+	if !releaseOrphanedPoolAssignment(ownerStore, strandedBead, clearDetached) {
+		return
+	}
+	if rec == nil {
+		return
+	}
+	rec.Record(events.Event{
+		Type:    events.BeadDeadAssigneeReopened,
+		Ts:      clk.Now().UTC(),
+		Actor:   "gc",
+		Subject: strandedBead.ID,
+		Message: formatDeadAssigneeReopenedMessage(strandedBead.ID, deadAssignee, routedTo),
+		Payload: api.BeadDeadAssigneeReopenedPayloadJSON(strandedBead.ID, deadAssignee, routedTo),
 	})
 }
 
@@ -633,7 +702,9 @@ func finalizeDrainAckStoppedSession(
 	}
 	recordStopped(true)
 	if hasAssignedWork {
-		recordDrainAckAssignedWorkEvent(cityPath, cfg, store, rigStores, info, template, template, name, rec, stderr)
+		if strandedBead, found := recordDrainAckAssignedWorkEvent(cityPath, cfg, store, rigStores, info, template, template, name, rec, stderr); found {
+			releaseStrandedAssignedWorkOnDrainAck(cfg, store, rigStores, info, template, strandedBead, clk, rec)
+		}
 	}
 	// Non-close drain-ack: the snapshot fold is the ApplyPatchInfo result above.
 	return drainAckFinalizeResult{folded: &foldedInfo}

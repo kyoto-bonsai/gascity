@@ -1793,9 +1793,13 @@ func TestReconcileSessionBeads_DrainAckWithAssignedOpenWorkSleepsInsteadOfDraini
 // while still holding the assignee on an in-progress work bead (the cap-hit
 // shape — worker exited mid-task without nulling assignee), the reconciler
 // MUST emit events.SessionDrainAckedWithAssignedWork carrying the session
-// and bead IDs exactly once after the provider stop has completed so pack-side
-// subscribers can apply recovery policy. The SDK reconciler stops at the event;
-// it does not commit, push, or clear assignee.
+// and bead IDs exactly once after the provider stop has completed. The
+// reconciler no longer stops at the event: for a generic pool session (not
+// configured-named/manual — see the carve-out tests below) it also clears
+// the stranded bead's assignee and reopens it via
+// releaseStrandedAssignedWorkOnDrainAck, emitting
+// events.BeadDeadAssigneeReopened, so the bead is not left permanently
+// orphaned on a seat that has gone idle and will not resume it.
 func TestReconcileSessionBeads_DrainAckMidPhaseEmitsAssignedWorkEvent(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
@@ -1878,17 +1882,36 @@ func TestReconcileSessionBeads_DrainAckMidPhaseEmitsAssignedWorkEvent(t *testing
 		t.Errorf("event payload does not reference stranded bead ID %q: %s", stranded.ID, matched.Payload)
 	}
 
-	// Verify the SDK did NOT mutate the bead's assignee — recovery policy
-	// must live in pack-side subscribers, not the reconciler.
+	// The stranded bead is released back to the pool: assignee cleared,
+	// status reset to open (not closed — the bead itself is still live work,
+	// only its dead assignee was stale).
 	got, err := env.store.Get(stranded.ID)
 	if err != nil {
 		t.Fatalf("Get(stranded): %v", err)
 	}
-	if got.Assignee != session.ID {
-		t.Errorf("stranded bead assignee = %q, want %q (SDK must not clear assignee — pack-side recovery)", got.Assignee, session.ID)
+	if got.Assignee != "" {
+		t.Errorf("stranded bead assignee = %q, want cleared (release-to-pool)", got.Assignee)
 	}
-	if got.Status == "closed" {
-		t.Errorf("stranded bead status = %q, SDK must not close the bead", got.Status)
+	if got.Status != "open" {
+		t.Errorf("stranded bead status = %q, want open (release-to-pool)", got.Status)
+	}
+
+	reopenMatches := 0
+	var reopened *events.Event
+	for i := range fake.Events {
+		if fake.Events[i].Type == events.BeadDeadAssigneeReopened {
+			reopenMatches++
+			reopened = &fake.Events[i]
+		}
+	}
+	if reopened == nil {
+		t.Fatalf("expected %s event, got %d events of other types", events.BeadDeadAssigneeReopened, len(fake.Events))
+	}
+	if reopenMatches != 1 {
+		t.Fatalf("%s events = %d, want exactly 1", events.BeadDeadAssigneeReopened, reopenMatches)
+	}
+	if !strings.Contains(string(reopened.Payload), stranded.ID) {
+		t.Errorf("reopened event payload does not reference stranded bead ID %q: %s", stranded.ID, reopened.Payload)
 	}
 }
 
@@ -3405,6 +3428,144 @@ func TestFinalizeDrainAckStoppedSessionFallsThroughWhenCloseGateRacesWithAssignm
 	}
 	if matches != 1 {
 		t.Fatalf("%s events = %d, want 1 after assignment race", events.SessionDrainAckedWithAssignedWork, matches)
+	}
+}
+
+// TestFinalizeDrainAckStoppedSessionReleasesStrandedWorkToPool pins
+// releaseStrandedAssignedWorkOnDrainAck's main-line behavior directly at the
+// finalize function, independent of the fuller reconcileSessionBeads
+// integration test above: a generic pool session that drain-acks holding an
+// open work bead gets that bead released back to the pool (assignee
+// cleared, status reset to open) and a bead.dead_assignee_reopened event
+// recorded, rather than leaving the bead permanently orphaned on a session
+// that has gone idle and will not resume it.
+func TestFinalizeDrainAckStoppedSessionReleasesStrandedWorkToPool(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	fake := events.NewFake()
+	env.rec = fake
+
+	session := env.createSessionBead("worker", "worker")
+	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
+		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
+	}
+	session.Metadata = patch.Apply(session.Metadata)
+
+	stranded, err := env.store.Create(beads.Bead{
+		Title:    "implement phase work",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(stranded bead): %v", err)
+	}
+	// MemStore.Create always normalizes new beads to status=open (mirroring
+	// real bd semantics: work is created open, then claimed into
+	// in_progress), so force the realistic cap-hit starting state explicitly.
+	if err := env.store.Update(stranded.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Update(stranded, in_progress): %v", err)
+	}
+
+	finalizeDrainAckStoppedSession(
+		"", env.cfg, env.store, nil, env.sessionInfo(session.ID), "worker", true,
+		newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
+	)
+
+	got, err := env.store.Get(stranded.ID)
+	if err != nil {
+		t.Fatalf("Get(stranded): %v", err)
+	}
+	if got.Assignee != "" {
+		t.Errorf("stranded bead assignee = %q, want cleared (release-to-pool)", got.Assignee)
+	}
+	if got.Status != "open" {
+		t.Errorf("stranded bead status = %q, want open (release-to-pool)", got.Status)
+	}
+
+	reopenMatches := 0
+	for _, ev := range fake.Events {
+		if ev.Type == events.BeadDeadAssigneeReopened {
+			reopenMatches++
+			if !strings.Contains(string(ev.Payload), stranded.ID) {
+				t.Errorf("reopened event payload does not reference stranded bead ID %q: %s", stranded.ID, ev.Payload)
+			}
+		}
+	}
+	if reopenMatches != 1 {
+		t.Fatalf("%s events = %d, want exactly 1", events.BeadDeadAssigneeReopened, reopenMatches)
+	}
+}
+
+// TestFinalizeDrainAckStoppedSessionPreservesConfiguredNamedSessionAssignee
+// pins releaseStrandedAssignedWorkOnDrainAck's safety carve-out: a
+// configured-named session persists its identity across sleep/wake and is
+// the intended target of the reconciler's own assigned-work wake pass (a
+// session holding assigned work is desired-awake by name), so a mid-phase
+// drain-ack must still emit the Shape A detect signal but must NOT release
+// the stranded bead — doing so would hand the named session's in-flight
+// work to a stranger while its rightful owner is merely asleep, not gone.
+func TestFinalizeDrainAckStoppedSessionPreservesConfiguredNamedSessionAssignee(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	fake := events.NewFake()
+	env.rec = fake
+
+	session := env.createSessionBead("worker", "worker")
+	patch := sessionpkg.DrainAckStopPendingPatch(env.clk.Now().UTC())
+	if err := env.store.SetMetadataBatch(session.ID, patch); err != nil {
+		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
+	}
+	session.Metadata = patch.Apply(session.Metadata)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+	})
+
+	stranded, err := env.store.Create(beads.Bead{
+		Title:    "implement phase work",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(stranded bead): %v", err)
+	}
+	// MemStore.Create always normalizes new beads to status=open (mirroring
+	// real bd semantics: work is created open, then claimed into
+	// in_progress), so force the realistic cap-hit starting state explicitly.
+	if err := env.store.Update(stranded.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Update(stranded, in_progress): %v", err)
+	}
+
+	finalizeDrainAckStoppedSession(
+		"", env.cfg, env.store, nil, env.sessionInfo(session.ID), "worker", true,
+		newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
+	)
+
+	got, err := env.store.Get(stranded.ID)
+	if err != nil {
+		t.Fatalf("Get(stranded): %v", err)
+	}
+	if got.Assignee != session.ID {
+		t.Errorf("stranded bead assignee = %q, want %q preserved (configured-named session)", got.Assignee, session.ID)
+	}
+	if got.Status != "in_progress" {
+		t.Errorf("stranded bead status = %q, want in_progress preserved", got.Status)
+	}
+
+	detectMatches := 0
+	for _, ev := range fake.Events {
+		switch ev.Type {
+		case events.SessionDrainAckedWithAssignedWork:
+			detectMatches++
+		case events.BeadDeadAssigneeReopened:
+			t.Fatalf("unexpected %s event for configured-named session: %+v", events.BeadDeadAssigneeReopened, ev)
+		}
+	}
+	if detectMatches != 1 {
+		t.Fatalf("%s events = %d, want exactly 1 (detect signal still fires)", events.SessionDrainAckedWithAssignedWork, detectMatches)
 	}
 }
 

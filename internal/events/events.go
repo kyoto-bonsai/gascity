@@ -33,10 +33,14 @@ const (
 	// concurrent polecat claims) into an observable signal. ADR-0009.
 	BeadClaimRejected = "bead.claim_rejected"
 	// BeadDeadAssigneeReopened fires when the reconciler reopens a routed work
-	// bead whose assignee resolves to no open session bead — the owning session
-	// closed/retired while the bead stayed assigned, leaving it open+routed but
-	// invisible to every claim probe (pool tier and demand require --unassigned;
-	// the hook requires an empty assignee). releaseOrphanedPoolAssignments clears
+	// bead whose assignee no longer usefully owns it, leaving it open+routed
+	// but invisible to every claim probe (pool tier and demand require
+	// --unassigned; the hook requires an empty assignee). Two triggers share
+	// this event: releaseOrphanedPoolAssignments' periodic sweep (the owning
+	// session closed/retired while the bead stayed assigned) and
+	// releaseStrandedAssignedWorkOnDrainAck (the owning session drain-acked
+	// idle while still holding the bead — it stays "open", not closed, so the
+	// periodic sweep's liveness check never catches it on its own). Both clear
 	// the dead assignee so the pool can reclaim it; this event turns that
 	// otherwise-silent repair into an observable signal (mirrors the
 	// bead.claim_rejected shape).

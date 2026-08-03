@@ -538,8 +538,9 @@ func SessionStrandedPayloadJSON(sessionID, sessionName, template string, workBea
 
 // BeadDeadAssigneeReopenedPayload is the typed payload for
 // bead.dead_assignee_reopened events. Emitted when the reconciler reopens a
-// routed work bead whose assignee no longer maps to any open session bead —
-// the owning session closed/retired while the bead stayed assigned, so it sat
+// routed work bead whose assignee no longer usefully owns it — either the
+// owning session closed/retired while the bead stayed assigned, or the
+// owning session drain-acked idle while still holding it — so it sat
 // open+routed but unclaimable. The reconciler clears DeadAssignee (empty-string
 // clear) so the RoutedTo pool can reclaim BeadID; the payload makes the repair
 // observable for eval/audit (mirrors BeadClaimRejectedPayload).
