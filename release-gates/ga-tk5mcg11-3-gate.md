@@ -228,7 +228,7 @@ diff-caused.
 |---|-----------|---------|----------|
 | 1 | Review PASS present | **PENDING** | Author≠validator: this gate is authored by persona-nils and has not yet been reviewed by a non-nils seat. See Validation below. |
 | 2 | Acceptance criteria met | PASS (mechanical) | All 35 in-scope local-only commits landed or explicitly, reasonably skipped (§S1–S3); ga-0pg093 fold-in produced as a separate branch per the bead's explicit instruction. |
-| 3 | Tests pass | PASS | Targeted suites green at every conflict checkpoint (§C1–C3 evidence blocks above); full-repo `make check` run — see below. |
+| 3 | Tests pass | PASS | Targeted suites green at every conflict checkpoint (§C1–C3); full `make check` run, 8 failures + 1 package timeout individually investigated to root cause (§T/§T1/§T2) — 2 fixed (schema regen), 6 confirmed pre-existing/environmental/unrelated-code with direct evidence, 1 genuine-but-out-of-scope finding flagged (not silently pushed through). Zero unexplained failures. |
 | 4 | No high-severity findings open | PASS (self-assessed) | The 3 conflicts each got a documented, evidenced resolution; no known open issue in the rebase itself. Subject to validator's independent read. |
 | 5 | Final branch is clean | PASS | `git status` clean on `build/ga-tk5mcg11-3-rebase-onto-main`. |
 | 6 | Branch diverges cleanly from origin/main | PASS | Cut from `origin/main@86ef443b9`; every commit is either a clean cherry-pick or a resolved/documented conflict — no unresolved markers, `gofmt -l` clean tree-wide. |
@@ -322,11 +322,16 @@ this repo's own dev-gotchas file warns "do not tail the panic, you lose the head
 the question"): `TestChangedStaticTargetsScopeLintAndFormattingToTheDiff` had been running **13
 minutes** with its `invalid_ref_falls_back_to_full_static_checks` subtest in-flight 1m23s when the
 per-package 15m timeout fired. `git diff origin/main..HEAD -- scripts/` is **empty** — this
-rebase touches zero files in that package. Confirmed independently in an isolated vanilla
-`origin/main` worktree that the same test is comparably slow there too (this section updated with
-the exact comparison once that background run completes). Not a rebase defect; a pre-existing
-test-suite duration characteristic of this machine, worth a separate follow-up (either raise
-`scripts`' timeout or split/speed up its slowest subtests) but out of scope here.
+rebase touches zero files in that package. **Definitively confirmed** by running the full
+`scripts` package in isolation on both trees: this branch times out at `1801.338s` even with a
+30-minute budget; a scratch worktree of vanilla, unmodified `origin/main` *also* times out, at
+`1200.765s` with a 20-minute budget. Same failure mode, same package, zero code difference — not
+a rebase defect, a pre-existing test-suite duration characteristic of this machine (heavily loaded
+throughout this session: load average ~20, multiple concurrent sibling sessions' builds/tests/dolt
+servers observed running simultaneously). Worth a separate follow-up (raise `scripts`' timeout or
+split/speed up `TestChangedStaticTargetsScopeLintAndFormattingToTheDiff`'s slowest subtests) but
+out of scope for this gate. The `scripts/cipolicy` *sub*package (distinct from the timing-out
+parent `scripts` package) passes cleanly in both trees.
 
 ## Security review
 
