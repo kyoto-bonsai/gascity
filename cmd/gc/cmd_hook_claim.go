@@ -1076,6 +1076,10 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 			bead.ID, ops.claimWindowOrDefault(), ops.invocationAge().Round(time.Millisecond))
 		return unwindUndeliveredHookClaim(hookClaimReleaseReasonStraddled, cause, bead, opts, ops, dir, stderr)
 	}
+	// Warned here, after the straddle check: a claim the check just unwound
+	// never sticks, so warning about it first would announce a parked bead
+	// this session is not actually about to work.
+	warnHookClaimAwaitingParked(result, stderr)
 	result.RootBeadID = strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	durable, stamped := stampHookClaimIdentity(bead, opts, ops, dir, stderr)
@@ -1179,6 +1183,25 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, opts hook
 		fmt.Fprintf(stderr, "gc hook --claim: undelivered claim %s was no longer ours to release\n", bead.ID) //nolint:errcheck
 	}
 	return 1
+}
+
+// warnHookClaimAwaitingParked is the "claim-then-announce" half of the R1
+// remedy (ga-kk6mke): ga-982pdy R1 forbids gating claim eligibility on
+// gc.awaiting, so a claim on an awaiting-parked bead always succeeds — but
+// until now nothing consumed the value ga-8gq4ff already surfaces in the
+// JSON result, so the claim was silent (the exact silence all four live
+// repros on ga-5g6wdx flagged). A non-empty Awaiting means the bead is
+// parked pending some other actor's decision, not necessarily this session's
+// own dispatched work. Warn loudly on stderr — outside the versioned JSON
+// contract, so opts.JSON callers parsing stdout are unaffected — rather than
+// let a session silently start treating a parked bead as ordinary ready
+// work.
+func warnHookClaimAwaitingParked(result hookClaimJSONResult, stderr io.Writer) {
+	awaiting := strings.TrimSpace(result.Awaiting)
+	if awaiting == "" || stderr == nil {
+		return
+	}
+	fmt.Fprintf(stderr, "gc hook --claim: WARNING: %s is PARKED (gc.awaiting=%s) — this may not be your dispatched work; verify before proceeding (ga-982pdy R1)\n", result.BeadID, awaiting) //nolint:errcheck
 }
 
 // writeHookClaimNoWork writes the single drain result for a hook that claimed
