@@ -1114,6 +1114,10 @@
           "type": "string",
           "description": "Base names the parent provider this spec inherits from. Supported\nforms:\n  \"\u003cname\u003e\"          - custom first (self-excluded), then built-in\n  \"builtin:\u003cname\u003e\"  - force built-in lookup\n  \"provider:\u003cname\u003e\" - force custom lookup\n  \"\"                - explicit standalone opt-out\n  nil               - field absent; no explicit declaration"
         },
+        "max_seats": {
+          "type": "integer",
+          "description": "MaxSeats caps the number of concurrent active sessions attributed to\nthis provider (via each session's template-\u003eprovider resolution),\nenforced by the spawn preflight gate (ga-mpb0xu). Semantics mirror\nAgent.MaxActiveSessions: nil = not configured (gate fails open, no\ncap enforced), -1 = explicitly unlimited, 0 or positive = literal\nseat cap. Distinct from Agent/pool-level MaxActiveSessions, which\ncaps one template's own session count, not the provider's aggregate\nacross all templates that resolve to it."
+        },
         "args_append": {
           "items": {
             "type": "string"

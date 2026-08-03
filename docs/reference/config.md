@@ -43,6 +43,7 @@ City is the top-level configuration for a Gas City instance.
 | `service` | []Service |  |  | Services declares workspace-owned HTTP services mounted on the controller edge under /svc/&#123;name&#125;. |
 | `webhook` | []Webhook |  |  | Webhooks declares inbound HTTP receivers mounted on the supervisor edge under /hook/&#123;name&#125;. Composed like Services (pack concatenation + SourceDir provenance + the default-closed public pack-guard). |
 | `webhooks` | WebhookPolicyConfig |  |  | WebhookPolicy holds city-level webhook governance (the [webhooks] table, notably allow_public grants). Authored only in the root city.toml; never merged from packs or fragments so a pack cannot grant itself exposure. |
+| `routing` | RoutingPolicyConfig |  |  | RoutingPolicy holds city-level staff-routing governance (the [routing] table: officer-of-record exempt set + value domain). Authored only in the root city.toml; never merged from packs or fragments so a pack cannot grant itself a routing exemption. See RoutingPolicyConfig. |
 | `github` | GitHubConfig |  |  | GitHub configures GitHub-facing repository monitors. |
 | `extmsg` | ExtMsgConfig |  |  | ExtMsg configures the external-messaging fabric (default routes for inbound conversations with no binding). |
 | `agent_defaults` | AgentDefaults |  |  | AgentDefaults provides root city defaults for agents that don't override them (canonical TOML key: agent_defaults). Pack-local defaults use the same table shape in pack.toml. The runtime currently applies provider, default_sling_formula, and append_fragments; the attachment-list fields remain tombstones, and the other fields are parsed/composed but not yet inherited automatically. |
@@ -669,6 +670,7 @@ ProviderPatch modifies an existing provider identified by Name.
 | `prompt_flag` | string |  |  | PromptFlag overrides the prompt flag. |
 | `ready_delay_ms` | integer |  |  | ReadyDelayMs overrides the ready delay in milliseconds. |
 | `accept_startup_dialogs` | boolean |  |  | AcceptStartupDialogs overrides startup dialog acceptance behavior. |
+| `max_seats` | integer |  |  | MaxSeats overrides the provider's concurrent active-session cap (nil = patch does not touch max_seats; same nil/-1/N semantics as ProviderSpec.MaxSeats once applied). |
 | `env` | map[string]string |  |  | Env adds or overrides environment variables. |
 | `env_remove` | []string |  |  | EnvRemove lists env var keys to remove. |
 | `_replace` | boolean |  |  | Replace replaces the entire provider block instead of deep-merging. |
@@ -680,6 +682,7 @@ ProviderSpec defines a named provider's startup parameters.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `base` | string |  |  | Base names the parent provider this spec inherits from. Supported forms:   "&lt;name&gt;"          - custom first (self-excluded), then built-in   "builtin:&lt;name&gt;"  - force built-in lookup   "provider:&lt;name&gt;" - force custom lookup   ""                - explicit standalone opt-out   nil               - field absent; no explicit declaration |
+| `max_seats` | integer |  |  | MaxSeats caps the number of concurrent active sessions attributed to this provider (via each session's template-&gt;provider resolution), enforced by the spawn preflight gate (ga-mpb0xu). Semantics mirror Agent.MaxActiveSessions: nil = not configured (gate fails open, no cap enforced), -1 = explicitly unlimited, 0 or positive = literal seat cap. Distinct from Agent/pool-level MaxActiveSessions, which caps one template's own session count, not the provider's aggregate across all templates that resolve to it. |
 | `args_append` | []string |  |  | ArgsAppend accumulates extra args after each layer's Args replacement. |
 | `options_schema_merge` | string |  |  | OptionsSchemaMerge controls OptionsSchema merge mode across the chain: "replace" (default) or "by_key". Enum: `replace`, `by_key` |
 | `display_name` | string |  |  | DisplayName is the human-readable name shown in UI and logs. |
@@ -749,6 +752,25 @@ RigPatch modifies an existing rig identified by Name.
 | `suspended` | boolean |  |  | Suspended is the deprecated, pre-runtime-state suspension override. Parsed for backwards compatibility; `gc doctor` surfaces it as a warning and recommends the rename to SuspendedOnStart. No behavioral code path reads it. |
 | `suspended_on_start` | boolean |  |  | SuspendedOnStart overrides the rig's desired suspension state at city start. Mirrors Rig.SuspendedOnStart. |
 | `formula_vars` | map[string]string |  |  | FormulaVars adds or overrides rig-scoped formula var defaults. Additive merge: patch keys win over existing rig keys, unspecified keys are preserved. |
+
+## RoutingExemptGroup
+
+RoutingExemptGroup names one category of routing-exempt personas, purely for provenance/readability in city.toml (e.g.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | string | **yes** |  | Name labels the group for humans reading city.toml. Not read at runtime. |
+| `personas` | []string |  |  | Personas lists the persona identifiers exempt from the officer-of-record gate by virtue of membership in this group. |
+
+## RoutingPolicyConfig
+
+RoutingPolicyConfig holds city-level staff-routing governance authored in the root city.toml under [routing].
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `routing_exempt` | []RoutingExemptGroup |  |  | RoutingExempt lists personas that are legal gc sling targets without gc.officer_of_record metadata on the target bead (officers, CoS office, independent audit, meta seats — accountable-by-construction actors, not staff specialists). |
+| `officer_of_record_value_domain` | []string |  |  | OfficerOfRecordValueDomain lists the legal values for a stamped gc.officer_of_record (the department officers plus "operator"). Not enforced by the sling gate itself (which only checks presence) — used by doctrine/lint-layer tooling that additionally validates the stamped value, kept here so both layers can reference one declared domain. |
+| `reports_to` | map[string]string |  |  | ReportsTo maps a staff persona to the officer_of_record value gc sling should auto-stamp when routing to that persona and the target bead does not yet carry gc.officer_of_record. Source of truth for the mapping is rigs/personas/doctrine/agent-org-departments-v2-2026-07-12.md (the Reports-to column) — kept in sync by hand, same discipline as RoutingExempt/OfficerOfRecordValueDomain above. Deliberately omits personas already covered by RoutingExempt (officers, CoS office, independent audit, meta): Exempt() short-circuits before this map is ever consulted for them, so an entry there would be dead data. This is the "fix at the source" ga-owbb42 asks for: stamping here, before checkOfficerOfRecord evaluates, means a mapped persona never trips the gate in the first place instead of being caught by fleet-lint V8 24h later or requiring a human hand-stamp mid-dispatch. |
 
 ## Service
 

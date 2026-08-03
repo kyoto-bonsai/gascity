@@ -2374,8 +2374,10 @@ gc mail read <id> [flags]
 Reply to a message. The reply is addressed to the original sender.
 
 Inherits the thread ID from the original message for conversation tracking.
-Use --notify to nudge the recipient after replying.
-Use -s/--subject for the reply subject and -m/--message for the reply body.
+If the recipient is a currently-live session, it is nudged automatically --
+no flag required. Use -s/--subject for the reply subject and -m/--message
+for the reply body. --notify/--nudge are accepted for backward compatibility
+and have no additional effect.
 
 ```
 gc mail reply <id> [-s subject] [-m body] [flags]
@@ -2385,7 +2387,7 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | reply body text |
-| `--notify` | bool |  | nudge the recipient about this reply, even if earlier mail is still unread |
+| `--notify` | bool |  | no-op, kept for backward compatibility -- live recipients are nudged automatically |
 | `-s`, `--subject` | string |  | reply subject line |
 
 ## gc mail send
@@ -2393,17 +2395,19 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to nudge
-the recipient after sending. Use --from to override the sender identity.
-Use --to as an alternative to the positional &lt;to&gt; argument.
-Use -s/--subject for the summary line and -m/--message for the body text.
-Use --body-file to read the body from a file instead (pass - for stdin).
-Prefer --body-file over -m/positional body when the text may contain
-backticks or $(...): the invoking shell expands those as command
-substitution inside a double-quoted argument before gc ever sees them,
-silently corrupting (or executing) the body. A file path never transits a
-shell argument, so its contents round-trip byte-for-byte.
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". If the recipient is a
+currently-live session, it is nudged automatically -- no flag required.
+Use --from to override the sender identity. Use --to as an alternative to
+the positional &lt;to&gt; argument. Use -s/--subject for the summary line and
+-m/--message for the body text. Use --body-file to read the body from a file
+instead (pass - for stdin). Prefer --body-file over -m/positional body when
+the text may contain backticks or $(...): the invoking shell expands those
+as command substitution inside a double-quoted argument before gc ever sees
+them, silently corrupting (or executing) the body. A file path never
+transits a shell argument, so its contents round-trip byte-for-byte.
 Use --all to broadcast to all live sessions (excluding sender and "human").
+--notify/--nudge are accepted for backward compatibility and have no
+additional effect.
 
 ```
 gc mail send [<to>] [<body>] [flags]
@@ -2418,7 +2422,6 @@ gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last
 gc mail send myrig/witness -s "Findings" --body-file findings.md
 gc mail send --to mayor "Build is green"
 gc mail send human "Review needed for PR #42"
-gc mail send polecat "Priority task" --notify
 gc mail send --all "Status update: tests passing"
 ```
 
@@ -2429,7 +2432,7 @@ gc mail send --all "Status update: tests passing"
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
-| `--notify` | bool |  | nudge the recipient about this message, even if earlier mail is still unread |
+| `--notify` | bool |  | no-op, kept for backward compatibility -- live recipients are nudged automatically |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
@@ -3919,6 +3922,7 @@ gc session new helper --no-attach
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--alias` | string |  | human-friendly session identifier for commands and mail |
+| `--force-degraded` | bool |  | bypass the spawn preflight gate (stale supervisor binary / aged pending-creates) — use only when you understand the risk |
 | `--json` | bool |  | JSON output |
 | `--no-attach` | bool |  | create session without attaching |
 | `--title` | string |  | human-readable session title |
@@ -4236,6 +4240,12 @@ unless the compiled root is Ready-visible — a v2 workflow root or a
 root-only wisp. See docs/reference/specs/formula-spec-v2.md for the formula
 format and contract details.
 
+Wake-on-dispatch is the default: after routing, the target is nudged
+automatically so a parked/asleep session claims the work without waiting for
+a human or orchestrator to notice and nudge it by hand. Use --no-nudge to
+route only (the old default), e.g. for a batch caller that nudges once at
+the end itself.
+
 Examples:
   gc sling my-rig/claude BL-42              # route existing bead
   gc sling my-rig/claude "write a README"   # create bead from text, then route
@@ -4250,12 +4260,14 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 |------|------|---------|-------------|
 | `-n`, `--dry-run` | bool |  | show what would be done without executing |
 | `--force` | bool |  | suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store |
+| `--force-degraded` | bool |  | bypass the spawn preflight gate (stale supervisor binary / aged pending-creates) — use only when you understand the risk |
 | `-f`, `--formula` | bool |  | treat argument as formula name |
 | `--json` | bool |  | Output dispatch result in JSON format |
 | `--merge` | string |  | merge strategy: direct, mr, or local |
 | `--no-convoy` | bool |  | skip auto-convoy creation |
 | `--no-formula` | bool |  | suppress default formula (route raw bead) |
-| `--nudge` | bool |  | nudge target after routing |
+| `--no-nudge` | bool |  | skip the automatic wake-nudge after routing (opt out of wake-on-dispatch) |
+| `--nudge` | bool |  | nudge target after routing (default behavior; kept for back-compat, see --no-nudge) |
 | `--on` | string |  | attach wisp from formula to bead before routing |
 | `--owned` | bool |  | mark auto-convoy as owned (skip auto-close) |
 | `--reassign` | bool |  | clear any existing human assignee before routing (for human→pool handoff) |

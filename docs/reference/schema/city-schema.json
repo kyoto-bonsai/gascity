@@ -1226,6 +1226,10 @@
           "$ref": "#/$defs/WebhookPolicyConfig",
           "description": "WebhookPolicy holds city-level webhook governance (the [webhooks] table,\nnotably allow_public grants). Authored only in the root city.toml; never\nmerged from packs or fragments so a pack cannot grant itself exposure."
         },
+        "routing": {
+          "$ref": "#/$defs/RoutingPolicyConfig",
+          "description": "RoutingPolicy holds city-level staff-routing governance (the [routing]\ntable: officer-of-record exempt set + value domain). Authored only in\nthe root city.toml; never merged from packs or fragments so a pack\ncannot grant itself a routing exemption. See RoutingPolicyConfig."
+        },
         "github": {
           "$ref": "#/$defs/GitHubConfig",
           "description": "GitHub configures GitHub-facing repository monitors."
@@ -2306,6 +2310,10 @@
           "type": "boolean",
           "description": "AcceptStartupDialogs overrides startup dialog acceptance behavior."
         },
+        "max_seats": {
+          "type": "integer",
+          "description": "MaxSeats overrides the provider's concurrent active-session cap\n(nil = patch does not touch max_seats; same nil/-1/N semantics as\nProviderSpec.MaxSeats once applied)."
+        },
         "env": {
           "additionalProperties": {
             "type": "string"
@@ -2337,6 +2345,10 @@
         "base": {
           "type": "string",
           "description": "Base names the parent provider this spec inherits from. Supported\nforms:\n  \"\u003cname\u003e\"          - custom first (self-excluded), then built-in\n  \"builtin:\u003cname\u003e\"  - force built-in lookup\n  \"provider:\u003cname\u003e\" - force custom lookup\n  \"\"                - explicit standalone opt-out\n  nil               - field absent; no explicit declaration"
+        },
+        "max_seats": {
+          "type": "integer",
+          "description": "MaxSeats caps the number of concurrent active sessions attributed to\nthis provider (via each session's template-\u003eprovider resolution),\nenforced by the spawn preflight gate (ga-mpb0xu). Semantics mirror\nAgent.MaxActiveSessions: nil = not configured (gate fails open, no\ncap enforced), -1 = explicitly unlimited, 0 or positive = literal\nseat cap. Distinct from Agent/pool-level MaxActiveSessions, which\ncaps one template's own session count, not the provider's aggregate\nacross all templates that resolve to it."
         },
         "args_append": {
           "items": {
@@ -2641,6 +2653,55 @@
         "name"
       ],
       "description": "RigPatch modifies an existing rig identified by Name."
+    },
+    "RoutingExemptGroup": {
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name labels the group for humans reading city.toml. Not read at runtime."
+        },
+        "personas": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Personas lists the persona identifiers exempt from the officer-of-record\ngate by virtue of membership in this group."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "description": "RoutingExemptGroup names one category of routing-exempt personas, purely for provenance/readability in city.toml (e.g."
+    },
+    "RoutingPolicyConfig": {
+      "properties": {
+        "routing_exempt": {
+          "items": {
+            "$ref": "#/$defs/RoutingExemptGroup"
+          },
+          "type": "array",
+          "description": "RoutingExempt lists personas that are legal gc sling targets without\ngc.officer_of_record metadata on the target bead (officers, CoS office,\nindependent audit, meta seats — accountable-by-construction actors,\nnot staff specialists)."
+        },
+        "officer_of_record_value_domain": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OfficerOfRecordValueDomain lists the legal values for a stamped\ngc.officer_of_record (the department officers plus \"operator\"). Not\nenforced by the sling gate itself (which only checks presence) — used\nby doctrine/lint-layer tooling that additionally validates the stamped\nvalue, kept here so both layers can reference one declared domain."
+        },
+        "reports_to": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "ReportsTo maps a staff persona to the officer_of_record value gc sling\nshould auto-stamp when routing to that persona and the target bead does\nnot yet carry gc.officer_of_record. Source of truth for the mapping is\nrigs/personas/doctrine/agent-org-departments-v2-2026-07-12.md (the\nReports-to column) — kept in sync by hand, same discipline as\nRoutingExempt/OfficerOfRecordValueDomain above. Deliberately omits\npersonas already covered by RoutingExempt (officers, CoS office,\nindependent audit, meta): Exempt() short-circuits before this map is\never consulted for them, so an entry there would be dead data. This is\nthe \"fix at the source\" ga-owbb42 asks for: stamping here, before\ncheckOfficerOfRecord evaluates, means a mapped persona never trips the\ngate in the first place instead of being caught by fleet-lint V8 24h\nlater or requiring a human hand-stamp mid-dispatch."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RoutingPolicyConfig holds city-level staff-routing governance authored in the root city.toml under [routing]."
     },
     "Service": {
       "properties": {
