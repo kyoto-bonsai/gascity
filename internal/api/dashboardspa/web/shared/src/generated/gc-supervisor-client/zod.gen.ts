@@ -1722,6 +1722,16 @@ export const zSessionRespondOutputBody = z.object({
     status: z.string()
 });
 
+export const zSessionSleptPayload = z.object({
+    idle_duration_s: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }).optional(),
+    policy_class: z.string().optional(),
+    reason: z.string(),
+    resolution_source: z.string().optional(),
+    resolved_ttl: z.string().optional(),
+    session_name: z.string(),
+    template: z.string()
+});
+
 export const zSessionStrandedPayload = z.object({
     session_id: z.string(),
     session_name: z.string().optional(),
@@ -3318,6 +3328,7 @@ export const zEventPayload = z.union([
     zSessionLifecyclePayload,
     zSessionMessageSucceededPayload,
     zSessionResetStalledPayload,
+    zSessionSleptPayload,
     zSessionStrandedPayload,
     zSessionSubmitSucceededPayload,
     zSessionUnknownStatePayload,
@@ -4796,6 +4807,42 @@ export const zTypedEventStreamEnvelopeSessionResetStalled = z.object({
 });
 
 /**
+ * TypedEventStreamEnvelope session.resumed
+ */
+export const zTypedEventStreamEnvelopeSessionResumed = z.object({
+    actor: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zNoPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('session.resumed'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
+ * TypedEventStreamEnvelope session.slept
+ */
+export const zTypedEventStreamEnvelopeSessionSlept = z.object({
+    actor: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zSessionSleptPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('session.slept'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
  * TypedEventStreamEnvelope session.stopped
  */
 export const zTypedEventStreamEnvelopeSessionStopped = z.object({
@@ -5254,6 +5301,8 @@ export const zTypedEventStreamEnvelope = z.discriminatedUnion('type', [
     zTypedEventStreamEnvelopeSessionMaxAgeKilled.extend({ type: z.literal('session.max_age_killed') }),
     zTypedEventStreamEnvelopeSessionQuarantined.extend({ type: z.literal('session.quarantined') }),
     zTypedEventStreamEnvelopeSessionResetStalled.extend({ type: z.literal('session.reset_stalled') }),
+    zTypedEventStreamEnvelopeSessionResumed.extend({ type: z.literal('session.resumed') }),
+    zTypedEventStreamEnvelopeSessionSlept.extend({ type: z.literal('session.slept') }),
     zTypedEventStreamEnvelopeSessionStopped.extend({ type: z.literal('session.stopped') }),
     zTypedEventStreamEnvelopeSessionStranded.extend({ type: z.literal('session.stranded') }),
     zTypedEventStreamEnvelopeSessionSuspended.extend({ type: z.literal('session.suspended') }),
@@ -6731,6 +6780,44 @@ export const zTypedTaggedEventStreamEnvelopeSessionResetStalled = z.object({
 });
 
 /**
+ * TypedTaggedEventStreamEnvelope session.resumed
+ */
+export const zTypedTaggedEventStreamEnvelopeSessionResumed = z.object({
+    actor: z.string(),
+    city: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zNoPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('session.resumed'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
+ * TypedTaggedEventStreamEnvelope session.slept
+ */
+export const zTypedTaggedEventStreamEnvelopeSessionSlept = z.object({
+    actor: z.string(),
+    city: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zSessionSleptPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('session.slept'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
  * TypedTaggedEventStreamEnvelope session.stopped
  */
 export const zTypedTaggedEventStreamEnvelopeSessionStopped = z.object({
@@ -7210,6 +7297,8 @@ export const zTypedTaggedEventStreamEnvelope = z.discriminatedUnion('type', [
     zTypedTaggedEventStreamEnvelopeSessionMaxAgeKilled.extend({ type: z.literal('session.max_age_killed') }),
     zTypedTaggedEventStreamEnvelopeSessionQuarantined.extend({ type: z.literal('session.quarantined') }),
     zTypedTaggedEventStreamEnvelopeSessionResetStalled.extend({ type: z.literal('session.reset_stalled') }),
+    zTypedTaggedEventStreamEnvelopeSessionResumed.extend({ type: z.literal('session.resumed') }),
+    zTypedTaggedEventStreamEnvelopeSessionSlept.extend({ type: z.literal('session.slept') }),
     zTypedTaggedEventStreamEnvelopeSessionStopped.extend({ type: z.literal('session.stopped') }),
     zTypedTaggedEventStreamEnvelopeSessionStranded.extend({ type: z.literal('session.stranded') }),
     zTypedTaggedEventStreamEnvelopeSessionSuspended.extend({ type: z.literal('session.suspended') }),

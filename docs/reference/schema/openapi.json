@@ -2599,6 +2599,9 @@
             "$ref": "#/components/schemas/SessionResetStalledPayload"
           },
           {
+            "$ref": "#/components/schemas/SessionSleptPayload"
+          },
+          {
             "$ref": "#/components/schemas/SessionStrandedPayload"
           },
           {
@@ -7823,6 +7826,39 @@
         ],
         "type": "object"
       },
+      "SessionSleptPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "idle_duration_s": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "policy_class": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "resolution_source": {
+            "type": "string"
+          },
+          "resolved_ttl": {
+            "type": "string"
+          },
+          "session_name": {
+            "type": "string"
+          },
+          "template": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_name",
+          "template",
+          "reason"
+        ],
+        "type": "object"
+      },
       "SessionStrandedPayload": {
         "additionalProperties": false,
         "properties": {
@@ -12274,6 +12310,8 @@
             "session.max_age_killed": "#/components/schemas/TypedEventStreamEnvelopeSessionMaxAgeKilled",
             "session.quarantined": "#/components/schemas/TypedEventStreamEnvelopeSessionQuarantined",
             "session.reset_stalled": "#/components/schemas/TypedEventStreamEnvelopeSessionResetStalled",
+            "session.resumed": "#/components/schemas/TypedEventStreamEnvelopeSessionResumed",
+            "session.slept": "#/components/schemas/TypedEventStreamEnvelopeSessionSlept",
             "session.stopped": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedEventStreamEnvelopeSessionSuspended",
@@ -12523,6 +12561,12 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionResetStalled"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionResumed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionSlept"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped"
@@ -13840,6 +13884,8 @@
                 "session.max_age_killed",
                 "session.suspended",
                 "session.updated",
+                "session.slept",
+                "session.resumed",
                 "session.drain_acked_with_assigned_work",
                 "session.stranded",
                 "session.unknown_state",
@@ -17022,6 +17068,120 @@
         "title": "TypedEventStreamEnvelope session.reset_stalled",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSessionResumed": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.resumed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.resumed",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeSessionSlept": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionSleptPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.slept",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.slept",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeSessionStopped": {
         "additionalProperties": false,
         "properties": {
@@ -18298,6 +18458,8 @@
             "session.max_age_killed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled",
             "session.quarantined": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionQuarantined",
             "session.reset_stalled": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResetStalled",
+            "session.resumed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResumed",
+            "session.slept": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSlept",
             "session.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSuspended",
@@ -18547,6 +18709,12 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResetStalled"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResumed"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSlept"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped"
@@ -19951,6 +20119,8 @@
                 "session.max_age_killed",
                 "session.suspended",
                 "session.updated",
+                "session.slept",
+                "session.resumed",
                 "session.drain_acked_with_assigned_work",
                 "session.stranded",
                 "session.unknown_state",
@@ -23348,6 +23518,128 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.reset_stalled",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionResumed": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.resumed",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.resumed",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionSlept": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionSleptPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.slept",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.slept",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionStopped": {
