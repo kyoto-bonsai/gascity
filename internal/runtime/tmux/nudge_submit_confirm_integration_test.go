@@ -3,7 +3,9 @@
 package tmux
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -125,5 +127,70 @@ func TestNudgeSessionReEntersUntilSubmittedForClaude(t *testing.T) {
 	}
 	if !strings.Contains(out, "esc to interrupt") {
 		t.Fatalf("never reached submitted/busy state after re-send:\n%s", out)
+	}
+}
+
+// TestNudgeSessionLogsPayloadOnExhaustionForClaude proves the ga-9rqtdh
+// instrumentation end-to-end against real tmux: when the pane never goes busy
+// within the submit-confirm budget (every Enter dropped), NudgeSession still
+// returns nil — the historical "nil == handed to tmux" fail-open contract is
+// unchanged, so callers do not re-paste — but it logs the undelivered payload
+// text, not just the fact of the failure. Without this, a drafted message is
+// unrecoverable the moment the holding pane dies (the ga-9rqtdh cross-family
+// instance: a lost operator ruling with no other durable copy anywhere).
+func TestNudgeSessionLogsPayloadOnExhaustionForClaude(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	tm := testTmux()
+	dir := t.TempDir()
+	fake := buildBusyOnEnterBinary(t, dir, "fakeclaude")
+	sessionName := fmt.Sprintf("gt-test-nudge-exhaust-%d", time.Now().UnixNano()%100000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, dir, fake, map[string]string{
+		"GC_PROVIDER": "claude",
+		// Beyond submitEnterMaxSends (3): the fake agent never goes busy
+		// within budget, forcing the exhaustion path.
+		"GC_TEST_BUSY_AFTER": "5",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	const payload = "defer the re-derivation project — record it and close the loop"
+
+	var logBuf bytes.Buffer
+	prevOut := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+
+	if err := tm.NudgeSession(sessionName, payload); err != nil {
+		t.Fatalf("NudgeSession: expected fail-open (nil) on exhaustion per the historical contract, got error: %v", err)
+	}
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if !strings.Contains(out, fmt.Sprintf("ENTER#%d", submitEnterMaxSends)) {
+		t.Fatalf("expected all %d Enter attempts to be sent before giving up:\n%s", submitEnterMaxSends, out)
+	}
+	if strings.Contains(out, "esc to interrupt") {
+		t.Fatalf("fake agent went busy — this test requires the never-busy exhaustion path, adjust GC_TEST_BUSY_AFTER:\n%s", out)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, "ga-9rqtdh") {
+		t.Fatalf("exhaustion log line missing entirely — the failure mode is silent again:\n%s", logged)
+	}
+	if !strings.Contains(logged, payload) {
+		t.Fatalf("exhaustion log line did not include the undelivered payload — the drafted text is still unrecoverable once the pane dies:\n%s", logged)
 	}
 }

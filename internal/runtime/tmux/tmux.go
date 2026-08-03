@@ -1794,6 +1794,19 @@ func (t *Tmux) submitVerifyEligible(target string) bool {
 	return t.targetLooksLikeProvider(target, "claude")
 }
 
+// truncateForLog caps a string for inclusion in a log line so an unusually
+// long drafted message can't blow out log output. Recovering payloads longer
+// than this from the log is a follow-on concern (a durable queue/journal),
+// not this line's job — it exists to make the common case (a routing
+// instruction or short ruling) recoverable, not to be a backup store.
+func truncateForLog(s string) string {
+	const maxLogPayloadLen = 500
+	if len(s) <= maxLogPayloadLen {
+		return s
+	}
+	return s[:maxLogPayloadLen] + "...(truncated)"
+}
+
 // NudgeSession sends a message to a Claude Code session reliably.
 // This is the canonical way to send messages to Claude sessions.
 // Uses: literal mode + 500ms debounce + separate Enter.
@@ -1871,10 +1884,14 @@ func (t *Tmux) NudgeSession(session, message string) error {
 			// within budget. This still fail-opens by the historical "nil ==
 			// handed to tmux" contract below, so the caller sees success even
 			// though the message may be drafted but never actually submitted
-			// (ga-9rqtdh). Logged so that failure mode is measurable instead
-			// of silent, pending a decision on whether the contract itself
-			// should change.
-			log.Printf("tmux nudge: submit Enter delivered to %q after %d attempt(s) but busy-transition never observed — message may be drafted but not submitted (see ga-9rqtdh)", target, submitEnterMaxSends)
+			// (ga-9rqtdh). The payload is logged alongside the failure — not
+			// just the fact of it — because the drafted text lives only in the
+			// pane's terminal buffer: if the holding session dies before anyone
+			// reads it, this log line is the only durable copy left (confirmed
+			// unrecoverable in practice on ga-9rqtdh, where an operator ruling
+			// sent as a nudge was lost this way). Pending a decision on whether
+			// the fail-open contract itself should change.
+			log.Printf("tmux nudge: submit Enter delivered to %q after %d attempt(s) but busy-transition never observed — message may be drafted but not submitted (see ga-9rqtdh); undelivered payload: %s", target, submitEnterMaxSends, truncateForLog(message))
 		}
 		return nil
 	}
