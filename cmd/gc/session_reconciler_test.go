@@ -6128,6 +6128,60 @@ func TestReconcileSessionBeads_OrphanNotRunningClosed(t *testing.T) {
 	}
 }
 
+// TestReconcileSessionBeads_OrphanNotRunningWithAssignedWorkStaysOpen is the
+// not-running sibling of TestReconcileSessionBeads_OrphanDrainLiveAssignedWorkStaysOpen:
+// an undesired pool session with a dead runtime must not be closed by the
+// runtime-missing orphan-close path (session_reconciler.go's `if !desired`
+// block, !providerAlive arm) while it still holds live in-progress assigned
+// work. closeSessionBeadIfReachableStoreUnassigned (session_work_guard.go)
+// live-queries assigned work before every close in this path and must refuse.
+// Regression pin for the ga-zxr7gr/ga-yc9ub0/ga-4m2ze7 RCA chain (diagnostic_
+// gc-seat-concurrency-2026-06-09.md): a seat holding a claimed bead must
+// survive every reap path, not just idle-sleep or the alive/drain path.
+func TestReconcileSessionBeads_OrphanNotRunningWithAssignedWorkStaysOpen(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "other"}}}
+	session := env.createSessionBead("orphan", "orphan")
+
+	work, err := env.store.Create(beads.Bead{
+		Title:    "claimed work",
+		Type:     "task",
+		Assignee: session.Metadata["session_name"],
+	})
+	if err != nil {
+		t.Fatalf("Create assigned work bead: %v", err)
+	}
+	// MemStore.Create always forces Status="open" regardless of the input
+	// Bead (internal/beads/memstore.go), so the in_progress transition must
+	// be a separate Update — matching the working pattern in
+	// pool_session_name_test.go's KeepsOpenSessionOwnership. A Status field
+	// set directly in the Create call above would silently no-op.
+	if err := env.store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status in_progress: %v", err)
+	}
+
+	env.reconcile([]beads.Bead{session})
+
+	b, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get session bead: %v", err)
+	}
+	if b.Status == "closed" {
+		t.Fatalf("session bead was closed despite live in-progress assigned work; status=%q close_reason=%q", b.Status, b.Metadata["close_reason"])
+	}
+
+	gotWork, err := env.store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get work bead: %v", err)
+	}
+	if gotWork.Status != "in_progress" {
+		t.Errorf("work status = %q, want in_progress (must not be released while owner session is unclosed)", gotWork.Status)
+	}
+	if gotWork.Assignee != session.Metadata["session_name"] {
+		t.Errorf("work assignee = %q, want %q", gotWork.Assignee, session.Metadata["session_name"])
+	}
+}
+
 func TestReconcileSessionBeads_SuspendedSessionDrained(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
