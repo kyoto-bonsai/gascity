@@ -131,7 +131,9 @@ func emitPoolCreateBudgetGateAlert(cityPath, qualifiedName string, since time.Ti
 		"Pool session-create budget gate OPEN: template=%s since=%s deferred=%d. "+
 			"Fresh spawns for %s are being deferred (shared daemon.max_wakes_per_tick budget "+
 			"exhausted this tick); existing-session reuse is unaffected. Check `gc session list` "+
-			"for idle/finished seats holding slots, or raise [daemon].max_wakes_per_tick.",
+			"for idle/finished seats holding slots. Do NOT raise [daemon].max_wakes_per_tick to "+
+			"compensate (see ga-v8mtlp: raising the rate limiter to mask a slot-release problem "+
+			"is what produced the 105-seat herd).",
 		qualifiedName, since.UTC().Format(time.RFC3339), deferCount, qualifiedName,
 	)
 	fmt.Fprintln(stderr, msg) //nolint:errcheck

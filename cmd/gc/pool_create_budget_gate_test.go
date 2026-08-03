@@ -147,3 +147,27 @@ func TestEmitPoolCreateBudgetGateAlert_Format(t *testing.T) {
 		}
 	}
 }
+
+// TestEmitPoolCreateBudgetGateAlert_DoesNotAdviseTheForbiddenRemedy guards
+// ga-n75udx: the gate's own remediation text must never coach raising
+// [daemon].max_wakes_per_tick — city.toml:150-152 forbids re-raising it
+// without a machine-checked revert trigger (ga-v8mtlp), so the alert most
+// likely to be read during slot pressure must not point at the one remedy
+// that reproduces the thundering herd. Asserted on the emitted message, not
+// the source constant, per the bead's acceptance criterion.
+func TestEmitPoolCreateBudgetGateAlert_DoesNotAdviseTheForbiddenRemedy(t *testing.T) {
+	var captured string
+	w := &capWriter{fn: func(b []byte) { captured += string(b) }}
+	since := time.Date(2026, 7, 26, 13, 12, 0, 0, time.UTC)
+
+	emitPoolCreateBudgetGateAlert(t.TempDir(), "seo-author/nils/reese", since, 7, since.Add(time.Minute), w)
+
+	if strings.Contains(captured, "or raise [daemon].max_wakes_per_tick") {
+		t.Errorf("alert message still coaches the forbidden remedy (see city.toml:150-152, ga-v8mtlp)\ngot: %s", captured)
+	}
+	for _, want := range []string{"Do NOT raise [daemon].max_wakes_per_tick", "ga-v8mtlp", "`gc session list`"} {
+		if !strings.Contains(captured, want) {
+			t.Errorf("alert message missing %q\ngot: %s", want, captured)
+		}
+	}
+}
