@@ -146,7 +146,7 @@ hooks to deliver mail notifications into agent prompts.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				fmt.Fprintln(stderr, "gc mail: missing subcommand (archive, check, count, delete, inbox, mark-read, mark-unread, peek, read, reply, send, thread)") //nolint:errcheck // best-effort stderr
+				fmt.Fprintln(stderr, "gc mail: missing subcommand (archive, check, count, delete, inbox, mark-read, mark-unread, peek, read, reply, resolve, send, sent, thread)") //nolint:errcheck // best-effort stderr
 			} else {
 				fmt.Fprintf(stderr, "gc mail: unknown subcommand %q\n", args[0]) //nolint:errcheck // best-effort stderr
 			}
@@ -165,6 +165,8 @@ hooks to deliver mail notifications into agent prompts.`,
 		newMailPeekCmd(stdout, stderr),
 		newMailReadCmd(stdout, stderr),
 		newMailReplyCmd(stdout, stderr),
+		newMailResolveCmd(stdout, stderr),
+		newMailSentCmd(stdout, stderr),
 		newMailThreadCmd(stdout, stderr),
 	)
 	return cmd
@@ -273,6 +275,53 @@ func doMailArchiveSelected(mp mail.Provider, rec events.Recorder, opts mailArchi
 type archiveMatchingProvider interface {
 	ArchiveCandidates(beadmail.ArchiveFilter) ([]mail.Message, error)
 	ArchiveMatching(beadmail.ArchiveFilter) ([]mail.Message, []mail.ArchiveResult, error)
+}
+
+// mailAskOptions carries the optional --expects-reply flag through the
+// send/reply call chain via a variadic tail parameter (see
+// applyExpectsReplyOption) rather than a new positional parameter, so the
+// dozens of existing doMailSend*/doMailReply* call sites in cmd_mail_test.go
+// that construct these functions directly with injected providers for
+// testability do not need to change.
+type mailAskOptions struct {
+	ExpectsReply bool
+}
+
+// firstMailAskOption returns the first option in opts, or the zero value
+// (ExpectsReply: false) when the caller passed none — the common case for
+// every pre-existing call site.
+func firstMailAskOption(opts []mailAskOptions) mailAskOptions {
+	if len(opts) == 0 {
+		return mailAskOptions{}
+	}
+	return opts[0]
+}
+
+// expectsReplyMarker is an optional beadmail-specific extension (mirroring
+// archiveMatchingProvider above): providers that cannot persist the
+// ask-marker (e.g. exec) degrade --expects-reply to a warned no-op rather
+// than failing the send outright, since the message itself still needs to go
+// out. It is deliberately not part of [mail.Provider] — see
+// beadmail.Provider.MarkExpectsReply's doc comment.
+type expectsReplyMarker interface {
+	MarkExpectsReply(id string) error
+}
+
+// applyExpectsReplyOption marks id as expecting a reply when opt.ExpectsReply
+// is set, warning (not failing — the message already sent) when the
+// configured provider does not support it or the marking call itself errors.
+func applyExpectsReplyOption(mp mail.Provider, id string, opt mailAskOptions, cmdName string, stderr io.Writer) {
+	if !opt.ExpectsReply {
+		return
+	}
+	marker, ok := mp.(expectsReplyMarker)
+	if !ok {
+		fmt.Fprintf(stderr, "%s: --expects-reply requires the beadmail provider; message %s sent without the retention exemption\n", cmdName, id) //nolint:errcheck // best-effort stderr
+		return
+	}
+	if err := marker.MarkExpectsReply(id); err != nil {
+		fmt.Fprintf(stderr, "%s: marking %s as expecting a reply: %v\n", cmdName, id, err) //nolint:errcheck // best-effort stderr
+	}
 }
 
 func doMailArchiveSelectedJSON(mp mail.Provider, rec events.Recorder, args []string, opts mailArchiveSelectOptions, jsonOut bool, stdout, stderr io.Writer) int {
@@ -1441,6 +1490,7 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var message string
 	var bodyFile string
 	var jsonOut bool
+	var expectsReply bool
 	cmd := &cobra.Command{
 		Use:   "send [<to>] [<body>]",
 		Short: "Send a message to a session alias or human",
@@ -1459,14 +1509,20 @@ them, silently corrupting (or executing) the body. A file path never
 transits a shell argument, so its contents round-trip byte-for-byte.
 Use --all to broadcast to all live sessions (excluding sender and "human").
 --notify/--nudge are accepted for backward compatibility and have no
-additional effect.`,
+additional effect.
+
+Use --expects-reply to mark this message as a decision ask: it is exempted
+from read-mail retention (the close sweep and the wisp purge) until a reply
+exists or "gc mail resolve" clears the exemption manually. Check disposition
+with "gc mail sent --outstanding".`,
 		Example: `  gc mail send mayor "Build is green"
   gc mail send mayor -s "Build is green"
   gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
   gc mail send myrig/witness -s "Findings" --body-file findings.md
   gc mail send --to mayor "Build is green"
   gc mail send human "Review needed for PR #42"
-  gc mail send --all "Status update: tests passing"`,
+  gc mail send --all "Status update: tests passing"
+  gc mail send human "Ship it?" --expects-reply`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			effectiveMessage := message
@@ -1486,11 +1542,12 @@ additional effect.`,
 				}
 				effectiveMessage = content
 			}
+			opt := mailAskOptions{ExpectsReply: expectsReply}
 			code := 0
 			if jsonOut {
-				code = cmdMailSendJSON(args, notify, all, from, to, subject, effectiveMessage, true, stdout, stderr)
+				code = cmdMailSendJSON(args, notify, all, from, to, subject, effectiveMessage, true, stdout, stderr, opt)
 			} else {
-				code = cmdMailSend(args, notify, all, from, to, subject, effectiveMessage, stdout, stderr)
+				code = cmdMailSend(args, notify, all, from, to, subject, effectiveMessage, stdout, stderr, opt)
 			}
 			if code != 0 {
 				return errExit
@@ -1508,6 +1565,7 @@ additional effect.`,
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
 	cmd.Flags().StringVar(&bodyFile, "body-file", "", "read message body from file (use - for stdin)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
+	cmd.Flags().BoolVar(&expectsReply, "expects-reply", false, "mark as a decision ask, exempt from read-mail retention until answered (see gc mail sent, gc mail resolve)")
 	cmd.MarkFlagsMutuallyExclusive("to", "all")
 	cmd.MarkFlagsMutuallyExclusive("message", "body-file")
 	return cmd
@@ -1600,6 +1658,7 @@ func newMailReplyCmd(stdout, stderr io.Writer) *cobra.Command {
 	var message string
 	var notify bool
 	var jsonOut bool
+	var expectsReply bool
 	cmd := &cobra.Command{
 		Use:   "reply <id> [-s subject] [-m body]",
 		Short: "Reply to a message",
@@ -1609,14 +1668,18 @@ Inherits the thread ID from the original message for conversation tracking.
 If the recipient is a currently-live session, it is nudged automatically --
 no flag required. Use -s/--subject for the reply subject and -m/--message
 for the reply body. --notify/--nudge are accepted for backward compatibility
-and have no additional effect.`,
+and have no additional effect.
+
+Use --expects-reply to mark the reply itself as a decision ask (same
+retention exemption as "gc mail send --expects-reply").`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
+			opt := mailAskOptions{ExpectsReply: expectsReply}
 			code := 0
 			if jsonOut {
-				code = cmdMailReplyJSON(args, subject, message, notify, true, stdout, stderr)
+				code = cmdMailReplyJSON(args, subject, message, notify, true, stdout, stderr, opt)
 			} else {
-				code = cmdMailReply(args, subject, message, notify, stdout, stderr)
+				code = cmdMailReply(args, subject, message, notify, stdout, stderr, opt)
 			}
 			if code != 0 {
 				return errExit
@@ -1629,6 +1692,7 @@ and have no additional effect.`,
 	cmd.Flags().BoolVar(&notify, "notify", false, "no-op, kept for backward compatibility -- live recipients are nudged automatically")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
+	cmd.Flags().BoolVar(&expectsReply, "expects-reply", false, "mark this reply as a decision ask, exempt from read-mail retention until answered")
 	_ = cmd.Flags().MarkHidden("nudge")
 	return cmd
 }
@@ -1747,11 +1811,11 @@ The recipient defaults to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human".`,
 // cmdMailSend is the CLI entry point for sending mail. It opens the provider,
 // resolves session mailbox identities, and delegates to doMailSend.
 // The to parameter is the --to flag value (empty if not set).
-func cmdMailSend(args []string, notify bool, all bool, from string, to string, subject string, message string, stdout, stderr io.Writer) int {
-	return cmdMailSendJSON(args, notify, all, from, to, subject, message, false, stdout, stderr)
+func cmdMailSend(args []string, notify bool, all bool, from string, to string, subject string, message string, stdout, stderr io.Writer, opts ...mailAskOptions) int {
+	return cmdMailSendJSON(args, notify, all, from, to, subject, message, false, stdout, stderr, opts...)
 }
 
-func cmdMailSendJSON(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, stdout, stderr io.Writer) int {
+func cmdMailSendJSON(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, stdout, stderr io.Writer, opts ...mailAskOptions) int {
 	mp, code := openCityMailProvider(stderr, "gc mail send")
 	if mp == nil {
 		return code
@@ -1853,21 +1917,21 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 
 	if all {
 		rec := openCityRecorder(stderr)
-		return doMailSendAllJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr)
+		return doMailSendAllJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr, opts...)
 	}
 
 	rec := openCityRecorder(stderr)
-	return doMailSendJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr)
+	return doMailSendJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr, opts...)
 }
 
 // doMailSend creates a message addressed to a recipient. args is [to, subject, body]
 // or [to, body] (subject="" if no -s flag). When nudgeFn is non-nil, the
 // recipient is nudged after message creation (skipped for "human").
-func doMailSend(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, stdout, stderr io.Writer) int {
-	return doMailSendJSON(mp, rec, validRecipients, sender, args, nudgeFn, false, stdout, stderr)
+func doMailSend(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, stdout, stderr io.Writer, opts ...mailAskOptions) int {
+	return doMailSendJSON(mp, rec, validRecipients, sender, args, nudgeFn, false, stdout, stderr, opts...)
 }
 
-func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer) int {
+func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer, opts ...mailAskOptions) int {
 	if len(args) < 2 {
 		fmt.Fprintln(stderr, "gc mail send: usage: gc mail send <to> <body>  OR  gc mail send <to> -s <subject> [-m <body>]") //nolint:errcheck // best-effort stderr
 		return 1
@@ -1895,6 +1959,7 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	applyExpectsReplyOption(mp, m.ID, firstMailAskOption(opts), "gc mail send", stderr)
 	rec.Record(events.Event{
 		Type:    events.MailSent,
 		Actor:   m.From,
@@ -1924,11 +1989,11 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 
 // doMailSendAll broadcasts a message to all live session mailboxes (excluding the
 // sender and "human"). With --all, args is [subject, body] or [body].
-func doMailSendAll(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, stdout, stderr io.Writer) int {
-	return doMailSendAllJSON(mp, rec, validRecipients, sender, args, nil, false, stdout, stderr)
+func doMailSendAll(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, stdout, stderr io.Writer, opts ...mailAskOptions) int {
+	return doMailSendAllJSON(mp, rec, validRecipients, sender, args, nil, false, stdout, stderr, opts...)
 }
 
-func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer) int {
+func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer, opts ...mailAskOptions) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail send --all: usage: gc mail send --all <body>") //nolint:errcheck // best-effort stderr
 		return 1
@@ -1965,6 +2030,7 @@ func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients ma
 			fmt.Fprintf(stderr, "gc mail send --all: sending to %s: %v\n", to, err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+		applyExpectsReplyOption(mp, m.ID, firstMailAskOption(opts), "gc mail send --all", stderr)
 		rec.Record(events.Event{
 			Type:    events.MailSent,
 			Actor:   m.From,
@@ -2212,11 +2278,11 @@ func doMailPeekWithJSON(mp mail.Provider, args []string, jsonOut bool, stdout, s
 }
 
 // cmdMailReply replies to a message.
-func cmdMailReply(args []string, subject, message string, notify bool, stdout, stderr io.Writer) int {
-	return cmdMailReplyJSON(args, subject, message, notify, false, stdout, stderr)
+func cmdMailReply(args []string, subject, message string, notify bool, stdout, stderr io.Writer, opts ...mailAskOptions) int {
+	return cmdMailReplyJSON(args, subject, message, notify, false, stdout, stderr, opts...)
 }
 
-func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonOut bool, stdout, stderr io.Writer) int {
+func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonOut bool, stdout, stderr io.Writer, opts ...mailAskOptions) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail reply: missing message ID") //nolint:errcheck // best-effort stderr
 		return 1
@@ -2292,21 +2358,22 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 		fmt.Fprintf(stderr, "gc mail reply: --notify requested but no city store available; nudge skipped: %v\n", notifySetupErr) //nolint:errcheck // best-effort stderr
 	}
 
-	return doMailReplyJSON(mp, rec, args[0], sender, subject, body, nf, jsonOut, stdout, stderr)
+	return doMailReplyJSON(mp, rec, args[0], sender, subject, body, nf, jsonOut, stdout, stderr, opts...)
 }
 
 // doMailReply creates a reply to an existing message.
-func doMailReply(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, stdout, stderr io.Writer) int {
-	return doMailReplyJSON(mp, rec, id, sender, subject, body, nudgeFn, false, stdout, stderr)
+func doMailReply(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, stdout, stderr io.Writer, opts ...mailAskOptions) int {
+	return doMailReplyJSON(mp, rec, id, sender, subject, body, nudgeFn, false, stdout, stderr, opts...)
 }
 
-func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer) int {
+func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer, opts ...mailAskOptions) int {
 	reply, err := mp.Reply(id, sender, subject, body)
 	telemetry.RecordMailOp(context.Background(), "reply", err)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail reply: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	applyExpectsReplyOption(mp, reply.ID, firstMailAskOption(opts), "gc mail reply", stderr)
 	rec.Record(events.Event{
 		Type:    events.MailReplied,
 		Actor:   reply.From,

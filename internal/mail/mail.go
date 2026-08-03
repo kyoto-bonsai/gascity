@@ -40,6 +40,13 @@ const (
 	// ("true"/"false"), set alongside the label by MarkRead/MarkUnread. Retention
 	// sweeps query it directly (the label-based query is recipient-scoped).
 	ReadMetadataKey = "mail.read"
+	// ExpectsReplyMetadataKey marks a message as a decision ask ("true"/"false"),
+	// set by --expects-reply on `gc mail send`/`gc mail reply` or cleared by
+	// `gc mail resolve`. Opt-in and narrow by design: it exempts a message from
+	// the read-mail retention sweep and wisp purge until a reply-to: labelled
+	// reply exists (see beadmail.HasReply), so read-and-unanswered decision
+	// requests stop being indistinguishable from read-and-resolved ones.
+	ExpectsReplyMetadataKey = "mail.expects_reply"
 )
 
 // Message represents a mail message between agents or humans.
@@ -56,6 +63,10 @@ type Message struct {
 	Priority  int       `json:"priority,omitempty"`
 	CC        []string  `json:"cc,omitempty"`
 	Rig       string    `json:"rig,omitempty"`
+	// ExpectsReply mirrors [ExpectsReplyMetadataKey]: true when this message
+	// was sent with --expects-reply and is therefore exempt from read-mail
+	// retention until answered. See beadmail.HasReply for the answered check.
+	ExpectsReply bool `json:"expects_reply,omitempty"`
 }
 
 // HandoffIntent is the domain-shaped request for handoff mail. It lets the

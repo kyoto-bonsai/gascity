@@ -330,6 +330,45 @@ func (p *Provider) MarkUnread(id string) error {
 	})
 }
 
+// MarkExpectsReply marks a message as a decision ask, exempting it from the
+// read-mail retention sweep and wisp purge until [HasReply] finds an answer
+// or [Provider.ClearExpectsReply] releases the exemption manually. Callers
+// reach this through the optional expectsReplyMarker interface at the CLI
+// layer (`gc mail send --expects-reply` / `gc mail reply --expects-reply`) —
+// it is deliberately not part of [mail.Provider] since retention exemption is
+// a beadmail-retention-specific concept, not a universal mail capability.
+func (p *Provider) MarkExpectsReply(id string) error {
+	b, err := p.store.Get(id)
+	if err != nil {
+		return beadmailError("mark-expects-reply", err)
+	}
+	if isRemovedMessageBead(b) {
+		return beadmailError("mark-expects-reply", beads.ErrNotFound)
+	}
+	return p.store.Update(id, beads.UpdateOpts{
+		Metadata: map[string]string{mail.ExpectsReplyMetadataKey: "true"},
+	})
+}
+
+// ClearExpectsReply removes the expects-reply exemption from a message,
+// releasing it back to ordinary read-mail retention. This is the `gc mail
+// resolve` escape hatch for an ask answered outside `gc mail reply`
+// (dashboard, direct bead edit) — HasReply can only see replies created
+// through the reply path, so without this an ask answered another way would
+// stay in the outstanding set (`gc mail sent --outstanding`) forever.
+func (p *Provider) ClearExpectsReply(id string) error {
+	b, err := p.store.Get(id)
+	if err != nil {
+		return beadmailError("resolve", err)
+	}
+	if isRemovedMessageBead(b) {
+		return beadmailError("resolve", beads.ErrNotFound)
+	}
+	return p.store.Update(id, beads.UpdateOpts{
+		Metadata: map[string]string{mail.ExpectsReplyMetadataKey: "false"},
+	})
+}
+
 // ArchiveFilter selects open message beads for bounded archive cleanup.
 type ArchiveFilter struct {
 	Recipients      []string
@@ -741,6 +780,83 @@ func (p *Provider) Thread(id string) ([]mail.Message, error) {
 	return msgs, nil
 }
 
+// SentMessage is one message from [Provider.ListSent], decorated with
+// sender-side disposition that `gc mail inbox` structurally cannot show
+// (recipient-scoped and unread-only): whether the message was marked to
+// expect a reply, and whether one has arrived.
+type SentMessage struct {
+	mail.Message
+	ExpectsReply bool
+	Answered     bool
+}
+
+// ListSent returns open message beads sent by sender (ga-eibq22 S4 — the
+// sender-side disposition surface that actually discharges ga-bzoyd0's
+// headline complaint: a sender has no instrument to ask "was my message seen
+// or answered?"). Closed sent mail (e.g. retention-swept read mail) is out of
+// scope for this view; direct-ID lookup remains available for that
+// archaeology.
+//
+// When outstandingOnly is true, the scan is narrowed to the
+// mail.expects_reply=true subset first (same cheap-entry-point shape as
+// markedExpectsReplyIDs) and only unanswered asks are returned — the sender's
+// window onto exactly what SweepReadMessagesBefore/PurgeReadMessageWisps are
+// retaining on their behalf. Without it, every open message sent by sender is
+// returned via a full scan, matching the cost profile ArchiveCandidates
+// already accepts for its own all-recipients case.
+//
+// Sender matching is an exact match against the resolved display address
+// (beadToMessage's From), the same fidelity ArchiveFilter.From already uses —
+// it does not expand alias history the way recipient routing does.
+func (p *Provider) ListSent(sender string, outstandingOnly bool) ([]SentMessage, error) {
+	sender = strings.TrimSpace(sender)
+	if sender == "" {
+		return nil, fmt.Errorf("beadmail list-sent: sender is required")
+	}
+	query := beads.ListQuery{
+		Type:     messageBeadType,
+		TierMode: beads.TierBoth,
+		Live:     true,
+	}
+	if outstandingOnly {
+		query.Metadata = map[string]string{mail.ExpectsReplyMetadataKey: "true"}
+	} else {
+		query.AllowScan = true
+	}
+	candidates, err := p.store.List(query)
+	if err != nil {
+		return nil, fmt.Errorf("beadmail list-sent: %w", err)
+	}
+	var out []SentMessage
+	for _, b := range candidates {
+		if b.Status != "open" {
+			continue
+		}
+		msg := beadToMessage(b)
+		if msg.From != sender {
+			continue
+		}
+		answered := false
+		if msg.ExpectsReply {
+			answered, err = HasReply(p.store, b.ID)
+			if err != nil {
+				return nil, fmt.Errorf("beadmail list-sent: checking reply status for %s: %w", b.ID, err)
+			}
+		}
+		if outstandingOnly && (!msg.ExpectsReply || answered) {
+			continue
+		}
+		out = append(out, SentMessage{Message: msg, ExpectsReply: msg.ExpectsReply, Answered: answered})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 // Count returns (total, unread) message counts for a recipient.
 func (p *Provider) Count(recipient string) (int, int, error) {
 	total, unread, err := p.CountRecipients([]string{recipient})
@@ -835,6 +951,83 @@ func readMessagesBefore(store beads.Store, before time.Time, limit int) ([]beads
 	})
 }
 
+// HasReply reports whether a message bead labelled "reply-to:"+id exists —
+// the answered predicate the read-mail retention exemption is keyed on
+// (ga-eibq22 S2). No new state: Provider.Reply already stamps every reply
+// with a "reply-to:"+id label, so this is a single indexed label query.
+//
+// IncludeClosed is load-bearing (ga-eibq22 F2): the reply is itself mail and
+// gets read-swept closed by the same retention mechanism this predicate feeds
+// into (SweepReadMessagesBefore), so an open-only query would make every
+// answered ask outside its own reply's TTL window read as unanswered and
+// retained forever — unbounded growth via the exact mechanism the exemption
+// introduced.
+func HasReply(store beads.Store, id string) (bool, error) {
+	matches, err := store.List(beads.ListQuery{
+		Type:          messageBeadType,
+		Label:         "reply-to:" + id,
+		Limit:         1,
+		TierMode:      beads.TierBoth,
+		IncludeClosed: true,
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(matches) > 0, nil
+}
+
+// markedExpectsReplyIDs returns the set of open message bead IDs currently
+// carrying mail.expects_reply=true — the retention-exemption candidate set
+// for SweepReadMessagesBefore, CountReadMessagesBefore, and
+// PurgeReadMessageWisps.
+//
+// Queried once per pass rather than probing HasReply for every read-mail
+// candidate (ga-eibq22 F4: a per-candidate HasReply inside a 500-budget
+// watchdog loop is 500 extra queries per pass). HasReply is then called only
+// for candidates that intersect this set, so cost scales with the number of
+// open asks, not the close/purge budget. The opt-in discipline S1 requires
+// (--expects-reply is never inferred) is what keeps this set small in
+// practice.
+//
+// Scoped to open beads only: a marked message that is already closed fell out
+// of both retirement arms' live candidate pool by some other path (e.g.
+// retention-swept before this feature existed), and re-litigating that here
+// would be scope creep beyond what ga-eibq22 specifies.
+func markedExpectsReplyIDs(store beads.Store) (map[string]bool, error) {
+	marked, err := store.List(beads.ListQuery{
+		Type:     messageBeadType,
+		Metadata: map[string]string{mail.ExpectsReplyMetadataKey: "true"},
+		TierMode: beads.TierBoth,
+	})
+	if err != nil {
+		return nil, err
+	}
+	ids := make(map[string]bool, len(marked))
+	for _, b := range marked {
+		if b.Status == "open" {
+			ids[b.ID] = true
+		}
+	}
+	return ids, nil
+}
+
+// retainExpectsReplyCandidate reports whether id — a member of exempt — must
+// be retained by a retirement arm rather than closed/purged: true whenever
+// HasReply cannot be determined (fail-safe direction is always "keep", per
+// ga-eibq22 F3/S3) or comes back false (still outstanding). Shared by
+// SweepReadMessagesBefore, CountReadMessagesBefore, and
+// PurgeReadMessageWisps so the three stay in lockstep.
+func retainExpectsReplyCandidate(store beads.Store, exempt map[string]bool, id string) (bool, error) {
+	if !exempt[id] {
+		return false, nil
+	}
+	answered, err := HasReply(store, id)
+	if err != nil {
+		return true, fmt.Errorf("mail %s: checking reply status: %w", id, err)
+	}
+	return !answered, nil
+}
+
 // RetentionSweepCloseReason is the canonical close_reason the read-mail
 // retention sweep stamps on a message bead before closing it. It is the marker
 // that tells isRemovedMessageBead a closed message bead is system-aged
@@ -866,16 +1059,31 @@ const RetentionSweepCloseReason = "mail gc-swept: read mail bead past gc retenti
 // handling: listErr is the fatal candidate-listing failure (no beads were
 // swept), while closeErrs holds the per-bead metadata/close failures that do not
 // abort the sweep. Returns the number of beads closed.
+//
+// Candidates carrying the expects-reply marker (see MarkExpectsReply) are
+// skipped — retained rather than closed — unless HasReply finds an answer;
+// ordinary mail (the overwhelming majority — see ga-eibq22's own measurement)
+// closes exactly as before, byte-identical to pre-exemption behavior.
 func SweepReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int, closeReason string) (closed int, closeErrs []error, listErr error) {
 	candidates, err := readMessagesBefore(store.Store, cutoff, limit)
 	if err != nil {
 		return 0, nil, err
+	}
+	exempt, err := markedExpectsReplyIDs(store.Store)
+	if err != nil {
+		return 0, nil, fmt.Errorf("listing expects-reply exempt set: %w", err)
 	}
 	for _, b := range candidates {
 		if limit > 0 && closed >= limit {
 			break
 		}
 		if b.Status != "open" {
+			continue
+		}
+		if retain, hrErr := retainExpectsReplyCandidate(store.Store, exempt, b.ID); retain {
+			if hrErr != nil {
+				closeErrs = append(closeErrs, hrErr)
+			}
 			continue
 		}
 		if err := store.SetMetadata(b.ID, "close_reason", closeReason); err != nil {
@@ -900,12 +1108,22 @@ func CountReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int)
 	if err != nil {
 		return 0, err
 	}
+	exempt, err := markedExpectsReplyIDs(store.Store)
+	if err != nil {
+		return 0, fmt.Errorf("listing expects-reply exempt set: %w", err)
+	}
 	count := 0
 	for _, b := range candidates {
 		if limit > 0 && count >= limit {
 			break
 		}
 		if b.Status != "open" {
+			continue
+		}
+		// Retain (don't count) on a HasReply error, same fail-safe direction as
+		// the sweep; a dry-run count has no per-item error channel to surface it
+		// through, so it is silently excluded rather than aborting the count.
+		if retain, _ := retainExpectsReplyCandidate(store.Store, exempt, b.ID); retain {
 			continue
 		}
 		count++
@@ -922,6 +1140,14 @@ func CountReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int)
 // retention delete semantics). Beads with a zero or not-yet-past CreatedAt are
 // skipped. Per-bead delete failures are joined and returned without aborting the
 // sweep; returns the number of beads purged.
+//
+// Like SweepReadMessagesBefore, candidates carrying the expects-reply marker
+// are skipped unless HasReply finds an answer (ga-eibq22 F5/S3): a fix that
+// only taught the close sweep to exempt asks would be cosmetic, since an
+// exempted-but-still-open ask in the wisp tier would otherwise be deleted by
+// this arm regardless — deletion strictly worse than closure, since the close
+// path deliberately keeps swept beads addressable by direct ID
+// (isRemovedMessageBead) while purge leaves nothing.
 func PurgeReadMessageWisps(store beads.MailStore, cutoff time.Time) (int, error) {
 	entries, err := store.List(beads.ListQuery{
 		Type:          messageBeadType,
@@ -932,10 +1158,20 @@ func PurgeReadMessageWisps(store beads.MailStore, cutoff time.Time) (int, error)
 	if err != nil {
 		return 0, fmt.Errorf("listing read message wisps: %w", err)
 	}
+	exempt, err := markedExpectsReplyIDs(store.Store)
+	if err != nil {
+		return 0, fmt.Errorf("listing expects-reply exempt set: %w", err)
+	}
 	purged := 0
 	var deleteErr error
 	for _, entry := range entries {
 		if entry.CreatedAt.IsZero() || !entry.CreatedAt.Before(cutoff) {
+			continue
+		}
+		if retain, hrErr := retainExpectsReplyCandidate(store.Store, exempt, entry.ID); retain {
+			if hrErr != nil {
+				deleteErr = errors.Join(deleteErr, hrErr)
+			}
 			continue
 		}
 		if err := deleteMessageWispBead(store.Store, entry.ID); err != nil {
@@ -1270,17 +1506,18 @@ func beadToMessage(b beads.Bead) mail.Message {
 		read = false
 	}
 	return mail.Message{
-		ID:        b.ID,
-		From:      from,
-		To:        to,
-		Subject:   b.Title,
-		Body:      b.Description,
-		CreatedAt: b.CreatedAt,
-		Read:      read,
-		ThreadID:  extractLabel(b.Labels, "thread:"),
-		ReplyTo:   extractLabel(b.Labels, "reply-to:"),
-		Priority:  extractPriority(b.Labels),
-		CC:        extractCC(b.Labels),
+		ID:           b.ID,
+		From:         from,
+		To:           to,
+		Subject:      b.Title,
+		Body:         b.Description,
+		CreatedAt:    b.CreatedAt,
+		Read:         read,
+		ThreadID:     extractLabel(b.Labels, "thread:"),
+		ReplyTo:      extractLabel(b.Labels, "reply-to:"),
+		Priority:     extractPriority(b.Labels),
+		CC:           extractCC(b.Labels),
+		ExpectsReply: b.Metadata[mail.ExpectsReplyMetadataKey] == "true",
 	}
 }
 

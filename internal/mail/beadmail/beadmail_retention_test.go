@@ -466,3 +466,320 @@ func contains(ss []string, want string) bool {
 	}
 	return false
 }
+
+// expectsReplyAskSeed builds a seed Bead for an open, read, aged message
+// marked mail.expects_reply=true — the retention-exemption candidate shape.
+func expectsReplyAskSeed(id string, createdAt time.Time) beads.Bead {
+	return beads.Bead{
+		ID:        id,
+		Type:      "message",
+		Status:    "open",
+		Labels:    []string{"read"},
+		CreatedAt: createdAt,
+		Metadata:  map[string]string{mail.ExpectsReplyMetadataKey: "true"},
+	}
+}
+
+// replyToSeed builds a seed Bead labelled reply-to:askID, satisfying
+// HasReply(askID). closed marks it retention-swept-closed, exercising F2
+// (closed-reply blindness).
+func replyToSeed(id, askID string, createdAt time.Time, closed bool) beads.Bead {
+	b := beads.Bead{
+		ID:        id,
+		Type:      "message",
+		Status:    "open",
+		Labels:    []string{"thread:t", "reply-to:" + askID},
+		CreatedAt: createdAt,
+	}
+	if closed {
+		b.Status = "closed"
+	}
+	return b
+}
+
+// exemptSetErrStore errors only on the markedExpectsReplyIDs query (Type +
+// Metadata[expects_reply]), leaving the ordinary read-message candidate query
+// (Label="read") and any reply-to: HasReply query untouched — isolating the
+// exempt-set-lookup failure path from the candidate-listing failure path
+// listErrStore already covers.
+type exemptSetErrStore struct {
+	*beads.MemStore
+	err error
+}
+
+func (s exemptSetErrStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Type == "message" && query.Metadata[mail.ExpectsReplyMetadataKey] == "true" {
+		return nil, s.err
+	}
+	return s.MemStore.List(query)
+}
+
+// hasReplyErrStore errors only on a HasReply-shaped query (Label prefixed
+// reply-to:), leaving every other query (candidate listing, exempt-set
+// lookup) untouched — isolates the per-candidate answered-check failure path.
+type hasReplyErrStore struct {
+	*beads.MemStore
+	err error
+}
+
+func (s hasReplyErrStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if strings.HasPrefix(query.Label, "reply-to:") {
+		return nil, s.err
+	}
+	return s.MemStore.List(query)
+}
+
+// replyToCountingStore counts List calls shaped like a HasReply query (Label
+// prefixed reply-to:), so a test can assert the exemption logic queries
+// HasReply only for candidates that intersect the marked-expects-reply set
+// (ga-eibq22 F4), not once per read-mail candidate.
+type replyToCountingStore struct {
+	*beads.MemStore
+	hasReplyQueries int
+}
+
+func (s *replyToCountingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if strings.HasPrefix(query.Label, "reply-to:") {
+		s.hasReplyQueries++
+	}
+	return s.MemStore.List(query)
+}
+
+func TestSweepReadMessagesBefore_RetainsUnansweredExpectsReplyAsk(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Minute)
+
+	seed := []beads.Bead{
+		expectsReplyAskSeed("ask-unanswered", old),
+		readMailSeed("ordinary", old),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+	mailStore := beads.MailStore{Store: store}
+
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 0, "reason padded to twenty plus characters")
+	if listErr != nil || len(closeErrs) != 0 {
+		t.Fatalf("unexpected errors: list=%v perBead=%v", listErr, closeErrs)
+	}
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1 (ordinary only)", closed)
+	}
+
+	ask, err := store.Get("ask-unanswered")
+	if err != nil {
+		t.Fatalf("Get(ask-unanswered): %v", err)
+	}
+	if ask.Status != "open" {
+		t.Errorf("unanswered expects-reply ask status = %q, want open (must be retained)", ask.Status)
+	}
+
+	ordinary, err := store.Get("ordinary")
+	if err != nil {
+		t.Fatalf("Get(ordinary): %v", err)
+	}
+	if ordinary.Status != "closed" {
+		t.Errorf("ordinary read mail status = %q, want closed (opt-in exemption must not regress ordinary retention)", ordinary.Status)
+	}
+}
+
+func TestSweepReadMessagesBefore_ClosesAnsweredExpectsReplyAsk(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Minute)
+
+	seed := []beads.Bead{
+		expectsReplyAskSeed("ask-answered", old),
+		replyToSeed("reply-1", "ask-answered", old.Add(time.Second), false),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+	mailStore := beads.MailStore{Store: store}
+
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 0, "reason padded to twenty plus characters")
+	if listErr != nil || len(closeErrs) != 0 {
+		t.Fatalf("unexpected errors: list=%v perBead=%v", listErr, closeErrs)
+	}
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1 (answered ask closes like ordinary mail)", closed)
+	}
+	ask, err := store.Get("ask-answered")
+	if err != nil {
+		t.Fatalf("Get(ask-answered): %v", err)
+	}
+	if ask.Status != "closed" {
+		t.Errorf("answered expects-reply ask status = %q, want closed", ask.Status)
+	}
+}
+
+// TestSweepReadMessagesBefore_ClosedReplyStillCountsAsAnswered pins F2: the
+// reply is itself mail and gets read-swept closed by this same mechanism, so
+// HasReply's IncludeClosed:true must see it — an open-only query would make
+// every answered ask outside its own reply's TTL window read as unanswered
+// and retained forever.
+func TestSweepReadMessagesBefore_ClosedReplyStillCountsAsAnswered(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Minute)
+
+	seed := []beads.Bead{
+		expectsReplyAskSeed("ask-closed-reply", old),
+		replyToSeed("reply-closed", "ask-closed-reply", old.Add(time.Second), true /* closed */),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+	mailStore := beads.MailStore{Store: store}
+
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 0, "reason padded to twenty plus characters")
+	if listErr != nil || len(closeErrs) != 0 {
+		t.Fatalf("unexpected errors: list=%v perBead=%v", listErr, closeErrs)
+	}
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1 (ask must close: its reply exists even though the reply itself is closed)", closed)
+	}
+}
+
+func TestSweepReadMessagesBefore_HasReplyErrorRetainsCandidateAndSurfacesError(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Minute)
+
+	seed := []beads.Bead{expectsReplyAskSeed("ask-erroring", old)}
+	base := beads.NewMemStoreFrom(100, seed, nil)
+	store := hasReplyErrStore{MemStore: base, err: errors.New("reply lookup boom")}
+	mailStore := beads.MailStore{Store: store}
+
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 0, "reason padded to twenty plus characters")
+	if listErr != nil {
+		t.Fatalf("unexpected fatal list error: %v", listErr)
+	}
+	if closed != 0 {
+		t.Fatalf("closed = %d, want 0 (fail-safe: retain on HasReply error)", closed)
+	}
+	if len(closeErrs) != 1 || !strings.Contains(closeErrs[0].Error(), "reply lookup boom") {
+		t.Fatalf("closeErrs = %v, want one error naming the HasReply failure (observable, not silent)", closeErrs)
+	}
+	ask, err := base.Get("ask-erroring")
+	if err != nil {
+		t.Fatalf("Get(ask-erroring): %v", err)
+	}
+	if ask.Status != "open" {
+		t.Errorf("ask status = %q, want open (retained on error)", ask.Status)
+	}
+}
+
+func TestSweepReadMessagesBefore_ExemptSetListErrorIsFatal(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Minute)
+	seed := []beads.Bead{readMailSeed("ordinary", old)}
+	base := beads.NewMemStoreFrom(100, seed, nil)
+	store := exemptSetErrStore{MemStore: base, err: errors.New("exempt set store down")}
+	mailStore := beads.MailStore{Store: store}
+
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 0, "reason padded to twenty plus characters")
+	if listErr == nil {
+		t.Fatal("expected fatal error when the exempt-set query fails")
+	}
+	if closed != 0 || len(closeErrs) != 0 {
+		t.Fatalf("closed=%d closeErrs=%v, want zero on exempt-set list failure", closed, closeErrs)
+	}
+}
+
+func TestSweepReadMessagesBefore_HasReplyQueriedOnlyForMarkedCandidates(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Minute)
+
+	seed := []beads.Bead{
+		readMailSeed("ordinary-1", old),
+		readMailSeed("ordinary-2", old),
+		readMailSeed("ordinary-3", old),
+		expectsReplyAskSeed("ask-1", old),
+	}
+	store := &replyToCountingStore{MemStore: beads.NewMemStoreFrom(100, seed, nil)}
+	mailStore := beads.MailStore{Store: store}
+
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 0, "reason padded to twenty plus characters")
+	if listErr != nil || len(closeErrs) != 0 {
+		t.Fatalf("unexpected errors: list=%v perBead=%v", listErr, closeErrs)
+	}
+	if closed != 3 {
+		t.Fatalf("closed = %d, want 3 (the 3 ordinary beads)", closed)
+	}
+	if store.hasReplyQueries != 1 {
+		t.Fatalf("HasReply-shaped queries = %d, want exactly 1 (only the marked candidate) — "+
+			"cost must scale with open asks, not the candidate/close budget (F4)", store.hasReplyQueries)
+	}
+}
+
+func TestCountReadMessagesBefore_ExcludesRetainedExpectsReplyAsk(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Minute)
+
+	seed := []beads.Bead{
+		expectsReplyAskSeed("ask-unanswered", old),
+		readMailSeed("ordinary", old),
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+	mailStore := beads.MailStore{Store: store}
+
+	count, err := CountReadMessagesBefore(mailStore, now, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1 — CountReadMessagesBefore must stay in lockstep with what SweepReadMessagesBefore would actually close", count)
+	}
+}
+
+func TestPurgeReadMessageWisps_RetainsUnansweredExpectsReplyAsk(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	cutoff := now.Add(-time.Hour)
+	aged := now.Add(-2 * time.Hour)
+
+	seed := []beads.Bead{
+		{
+			ID: "ask-unanswered", Type: "message", Status: "open", CreatedAt: aged, Ephemeral: true,
+			Metadata: map[string]string{mail.ReadMetadataKey: "true", mail.ExpectsReplyMetadataKey: "true"},
+		},
+		{
+			ID: "ordinary", Type: "message", Status: "open", CreatedAt: aged, Ephemeral: true,
+			Metadata: map[string]string{mail.ReadMetadataKey: "true"},
+		},
+	}
+	store := &deleteTrackStore{MemStore: beads.NewMemStoreFrom(100, seed, nil), failDelete: map[string]error{}}
+	mailStore := beads.MailStore{Store: store}
+
+	purged, err := PurgeReadMessageWisps(mailStore, cutoff)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("purged = %d, want 1 (ordinary only)", purged)
+	}
+	if _, err := store.Get("ask-unanswered"); err != nil {
+		t.Errorf("unanswered expects-reply ask must survive the purge (second retirement path, F5): %v", err)
+	}
+	if contains(store.deleted, "ask-unanswered") {
+		t.Error("unanswered expects-reply ask must not be deleted")
+	}
+}
+
+func TestPurgeReadMessageWisps_DeletesAnsweredExpectsReplyAsk(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	cutoff := now.Add(-time.Hour)
+	aged := now.Add(-2 * time.Hour)
+
+	seed := []beads.Bead{
+		{
+			ID: "ask-answered", Type: "message", Status: "open", CreatedAt: aged, Ephemeral: true,
+			Metadata: map[string]string{mail.ReadMetadataKey: "true", mail.ExpectsReplyMetadataKey: "true"},
+		},
+		{
+			ID: "reply-1", Type: "message", Status: "open", CreatedAt: aged.Add(time.Second),
+			Labels: []string{"reply-to:ask-answered"},
+		},
+	}
+	store := &deleteTrackStore{MemStore: beads.NewMemStoreFrom(100, seed, nil), failDelete: map[string]error{}}
+	mailStore := beads.MailStore{Store: store}
+
+	purged, err := PurgeReadMessageWisps(mailStore, cutoff)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if purged != 1 || !contains(store.deleted, "ask-answered") {
+		t.Fatalf("purged = %d, deleted = %v, want the answered ask purged", purged, store.deleted)
+	}
+}

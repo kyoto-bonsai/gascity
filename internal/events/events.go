@@ -48,10 +48,14 @@ const (
 	MailMarkedUnread         = "mail.marked_unread"
 	MailReplied              = "mail.replied"
 	MailDeleted              = "mail.deleted"
-	SessionDraining          = "session.draining"
-	SessionUndrained         = "session.undrained"
-	SessionQuarantined       = "session.quarantined"
-	SessionIdleKilled        = "session.idle_killed"
+	// MailResolved marks a `gc mail resolve` call: the expects-reply retention
+	// exemption on a message was cleared manually (ga-eibq22 S5), typically
+	// because the ask was answered outside `gc mail reply`.
+	MailResolved       = "mail.resolved"
+	SessionDraining    = "session.draining"
+	SessionUndrained   = "session.undrained"
+	SessionQuarantined = "session.quarantined"
+	SessionIdleKilled  = "session.idle_killed"
 	// SessionMaxAgeKilled fires when the controller preemptively restarts a
 	// long-running session because its wall-clock age exceeded the agent's
 	// max_session_age threshold. Motivating case: provider SDKs that cache
@@ -269,7 +273,7 @@ var KnownEventTypes = []string{
 	BeadClaimRejected,
 	BeadDeadAssigneeReopened,
 	MailSent, MailRead, MailArchived, MailMarkedRead, MailMarkedUnread,
-	MailReplied, MailDeleted,
+	MailReplied, MailDeleted, MailResolved,
 	ConvoyCreated, ConvoyClosed,
 	ControllerStarted, ControllerStopped,
 	CitySuspended, CityResumed,
