@@ -44,6 +44,11 @@ type mailInboxJSONResult struct {
 	Recipient     string         `json:"recipient"`
 	Recipients    []string       `json:"recipients"`
 	Messages      []mail.Message `json:"messages"`
+	// PossiblyTruncated is true when a bounded read returned a full window
+	// (ga-4derp8): more mail may exist beyond it. Always explicit, never
+	// omitted, so a caller can tell "checked, complete" from "checked, maybe
+	// not" — never confuse either with "field absent, unknown".
+	PossiblyTruncated bool `json:"possibly_truncated"`
 }
 
 type mailThreadJSONResult struct {
@@ -1414,6 +1419,42 @@ func collectMailMessages(fetch func(string) ([]mail.Message, error), recipients 
 	return result, nil
 }
 
+// collectMailMessagesTruncated behaves like collectMailMessages but also
+// reports whether ANY per-recipient fetch may have been bounded before
+// scanning all matching mail (ga-4derp8) — a truncated single recipient in a
+// multi-recipient call still makes the merged result unsafe to trust as
+// complete, even though the merge itself can shrink the row count back below
+// the per-fetch bound.
+func collectMailMessagesTruncated(fetch func(string) ([]mail.Message, bool, error), recipients []string) ([]mail.Message, bool, error) {
+	seen := map[string]mail.Message{}
+	order := make([]string, 0, len(recipients))
+	var truncated bool
+	for _, recipient := range recipients {
+		messages, recipientTruncated, err := fetch(recipient)
+		if err != nil {
+			return nil, false, err
+		}
+		truncated = truncated || recipientTruncated
+		for _, message := range messages {
+			if _, ok := seen[message.ID]; !ok {
+				order = append(order, message.ID)
+			}
+			seen[message.ID] = message
+		}
+	}
+	result := make([]mail.Message, 0, len(order))
+	for _, id := range order {
+		result = append(result, seen[id])
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].CreatedAt.Equal(result[j].CreatedAt) {
+			return result[i].ID < result[j].ID
+		}
+		return result[i].CreatedAt.Before(result[j].CreatedAt)
+	})
+	return result, truncated, nil
+}
+
 func collectMailCounts(count func(string) (int, int, error), recipients []string) (int, int, error) {
 	total := 0
 	unread := 0
@@ -2014,6 +2055,16 @@ type mailInboxReader interface {
 	Inbox(recipient string) ([]mail.Message, error)
 }
 
+// mailInboxTruncationReader is an optional capability a mail.Provider backend
+// may implement to report possible truncation on an Inbox read (ga-4derp8).
+// It is deliberately NOT part of the mail.Provider contract: backends that
+// don't implement it (mocks, alternate stores) are treated as never
+// truncated, so this is a best-effort diagnostic probe, not a required
+// method every implementation must carry.
+type mailInboxTruncationReader interface {
+	InboxTruncated(recipient string) ([]mail.Message, bool, error)
+}
+
 // doMailInbox lists unread messages for a recipient.
 func doMailInbox(mp mailInboxReader, recipient string, stdout, stderr io.Writer) int {
 	return doMailInboxTarget(mp, resolvedMailTarget{display: recipient, recipients: []string{recipient}}, stdout, stderr)
@@ -2024,18 +2075,33 @@ func doMailInboxTarget(mp mailInboxReader, target resolvedMailTarget, stdout, st
 }
 
 func doMailInboxTargetWithJSON(mp mailInboxReader, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
-	messages, err := collectMailMessages(mp.Inbox, target.recipients)
+	var messages []mail.Message
+	var truncated bool
+	var err error
+	if ta, ok := mp.(mailInboxTruncationReader); ok {
+		messages, truncated, err = collectMailMessagesTruncated(ta.InboxTruncated, target.recipients)
+	} else {
+		messages, err = collectMailMessages(mp.Inbox, target.recipients)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if truncated {
+		// ga-4derp8: a bounded read came back with a full window. This is
+		// deliberately printed regardless of jsonOut and regardless of
+		// whether any messages matched, so a truncated-to-zero inbox can
+		// never be mistaken for a genuinely empty one.
+		fmt.Fprintf(stderr, "WARN: gc mail inbox %s: read returned a full bounded window — more mail may exist beyond it; do not treat this result as complete (ga-4derp8)\n", target.display) //nolint:errcheck // best-effort stderr
+	}
 
 	if jsonOut {
 		if err := writeCLIJSONLine(stdout, mailInboxJSONResult{
-			SchemaVersion: "1",
-			Recipient:     target.display,
-			Recipients:    jsonRecipients(target),
-			Messages:      messages,
+			SchemaVersion:     "1",
+			Recipient:         target.display,
+			Recipients:        jsonRecipients(target),
+			Messages:          messages,
+			PossiblyTruncated: truncated,
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck
 			return 1

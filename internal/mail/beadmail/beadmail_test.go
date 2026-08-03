@@ -548,6 +548,63 @@ func TestMessageCandidatesAllBoundsQueryLimit(t *testing.T) {
 	}
 }
 
+// TestInboxTruncatedSignalsFullWindow is the property-level regression test
+// ga-4derp8 asks for: a bounded read that comes back with a full window must
+// say so, never silently pass off a possibly-incomplete result as complete.
+// Reproduces the measured live shape (human: 1,531 open messages against the
+// 500-row cap) at a scale a unit test can afford: seed exactly one more than
+// messageCandidatesLimit, and require the signal to fire.
+func TestInboxTruncatedSignalsFullWindow(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	const seeded = messageCandidatesLimit + 1
+	for i := 0; i < seeded; i++ {
+		if _, err := p.Send("mayor", "human", "", "body"); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+	}
+
+	messages, truncated, err := p.InboxTruncated("human")
+	if err != nil {
+		t.Fatalf("InboxTruncated: %v", err)
+	}
+	if len(messages) != messageCandidatesLimit {
+		t.Fatalf("InboxTruncated returned %d messages, want exactly the %d-row bound", len(messages), messageCandidatesLimit)
+	}
+	if !truncated {
+		t.Fatalf("InboxTruncated returned the full %d-row window for a recipient with %d messages waiting but reported truncated=false — "+
+			"this is ga-4derp8's silent-loss shape: %d messages exist beyond what was returned with no signal",
+			messageCandidatesLimit, seeded, seeded-messageCandidatesLimit)
+	}
+
+	// Control: a recipient well under the bound must never be flagged, or
+	// this signal is noise, not a signal.
+	if _, err := p.Send("mayor", "not-human", "", "body"); err != nil {
+		t.Fatalf("Send control: %v", err)
+	}
+	controlMessages, controlTruncated, err := p.InboxTruncated("not-human")
+	if err != nil {
+		t.Fatalf("InboxTruncated (control): %v", err)
+	}
+	if len(controlMessages) != 1 {
+		t.Fatalf("control InboxTruncated returned %d messages, want 1", len(controlMessages))
+	}
+	if controlTruncated {
+		t.Fatalf("control InboxTruncated reported truncated=true for a recipient with only 1 message — false positive")
+	}
+
+	// Inbox (the pre-existing exported method every caller still uses) must
+	// be unaffected: InboxTruncated is strictly additive, not a behavior change.
+	inboxMessages, err := p.Inbox("human")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(inboxMessages) != messageCandidatesLimit {
+		t.Fatalf("Inbox returned %d messages, want %d (InboxTruncated must not change Inbox's own behavior)", len(inboxMessages), messageCandidatesLimit)
+	}
+}
+
 func hasMailMessageID(messages []mail.Message, id string) bool {
 	for _, message := range messages {
 		if message.ID == id {

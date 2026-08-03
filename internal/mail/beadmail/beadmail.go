@@ -263,13 +263,25 @@ func senderDisplayAddress(b beads.Bead, fallback string) string {
 
 // Inbox returns all unread messages for the recipient.
 func (p *Provider) Inbox(recipient string) ([]mail.Message, error) {
+	msgs, _, err := p.filterMessages(recipient, false)
+	return msgs, err
+}
+
+// InboxTruncated behaves like Inbox but additionally reports whether the read
+// may have been bounded by messageCandidatesLimit before scanning all of
+// recipient's open mail (ga-4derp8). True means "verify before trusting
+// completeness" — a result landing exactly at the bound is indistinguishable
+// from a genuinely complete read of that size, so this is a conservative
+// signal, not proof of loss.
+func (p *Provider) InboxTruncated(recipient string) ([]mail.Message, bool, error) {
 	return p.filterMessages(recipient, false)
 }
 
 // InboxRecipients returns all unread messages matching any recipient route in
 // one message-bead scan.
 func (p *Provider) InboxRecipients(recipients []string) ([]mail.Message, error) {
-	return p.filterMessagesForRecipients(recipients, false)
+	msgs, _, err := p.filterMessagesForRecipients(recipients, false)
+	return msgs, err
 }
 
 // Get retrieves a message by ID without marking it read.
@@ -384,7 +396,7 @@ func (p *Provider) Archive(id string) error {
 // them.
 func (p *Provider) ArchiveCandidates(filter ArchiveFilter) ([]mail.Message, error) {
 	routes := p.recipientRoutesForAll(filter.Recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes, len(filter.Recipients) == 1)
+	candidates, _, err := p.messageCandidatesForRoutes(routes, len(filter.Recipients) == 1)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail archive matching: %w", err)
 	}
@@ -540,12 +552,14 @@ func (p *Provider) DeleteMany(ids []string) ([]mail.ArchiveResult, error) {
 
 // All returns all open messages (read and unread) for the recipient.
 func (p *Provider) All(recipient string) ([]mail.Message, error) {
-	return p.filterMessages(recipient, true)
+	msgs, _, err := p.filterMessages(recipient, true)
+	return msgs, err
 }
 
 // Check returns unread messages for the recipient without marking them read.
 func (p *Provider) Check(recipient string) ([]mail.Message, error) {
-	return p.filterMessages(recipient, false)
+	msgs, _, err := p.filterMessages(recipient, false)
+	return msgs, err
 }
 
 // CheckAutoHandoffs returns unread continuation mail carrying both labels that
@@ -553,7 +567,7 @@ func (p *Provider) Check(recipient string) ([]mail.Message, error) {
 // mail so a recycle does not duplicate the UserPromptSubmit inbox injection.
 func (p *Provider) CheckAutoHandoffs(recipients []string) ([]mail.Message, error) {
 	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
+	candidates, _, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail: listing auto-handoff messages: %w", err)
 	}
@@ -768,7 +782,7 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 		return 0, 0, nil
 	}
 	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
+	candidates, _, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
 	if err != nil {
 		return 0, 0, fmt.Errorf("listing messages: %w", err)
 	}
@@ -790,17 +804,17 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 
 // filterMessages returns open message beads assigned to the recipient.
 // When includeRead is false, messages with the "read" label are excluded.
-func (p *Provider) filterMessages(recipient string, includeRead bool) ([]mail.Message, error) {
+func (p *Provider) filterMessages(recipient string, includeRead bool) ([]mail.Message, bool, error) {
 	return p.filterMessagesForRecipients([]string{recipient}, includeRead)
 }
 
 // filterMessagesForRecipients returns open message beads assigned to any
 // recipient route represented by recipients. Empty recipients mean all routes.
-func (p *Provider) filterMessagesForRecipients(recipients []string, includeRead bool) ([]mail.Message, error) {
+func (p *Provider) filterMessagesForRecipients(recipients []string, includeRead bool) ([]mail.Message, bool, error) {
 	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
+	candidates, truncated, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
 	if err != nil {
-		return nil, fmt.Errorf("beadmail: listing beads: %w", err)
+		return nil, false, fmt.Errorf("beadmail: listing beads: %w", err)
 	}
 	var msgs []mail.Message
 	for _, b := range candidates {
@@ -815,7 +829,7 @@ func (p *Provider) filterMessagesForRecipients(recipients []string, includeRead 
 		}
 		msgs = append(msgs, beadToMessage(b))
 	}
-	return msgs, nil
+	return msgs, truncated, nil
 }
 
 // IsMessageBead reports whether b is a mail message bead. It is the exported
@@ -1229,7 +1243,7 @@ func matchesRecipientRoute(routes []string, assignee string) bool {
 // name into its session's id/alias/session_name/history), as opposed to a
 // genuine fan-out across several distinct recipients — see
 // beads.ListQuery.AssigneesAreAliases for why that distinction matters.
-func (p *Provider) messageCandidatesForRoutes(routes []string, aliasesOfOneRecipient bool) ([]beads.Bead, error) {
+func (p *Provider) messageCandidatesForRoutes(routes []string, aliasesOfOneRecipient bool) ([]beads.Bead, bool, error) {
 	return p.messageCandidatesAll(routes, aliasesOfOneRecipient)
 }
 
@@ -1238,7 +1252,7 @@ func (p *Provider) messageCandidatesForRoutes(routes []string, aliasesOfOneRecip
 // issue-tier and wisp-tier reads before deduping. Empty routes return all open
 // messages. Live reads are required so command-visible mail sees fresh wisps
 // even when the active store cache was primed earlier.
-func (p *Provider) messageCandidatesAll(routes []string, aliasesOfOneRecipient bool) ([]beads.Bead, error) {
+func (p *Provider) messageCandidatesAll(routes []string, aliasesOfOneRecipient bool) ([]beads.Bead, bool, error) {
 	query := beads.ListQuery{
 		Type:     messageBeadType,
 		Status:   "open",
@@ -1254,10 +1268,16 @@ func (p *Provider) messageCandidatesAll(routes []string, aliasesOfOneRecipient b
 	}
 	all, err := p.store.List(query)
 	if err != nil {
-		return nil, fmt.Errorf("scanning message beads: %w", err)
+		return nil, false, fmt.Errorf("scanning message beads: %w", err)
 	}
+	// truncated reports whether this bounded read may have been cut off
+	// before scanning every matching open message: a result landing exactly
+	// at Limit is indistinguishable from a genuinely complete read of that
+	// size, so this is a conservative "maybe", never a certainty (ga-4derp8).
+	// Fewer rows than Limit is the only case this rules out.
+	truncated := query.Limit > 0 && len(all) >= query.Limit
 	if len(routes) == 0 {
-		return all, nil
+		return all, truncated, nil
 	}
 	out := make([]beads.Bead, 0, len(all))
 	for _, b := range all {
@@ -1267,7 +1287,7 @@ func (p *Provider) messageCandidatesAll(routes []string, aliasesOfOneRecipient b
 			out = append(out, b)
 		}
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // beadToMessage converts a bead to a mail.Message.
