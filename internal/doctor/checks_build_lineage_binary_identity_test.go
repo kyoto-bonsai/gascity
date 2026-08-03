@@ -200,12 +200,15 @@ func TestBuildLineageStalenessCheck_BinaryIsAncestor_OKWithProvenanceConfirmed(t
 	}
 }
 
-// TestBuildLineageStalenessCheck_BinaryCommitUnresolvable_DoesNotBlockOnItsOwn
-// covers the "cannot verify" branch distinctly from "verified diverged":
-// an unresolvable build commit (only present in some other local clone's
-// object store, per reference_gascity_src_dev_gotchas) must not itself
-// produce a false blocking alarm.
-func TestBuildLineageStalenessCheck_BinaryCommitUnresolvable_DoesNotBlockOnItsOwn(t *testing.T) {
+// TestBuildLineageStalenessCheck_BinaryCommitUnresolvable_WarnsVisiblyNotGreen
+// is ga-c7np1n's regression target. The commit is unresolvable ANYWHERE
+// (not present locally, not fetchable from the sole configured remote,
+// which genuinely never had it — a fabricated SHA), so the fetch-attempt
+// must fail gracefully and the result must be a VISIBLE, non-OK status with
+// "NOT verified" in Message itself (not only Details, which normal doctor
+// output never prints) — this is the exact defect the old version of this
+// test certified as correct by asserting StatusOK here.
+func TestBuildLineageStalenessCheck_BinaryCommitUnresolvable_WarnsVisiblyNotGreen(t *testing.T) {
 	remote := initBareableRemote(t)
 	commitDatedFile(t, remote, "seed.txt", time.Now())
 	local := cloneRepo(t, remote)
@@ -220,11 +223,17 @@ func TestBuildLineageStalenessCheck_BinaryCommitUnresolvable_DoesNotBlockOnItsOw
 
 	r := c.Run(&CheckContext{})
 
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d (%s), want StatusOK — fresh checkout, unresolvable provenance must not block on its own", r.Status, r.Message)
+	if r.Status == StatusOK {
+		t.Fatalf("status = StatusOK (%s) — MUST NOT be OK when binary provenance cannot be verified (ga-c7np1n: fail-closed, not a passing state)", r.Message)
 	}
-	if !anyDetailContains(r.Details, "NOT verified") {
-		t.Errorf("Details = %v, want a not-verified provenance detail", r.Details)
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d (%s), want StatusWarning", r.Status, r.Message)
+	}
+	if r.Severity != SeverityAdvisory {
+		t.Errorf("severity = %d, want SeverityAdvisory — uncertain is not the same as confirmed-bad, so this must not block", r.Severity)
+	}
+	if !strings.Contains(r.Message, "NOT verified") {
+		t.Fatalf("message = %q, want \"NOT verified\" IN THE MESSAGE ITSELF — Details alone is the exact defect this test regresses", r.Message)
 	}
 }
 
@@ -259,4 +268,142 @@ func anyDetailContains(details []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// --- attemptFetchCommit (ga-c7np1n) ---
+
+// TestAttemptFetchCommit_SucceedsWhenRemoteHasIt deliberately uses TWO
+// separate, fully-connected (non-shallow) remotes rather than a shallow
+// clone: a plain bare-SHA fetch into a shallow clone brings the OBJECT in
+// but does not reconnect it into the ancestor graph (verified by hand —
+// cat-file -e succeeds, merge-base --is-ancestor still fails, because the
+// shallow boundary isn't deepened by a single-commit fetch). This fleet's
+// real checkouts are always full clones (no --depth anywhere in its
+// documented workflow), so the realistic "unresolvable" shape is "no
+// configured remote has been asked for this ref yet," not "history is
+// shallow" — two full remotes, one with the commit, models that correctly.
+func TestAttemptFetchCommit_SucceedsWhenRemoteHasIt(t *testing.T) {
+	remote := initBareableRemote(t)
+	commitDatedFile(t, remote, "seed.txt", time.Now())
+	local := cloneRepo(t, remote)
+
+	other := initBareableRemote(t)
+	commitDatedFile(t, other, "other.txt", time.Now())
+	otherHead := strings.TrimSpace(mustRunGit(t, other, "rev-parse", "HEAD"))
+	runGitForLineageTest(t, local, "remote", "add", "other", other)
+
+	if err := isAncestor(mustGitBin(t), local, otherHead, "HEAD"); !errors.Is(err, errCommitUnresolvable) {
+		t.Fatalf("precondition failed: commit already resolvable before fetch (err=%v)", err)
+	}
+
+	if err := attemptFetchCommit(mustGitBin(t), local, otherHead); err != nil {
+		t.Fatalf("attemptFetchCommit() = %v, want nil — origin lacks it but the 'other' remote has it", err)
+	}
+}
+
+func TestAttemptFetchCommit_FailsWhenNoRemoteHasIt(t *testing.T) {
+	remote := initBareableRemote(t)
+	commitDatedFile(t, remote, "seed.txt", time.Now())
+	local := cloneRepo(t, remote)
+
+	err := attemptFetchCommit(mustGitBin(t), local, "deadbeef00deadbeef00deadbeef00deadbeef0")
+	if err == nil {
+		t.Error("attemptFetchCommit() = nil, want error — no configured remote has this fabricated commit")
+	}
+}
+
+func TestAttemptFetchCommit_FailsWhenNoRemotesConfigured(t *testing.T) {
+	dir := t.TempDir()
+	runGitForLineageTest(t, dir, "init", "-b", "main")
+	runGitForLineageTest(t, dir, "config", "user.name", "Lineage Test")
+	runGitForLineageTest(t, dir, "config", "user.email", "lineage-test@example.invalid")
+
+	err := attemptFetchCommit(mustGitBin(t), dir, "deadbeef00deadbeef00deadbeef00deadbeef0")
+	if err == nil {
+		t.Error("attemptFetchCommit() = nil, want error — repo has no remotes at all")
+	}
+}
+
+// TestBuildLineageStalenessCheck_UnresolvableCommitFetchedThenDiverged_Blocks
+// is the end-to-end proof that Run() actually wires attemptFetchCommit into
+// the ancestor check, not just that the two pieces work in isolation: the
+// build commit starts genuinely absent (not on "origin" at all), Run()
+// itself must try the second configured remote ("other") to resolve it,
+// and — the realistic outcome per the discovery above (a full local clone
+// can never be missing a true ancestor of its own HEAD; the only way it
+// can be missing a commit is that commit living on a lineage the checkout
+// never fetched at all) — correctly lands on diverged/blocking, exactly
+// like the live case this whole bead is about.
+func TestBuildLineageStalenessCheck_UnresolvableCommitFetchedThenDiverged_Blocks(t *testing.T) {
+	remote := initBareableRemote(t)
+	commitDatedFile(t, remote, "seed.txt", time.Now())
+	local := cloneRepo(t, remote)
+
+	other := initBareableRemote(t)
+	commitDatedFile(t, other, "other.txt", time.Now())
+	otherHead := strings.TrimSpace(mustRunGit(t, other, "rev-parse", "HEAD"))
+	runGitForLineageTest(t, local, "remote", "add", "other", other)
+
+	if err := isAncestor(mustGitBin(t), local, otherHead, "HEAD"); !errors.Is(err, errCommitUnresolvable) {
+		t.Fatalf("precondition failed: commit already resolvable before Run() (err=%v)", err)
+	}
+
+	c := NewBuildLineageStalenessCheck()
+	c.sourceRepoPath = local
+	c.now = func() time.Time { return time.Now() }
+	c.binaryPath = func() (string, error) { return "/fake/gc", nil }
+	c.goVersionM = func(string) (string, error) {
+		return "\tbuild\t-ldflags=\"-X main.commit=" + otherHead + "\"\n", nil
+	}
+
+	r := c.Run(&CheckContext{})
+
+	if r.Status != StatusError {
+		t.Fatalf("status = %d (%s), want StatusError — Run() should have fetched the commit via the 'other' remote and found it diverged", r.Status, r.Message)
+	}
+	if r.Severity != SeverityBlocking {
+		t.Errorf("severity = %d, want SeverityBlocking", r.Severity)
+	}
+	if !strings.Contains(r.Message, "diverged") {
+		t.Errorf("message = %q, want mention of diverged lineage", r.Message)
+	}
+}
+
+// TestBuildLineageStalenessCheck_StaleAndUnverified_ErrorMentionsBoth covers
+// the new combined branch: checkout is ALSO genuinely stale, not just
+// unverified. The more severe, more specific finding (real staleness) must
+// stay StatusError/Blocking (not get diluted into a mere warning), while
+// still surfacing the provenance gap in the same message rather than
+// silently dropping it.
+func TestBuildLineageStalenessCheck_StaleAndUnverified_ErrorMentionsBoth(t *testing.T) {
+	remote := initBareableRemote(t)
+	commitDatedFile(t, remote, "seed.txt", time.Now().Add(-time.Hour))
+	local := cloneRepo(t, remote)
+	for i := 0; i < defaultBuildLineageMaxCommits+5; i++ {
+		commitDatedFile(t, remote, "upstream.txt", time.Now())
+	}
+	runGitForLineageTest(t, local, "fetch", "origin")
+
+	c := NewBuildLineageStalenessCheck()
+	c.sourceRepoPath = local
+	c.now = func() time.Time { return time.Now() }
+	c.binaryPath = func() (string, error) { return "/fake/gc", nil }
+	c.goVersionM = func(string) (string, error) {
+		return "\tbuild\t-ldflags=\"-X main.commit=deadbeef00deadbeef00deadbeef00deadbeef0\"\n", nil
+	}
+
+	r := c.Run(&CheckContext{})
+
+	if r.Status != StatusError {
+		t.Fatalf("status = %d (%s), want StatusError", r.Status, r.Message)
+	}
+	if r.Severity != SeverityBlocking {
+		t.Errorf("severity = %d, want SeverityBlocking — genuine staleness must not be diluted to advisory", r.Severity)
+	}
+	if !strings.Contains(r.Message, "commits behind") {
+		t.Errorf("message = %q, want the staleness numbers still present", r.Message)
+	}
+	if !strings.Contains(r.Message, "NOT verified") {
+		t.Errorf("message = %q, want the provenance gap also surfaced, not silently dropped", r.Message)
+	}
 }

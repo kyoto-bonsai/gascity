@@ -153,6 +153,39 @@ func isAncestor(gitBin, dir, commit, ref string) error {
 	return errCommitUnresolvable
 }
 
+// attemptFetchCommit tries to fetch commit into dir from each of dir's
+// configured remotes in turn, stopping at the first success. Scoped
+// narrowly to resolving one specific commit object, not a general fetch:
+// this fleet's local-only hardening commits are typically pushed to a fork
+// remote even when never merged upstream (reference_gascity_src_dev_gotchas
+// -- PR access to gastownhall/gascity is blocked, so the fork is often the
+// only place a given commit actually lives), so most "unresolvable" cases
+// are simply an object nobody has fetched into THIS particular checkout
+// yet, not a commit that exists nowhere. Returns nil on first success, or
+// the last error if every configured remote failed / none are configured.
+func attemptFetchCommit(gitBin, dir, commit string) error {
+	remotesOut, err := runGitCommand(gitBin, dir, "remote")
+	if err != nil {
+		return err
+	}
+	remotes := strings.Fields(remotesOut)
+	if len(remotes) == 0 {
+		return errors.New("no remotes configured")
+	}
+	var lastErr error
+	for _, remote := range remotes {
+		cmd := exec.Command(gitBin, "fetch", "--no-tags", "-q", remote, commit)
+		cmd.Dir = dir
+		cmd.Env = git.SanitizedEnv()
+		runErr := cmd.Run()
+		if runErr == nil {
+			return nil
+		}
+		lastErr = runErr
+	}
+	return lastErr
+}
+
 func resolveSourceRepoPath() string {
 	if p := strings.TrimSpace(os.Getenv("GC_SRC_PATH")); p != "" {
 		return p
@@ -243,9 +276,20 @@ func (c *BuildLineageStalenessCheck) Run(_ *CheckContext) *CheckResult {
 	// result proves the running binary was never part of, so trusting them
 	// as "what's actually deployed is this fresh" would be exactly wrong.
 	provenanceDetail := "binary provenance not checked (no resolvable running binary or embedded build commit)"
+	provenanceUnverified := false
 	if binPath, binErr := c.binaryPath(); binErr == nil {
 		if commit, cerr := buildCommitOf(c.goVersionM, binPath); cerr == nil && commit != "" {
-			switch ancErr := isAncestor(gitBin, c.sourceRepoPath, commit, "HEAD"); {
+			ancErr := isAncestor(gitBin, c.sourceRepoPath, commit, "HEAD")
+			if errors.Is(ancErr, errCommitUnresolvable) {
+				// Most "unresolvable" cases are just an object nobody has
+				// fetched into this checkout yet, not a commit that exists
+				// nowhere — try once before concluding we genuinely can't
+				// verify (ga-c7np1n).
+				if fetchErr := attemptFetchCommit(gitBin, c.sourceRepoPath, commit); fetchErr == nil {
+					ancErr = isAncestor(gitBin, c.sourceRepoPath, commit, "HEAD")
+				}
+			}
+			switch {
 			case errors.Is(ancErr, errNotAncestor):
 				r.Status = StatusError
 				r.Severity = SeverityBlocking
@@ -256,29 +300,56 @@ func (c *BuildLineageStalenessCheck) Run(_ *CheckContext) *CheckResult {
 				r.Details = []string{fmt.Sprintf("checkout-only staleness (not applicable to the running binary): merge-base with origin/main is %s old, %d commits behind", age.Round(time.Hour), behindCount)}
 				return r
 			case errors.Is(ancErr, errCommitUnresolvable):
-				provenanceDetail = fmt.Sprintf("binary provenance NOT verified — build commit %s not found in %s's object store (fetch, or point GC_SRC_PATH at the repo that actually produced this binary)", shortSHA(commit), c.sourceRepoPath)
+				provenanceUnverified = true
+				provenanceDetail = fmt.Sprintf(
+					"binary provenance NOT verified — build commit %s not resolvable in %s, even after attempting to fetch it from every configured remote",
+					shortSHA(commit), c.sourceRepoPath)
 			case ancErr == nil:
 				provenanceDetail = fmt.Sprintf("binary provenance confirmed: running binary's build commit %s is part of this checkout's history", shortSHA(commit))
 			}
 		}
 	}
 
-	if age > c.maxAge || behindCount > c.maxCommits {
+	staleFixHint := "triage the missing upstream commits, fold this lineage's local-only fixes into the next build's manifest on the LIVE base (not origin/main — see reference_gascity_src_dev_gotchas REPO TOPOLOGY: local main is a dead tracking branch nothing builds from), rebuild, reinstall"
+	staleByThreshold := age > c.maxAge || behindCount > c.maxCommits
+
+	// Fail-closed (ga-c7np1n): an unresolvable binary commit must never
+	// silently coexist with a StatusOK result, and the caveat belongs in
+	// Message (always shown) not just Details (verbose-only) — this fleet's
+	// own standing convention, and the entire reason this guard exists.
+	switch {
+	case staleByThreshold && provenanceUnverified:
+		r.Status = StatusError
+		r.Severity = SeverityBlocking
+		r.Message = fmt.Sprintf(
+			"%s: merge-base with origin/main is %s old and %d commits behind (thresholds: %s / %d commits)%s; ALSO %s",
+			c.sourceRepoPath, age.Round(time.Hour), behindCount, c.maxAge, c.maxCommits, fetchCaveat, provenanceDetail)
+		r.FixHint = staleFixHint
+		return r
+	case staleByThreshold:
 		r.Status = StatusError
 		r.Severity = SeverityBlocking
 		r.Message = fmt.Sprintf(
 			"%s: merge-base with origin/main is %s old and %d commits behind (thresholds: %s / %d commits)%s",
 			c.sourceRepoPath, age.Round(time.Hour), behindCount, c.maxAge, c.maxCommits, fetchCaveat)
-		r.FixHint = "triage the missing upstream commits, fold this lineage's local-only fixes into the next build's manifest on the LIVE base (not origin/main — see reference_gascity_src_dev_gotchas REPO TOPOLOGY: local main is a dead tracking branch nothing builds from), rebuild, reinstall"
+		r.FixHint = staleFixHint
+		r.Details = []string{provenanceDetail}
+		return r
+	case provenanceUnverified:
+		r.Status = StatusWarning
+		r.Severity = SeverityAdvisory
+		r.Message = fmt.Sprintf(
+			"%s: %s (checkout-only staleness is within thresholds: %s old, %d commits behind%s — lineage identity is UNKNOWN, not confirmed)",
+			c.sourceRepoPath, provenanceDetail, age.Round(time.Hour), behindCount, fetchCaveat)
+		r.FixHint = "fetch the commit into this checkout manually if you know where it lives (git fetch <remote> <sha>), or point GC_SRC_PATH at the repo/clone that actually produced this binary"
+		return r
+	default:
+		r.Status = StatusOK
+		r.Message = fmt.Sprintf("%s: merge-base with origin/main is %s old, %d commits behind — within thresholds%s",
+			c.sourceRepoPath, age.Round(time.Hour), behindCount, fetchCaveat)
 		r.Details = []string{provenanceDetail}
 		return r
 	}
-
-	r.Status = StatusOK
-	r.Message = fmt.Sprintf("%s: merge-base with origin/main is %s old, %d commits behind — within thresholds%s",
-		c.sourceRepoPath, age.Round(time.Hour), behindCount, fetchCaveat)
-	r.Details = []string{provenanceDetail}
-	return r
 }
 
 // shortSHA truncates a commit SHA for compact messages.
