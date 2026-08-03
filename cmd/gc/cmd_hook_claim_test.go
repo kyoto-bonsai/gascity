@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -441,4 +442,132 @@ func TestDoHookClaimStillClaimsBeadWithAwaitingSet(t *testing.T) {
 	if !result.OK || result.Reason != "claimed" {
 		t.Fatalf("result = %#v, want ok=true reason=claimed", result)
 	}
+}
+
+// ga-kk6mke: the "claim-then-announce" half of the R1 remedy. R1 forbids
+// refusing the claim itself (see TestDoHookClaimStillClaimsBeadWithAwaitingSet
+// above), so the consumer this bead asks for must act on the Awaiting value
+// AFTER a successful claim, not gate the claim. These three tests pin that a
+// non-empty Awaiting produces a loud stderr warning on all three result sites
+// (fresh pool-claim, existing in-progress assignment, ready assignment) and
+// that a normal claim with no gc.awaiting stays silent (adjacent-class
+// control — the warning must be conditioned on Awaiting, not fire
+// unconditionally on every claim).
+
+func TestDoHookClaimWarnsOnAwaitingParkedFreshClaim(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "bead-1", Status: "open", Metadata: map[string]string{"gc.routed_to": "route-1", "gc.awaiting": "validator"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) { return string(output), nil },
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress", Metadata: candidates[0].Metadata}, true, nil
+		},
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "bead-1") || !strings.Contains(stderr.String(), "PARKED") || !strings.Contains(stderr.String(), "validator") {
+		t.Errorf("stderr = %q, want a PARKED warning naming bead-1 and validator", stderr.String())
+	}
+}
+
+func TestDoHookClaimWarnsOnAwaitingParkedExistingAssignment(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "bead-1", Status: "in_progress", Assignee: "worker-1", Metadata: map[string]string{"gc.routed_to": "route-1", "gc.awaiting": "close_decision"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	ops := hookClaimOps{
+		Runner:   func(string, string) (string, error) { return string(output), nil },
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "bead-1") || !strings.Contains(stderr.String(), "PARKED") || !strings.Contains(stderr.String(), "close_decision") {
+		t.Errorf("stderr = %q, want a PARKED warning naming bead-1 and close_decision", stderr.String())
+	}
+}
+
+func TestDoHookClaimNoWarningWhenNotAwaitingParked(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "bead-1", Status: "open", Metadata: map[string]string{"gc.routed_to": "route-1"}},
+	}
+	output, err := json.Marshal(candidates)
+	if err != nil {
+		t.Fatalf("marshal candidates: %v", err)
+	}
+
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) { return string(output), nil },
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			return beads.Bead{ID: beadID, Assignee: assignee, Status: "in_progress", Metadata: candidates[0].Metadata}, true, nil
+		},
+		DrainAck: func(io.Writer) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", ".", hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"route-1"},
+		JSON:               true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "PARKED") {
+		t.Errorf("stderr = %q, want no PARKED warning for a bead with no gc.awaiting", stderr.String())
+	}
+}
+
+func TestWarnHookClaimAwaitingParked(t *testing.T) {
+	cases := map[string]struct {
+		result   hookClaimJSONResult
+		wantWarn bool
+	}{
+		"empty awaiting":      {result: hookClaimJSONResult{BeadID: "b1", Awaiting: ""}, wantWarn: false},
+		"whitespace awaiting": {result: hookClaimJSONResult{BeadID: "b1", Awaiting: "   "}, wantWarn: false},
+		"validator":           {result: hookClaimJSONResult{BeadID: "b1", Awaiting: "validator"}, wantWarn: true},
+		"off-vocabulary":      {result: hookClaimJSONResult{BeadID: "b1", Awaiting: "cass"}, wantWarn: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			warnHookClaimAwaitingParked(tc.result, &stderr)
+			got := strings.Contains(stderr.String(), "PARKED")
+			if got != tc.wantWarn {
+				t.Errorf("warned = %v, want %v; stderr=%q", got, tc.wantWarn, stderr.String())
+			}
+		})
+	}
+	// A nil stderr must never panic (best-effort, same contract as every
+	// other diagnostic in this file).
+	warnHookClaimAwaitingParked(hookClaimJSONResult{BeadID: "b1", Awaiting: "validator"}, nil)
 }

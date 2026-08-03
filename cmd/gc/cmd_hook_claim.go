@@ -350,6 +350,7 @@ func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions)
 }
 
 func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) int {
+	warnHookClaimAwaitingParked(result, stderr)
 	stampHookWorkBranch(bead, opts, ops, dir, stderr)
 	recordHookClaimSessionPointers(bead, opts, ops, dir, stderr)
 	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir)
@@ -367,6 +368,25 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	}
 	fmt.Fprintln(stdout, result.BeadID) //nolint:errcheck
 	return 0
+}
+
+// warnHookClaimAwaitingParked is the "claim-then-announce" half of the R1
+// remedy (ga-kk6mke): ga-982pdy R1 forbids gating claim eligibility on
+// gc.awaiting, so a claim on an awaiting-parked bead always succeeds — but
+// until now nothing consumed the value ga-8gq4ff already surfaces in the
+// JSON result, so the claim was silent (the exact silence all four live
+// repros on ga-5g6wdx flagged). A non-empty Awaiting means the bead is
+// parked pending some other actor's decision, not necessarily this session's
+// own dispatched work. Warn loudly on stderr — outside the versioned JSON
+// contract, so opts.JSON callers parsing stdout are unaffected — rather than
+// let a session silently start treating a parked bead as ordinary ready
+// work.
+func warnHookClaimAwaitingParked(result hookClaimJSONResult, stderr io.Writer) {
+	awaiting := strings.TrimSpace(result.Awaiting)
+	if awaiting == "" || stderr == nil {
+		return
+	}
+	fmt.Fprintf(stderr, "gc hook --claim: WARNING: %s is PARKED (gc.awaiting=%s) — this may not be your dispatched work; verify before proceeding (ga-982pdy R1)\n", result.BeadID, awaiting) //nolint:errcheck
 }
 
 // writeHookClaimNoWork writes the single drain result for a hook that claimed
