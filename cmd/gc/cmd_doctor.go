@@ -331,10 +331,15 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// city config needed — catch the recurring failure mode where a new gc
 	// binary is built from a stale/wrong base and silently drops local-only
 	// hardening that never merged upstream (ga-tk5mcg.11, confirmed for real
-	// by ga-89t7e2). Both degrade to advisory when their precondition isn't
-	// met on this host (no source checkout, no go toolchain) rather than
-	// ever blocking doctor on an environment where they're not applicable.
-	register(doctor.NewBuildLineageStalenessCheck())
+	// by ga-89t7e2). Amended spec (marcus's RCA ga-gbx5lc): doctor never
+	// fetches or reconstructs lineage — the install gate (`gc internal
+	// verify-build-lineage`, internal/buildprovenance) is the sole place
+	// that runs git, once, locally, at install time, and doctor only reads
+	// what it recorded. missingIsBlocking=false is the A4 transition grace
+	// period (one install cycle); ga-tk5mcg.11.5 is the dated bead that
+	// must flip this to true — an un-flipped advisory repeats the
+	// ga-c7np1n fail-open class.
+	register(doctor.NewBuildProvenanceCheck(commit, false))
 	register(doctor.NewHardeningSymbolsCheck())
 	if cfgErr == nil && doctorWorkspaceHasPostgresScope(cityPath, cfg) {
 		register(doctorchecks.NewPostgresAuthCheck(cityPath, cfg))
