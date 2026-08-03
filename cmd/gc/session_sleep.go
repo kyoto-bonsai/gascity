@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"strings"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
@@ -380,6 +382,23 @@ func recoverPendingIdleSleepInfo(
 		return false
 	}
 	return true
+}
+
+// sessionSleptPayload builds the events.SessionSleptPayload wire JSON for a
+// session.slept emission (ga-e5ygdf). idleReference is the last-known-activity
+// timestamp captured BEFORE any kill this tick may perform; a zero value (or
+// one that is not before now) omits idle_duration_s rather than measuring
+// against an already-dead runtime. policy is the session's resolved
+// sleep_after_idle policy at the moment of this transition — pass the zero
+// resolvedSessionSleepPolicy{} when resolution is not cheaply available
+// (e.g. no loaded city config) so PolicyClass/ResolvedTTL/ResolutionSource
+// are omitted rather than sent as misleading empty strings.
+func sessionSleptPayload(sessionName, template, reason string, idleReference, now time.Time, policy resolvedSessionSleepPolicy) json.RawMessage {
+	idleDurationS := 0
+	if !idleReference.IsZero() && now.After(idleReference) {
+		idleDurationS = int(now.Sub(idleReference).Seconds())
+	}
+	return events.SessionSleptPayloadJSON(sessionName, template, reason, idleDurationS, string(policy.Class), policy.Effective, policy.Source)
 }
 
 func boolMetadata(v bool) string {

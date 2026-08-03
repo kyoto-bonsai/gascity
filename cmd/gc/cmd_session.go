@@ -2403,12 +2403,20 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 	// kill leaves behind (#3629). Written here at the CLI layer rather than in
 	// Manager.Kill so the drain-ack async-stop path (verifiedStop ->
 	// handle.Kill -> Manager.Kill) keeps owning its own lifecycle state.
+	sleptEventPayload := json.RawMessage(nil)
 	if infoErr == nil {
 		now := time.Now().UTC()
 		patch := session.SleepPatch(now, "killed")
 		patch["synced_at"] = now.Format(time.RFC3339)
 		if err := sessStore.SetMetadataBatch(sessionID, patch); err != nil {
 			fmt.Fprintf(stderr, "gc session kill: warning: syncing session %s to asleep: %v\n", sessionID, err) //nolint:errcheck // best-effort stderr
+		} else {
+			// session.slept (ga-e5ygdf): policy resolution and the idle-reference
+			// probe both need cfg/sp, which this CLI command loads unconditionally
+			// above (unlike the manual-session-only `identity` lookup), so both are
+			// populated here rather than omitted.
+			policy := resolveSessionSleepPolicyInfo(info, cfg, sp)
+			sleptEventPayload = sessionSleptPayload(info.SessionNameMetadata, normalizedSessionTemplateInfo(info, cfg), "killed", sessionIdleReferenceInfo(info, sp), now, policy)
 		}
 	}
 
@@ -2434,6 +2442,15 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 		Message: "killed",
 		Payload: api.SessionLifecyclePayloadJSON(sessionID, "", "killed"),
 	})
+	if sleptEventPayload != nil {
+		rec.Record(events.Event{
+			Type:      events.SessionSlept,
+			Actor:     eventActor(),
+			Subject:   sessionID,
+			SessionID: sessionID,
+			Payload:   sleptEventPayload,
+		})
+	}
 	recordSessionKillStop(info, infoErr, cfg)
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{

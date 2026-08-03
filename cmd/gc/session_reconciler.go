@@ -2655,6 +2655,17 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			// sleep_policy_fingerprint are non-Info). Pre-pass-masked (STEP6-PREPASS-AUDIT
 			// group 6).
 			tick.apply(id, sessionpkg.SleepPatch(clk.Now().UTC(), string(sessionpkg.SleepReasonIdle)))
+			// session.slept (ga-e5ygdf): the runtime already stopped on its own
+			// before this tick observed it (recoverPendingIdleSleepInfo only
+			// returns true on !running), so the idle-reference probe below reads
+			// state from before this transition, not a runtime this tick just killed.
+			rec.Record(events.Event{
+				Type:      events.SessionSlept,
+				Actor:     "gc",
+				Subject:   tp.DisplayName(),
+				SessionID: id,
+				Payload:   sessionSleptPayload(name, tp.DisplayName(), string(sessionpkg.SleepReasonIdle), sessionIdleReferenceInfo(infoByID[id], sp), clk.Now(), policy),
+			})
 		}
 		// Fold detached_at change onto the snapshot (Step 6d write-returns-Info).
 		// reconcileDetachedAt returns the {"detached_at": <value>} batch it mirrored,
@@ -3165,6 +3176,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					reason, outcome := timerTraceCodes(dec)
 					trace.RecordDecision(TraceSiteReconcilerMaxSessionAge, reason, outcome, tp.TemplateName, name, nil)
 				}
+				// Captured before the kill below so session.slept's idle_duration_s
+				// reflects live activity state, not a probe against the runtime this
+				// call is about to stop.
+				idleReferenceBeforeMaxAgeKill := sessionIdleReferenceInfo(infoByID[id], sp)
 				if err := workerKillSessionTargetWithConfig("", store, sp, cfg, name); err != nil {
 					fmt.Fprintf(stderr, "session reconciler: stopping aged %s: %v\n", name, err) //nolint:errcheck // best-effort stderr
 				} else {
@@ -3175,6 +3190,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						Subject: tp.DisplayName(),
 					})
 					telemetry.RecordAgentMaxAgeKill(context.Background(), tp.DisplayName())
+					rec.Record(events.Event{
+						Type:      events.SessionSlept,
+						Actor:     "gc",
+						Subject:   tp.DisplayName(),
+						SessionID: id,
+						Payload:   sessionSleptPayload(name, tp.DisplayName(), dec.SleepReason, idleReferenceBeforeMaxAgeKill, clk.Now(), policy),
+					})
 					batch := sessionpkg.SleepPatch(clk.Now(), dec.SleepReason)
 					// OPTIMISTIC fold (origin/main parity): the kill already happened, so
 					// the sleep MUST land on the snapshot even if its persistence fails —
@@ -3287,6 +3309,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					reason, outcome := timerTraceCodes(dec)
 					trace.RecordDecision(TraceSiteReconcilerIdleTimeout, reason, outcome, tp.TemplateName, name, nil)
 				}
+				// Captured before the kill below so session.slept's idle_duration_s
+				// reflects live activity state, not a probe against the runtime this
+				// call is about to stop.
+				idleReferenceBeforeIdleTimeoutKill := sessionIdleReferenceInfo(infoByID[id], sp)
 				if err := workerKillSessionTargetWithConfig("", store, sp, cfg, name); err != nil {
 					fmt.Fprintf(stderr, "session reconciler: stopping idle %s: %v\n", name, err) //nolint:errcheck // best-effort stderr
 				} else {
@@ -3297,6 +3323,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						Subject: tp.DisplayName(),
 					})
 					telemetry.RecordAgentIdleKill(context.Background(), tp.DisplayName())
+					rec.Record(events.Event{
+						Type:      events.SessionSlept,
+						Actor:     "gc",
+						Subject:   tp.DisplayName(),
+						SessionID: id,
+						Payload:   sessionSleptPayload(name, tp.DisplayName(), dec.SleepReason, idleReferenceBeforeIdleTimeoutKill, clk.Now(), policy),
+					})
 					// Mark for immediate re-wake on this same tick by clearing
 					// last_woke_at and setting state to asleep. The wake logic
 					// below will pick it up.

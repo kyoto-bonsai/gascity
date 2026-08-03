@@ -59,6 +59,33 @@ const (
 	SessionMaxAgeKilled = "session.max_age_killed"
 	SessionSuspended    = "session.suspended"
 	SessionUpdated      = "session.updated"
+	// SessionSlept fires at every genuine transition of a session bead to
+	// state=asleep — the idle-sleep engine's own drain-complete site, the
+	// max-session-age preemptive-restart kill, the idle-timeout kill, and an
+	// explicit `gc session kill`. Before this event, sleep was a silent state
+	// transition: 500 events observed over a 3h window included zero of them
+	// (ga-v8mtlp 3-arm validation, finding F5). Its payload's resolved-policy
+	// fields let a subscriber distinguish an interactive-resume graceful sleep
+	// from a forced kill without re-deriving config, and answer "N asleep"
+	// questions that gc session list's contaminated state=asleep column cannot
+	// (that column conflates engine-slept with killed/runtime-missing/city-stop).
+	SessionSlept = "session.slept"
+	// SessionResumed fires additively alongside session.woke when a start
+	// commits successfully AND the session is continuing a prior provider
+	// conversation (not the bead's first-ever start, not a forced fresh wake,
+	// and a resumable session_key is present) — the same resume/fresh
+	// distinction already used to choose between delivering the full startup
+	// prompt and a short restart nudge (buildPreparedStartWithWorkDirResolver).
+	// session.woke keeps firing unconditionally on every commit exactly as
+	// before (SessionResumed is additive, never a replacement), so existing
+	// session.woke consumers are unaffected. Before this event, session.woke
+	// was the only wake signal and fired identically for a brand-new session's
+	// first-ever start and a genuine resume-from-sleep — three independent
+	// proofs in ga-v8mtlp finding F5 established this conflation (a
+	// start-pending create, a never-slept fresh spawn, and wake events on a
+	// template pinned sleep_after_idle="off" and therefore unable to sleep at
+	// all).
+	SessionResumed = "session.resumed"
 	// SessionDrainAckedWithAssignedWork fires when a session acknowledges
 	// drain (via `gc runtime drain-ack`) while still holding the assignee
 	// on an open or in-progress work bead. Distinguishes a worker that
@@ -258,6 +285,7 @@ var KnownEventTypes = []string{
 	SessionWoke, SessionStopped, SessionCrashed,
 	SessionDraining, SessionUndrained, SessionQuarantined,
 	SessionIdleKilled, SessionMaxAgeKilled, SessionSuspended, SessionUpdated,
+	SessionSlept, SessionResumed,
 	SessionDrainAckedWithAssignedWork,
 	SessionStranded,
 	SessionUnknownState,

@@ -228,6 +228,15 @@ type preparedStart struct {
 	// re-derivation from the template (S19 re-eligibility).
 	promptDelivered bool
 	promptHash      string
+	// resumedFromSleep reports whether this incarnation is continuing a prior
+	// provider conversation (ga-e5ygdf) — the exact complement of
+	// promptDelivered's fresh-launch condition (!firstStart && !forceFresh &&
+	// hasResumeKey, the same test that selects restartPromptNudge over the
+	// full startup prompt below). Committing this start records session.woke
+	// unconditionally as always; when true it additionally records
+	// session.resumed, so a fresh spawn and a genuine resume are finally
+	// distinguishable in the event log (ga-v8mtlp finding F5).
+	resumedFromSleep bool
 }
 
 type startResult struct {
@@ -1076,6 +1085,13 @@ func buildPreparedStartWithWorkDirResolver(
 		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, parentSID, tp.ResolvedProvider, firstStart, forceFresh)
 	}
 	hasResumeKey := strings.TrimSpace(candidate.info.SessionKey) != ""
+	// isResume (ga-e5ygdf): true exactly when this incarnation continues a
+	// prior provider conversation rather than starting clean — the same test
+	// the prompt-delivery override below already uses to swap in
+	// restartPromptNudge. Threaded onto preparedStart.resumedFromSleep so the
+	// post-commit event emission (commitStartResultTraced) can distinguish a
+	// genuine resume from a fresh spawn without re-deriving this decision.
+	isResume := !firstStart && !forceFresh && hasResumeKey
 	// S19 priming confirmation (write-only in Stage 2): a marker is stamped only
 	// when the pure delivery decision holds AND this incarnation is a fresh
 	// launch — the exact complement of the resume override below, which swaps in
@@ -1089,7 +1105,7 @@ func buildPreparedStartWithWorkDirResolver(
 	// replays the transient initial_message, so hashing the delivered bytes would
 	// make the stored hash never match the re-derivation and re-prime forever.
 	promptHash := sessionpkg.PromptHash(tp.Prompt)
-	if !firstStart && !forceFresh && hasResumeKey {
+	if isResume {
 		agentCfg.PromptSuffix = ""
 		agentCfg.PromptFlag = ""
 		agentCfg.Nudge = restartPromptNudge(tp.Prompt, tp.Hints.Nudge)
@@ -1166,15 +1182,16 @@ func buildPreparedStartWithWorkDirResolver(
 	}
 	agentCfg = runtime.SyncWorkDirEnv(agentCfg)
 	return &preparedStart{
-		candidate:       candidate,
-		cfg:             agentCfg,
-		coreHash:        coreHash,
-		coreBreakdown:   coreBreakdown,
-		liveHash:        liveHash,
-		provisionHash:   provisionHash,
-		launchHash:      launchHash,
-		promptDelivered: promptDelivered,
-		promptHash:      promptHash,
+		candidate:        candidate,
+		cfg:              agentCfg,
+		coreHash:         coreHash,
+		coreBreakdown:    coreBreakdown,
+		liveHash:         liveHash,
+		provisionHash:    provisionHash,
+		launchHash:       launchHash,
+		promptDelivered:  promptDelivered,
+		promptHash:       promptHash,
+		resumedFromSleep: isResume,
 	}, candidate.info, nil
 }
 
@@ -2176,6 +2193,21 @@ func commitStartResultTraced(
 		Subject:   tp.DisplayName(),
 		SessionID: info.ID,
 	})
+	// session.resumed (ga-e5ygdf): additive alongside the unconditional
+	// session.woke above — never a replacement, so existing session.woke
+	// consumers see no change. Fires only when this incarnation continues a
+	// prior provider conversation (preparedStart.resumedFromSleep, computed
+	// in buildPreparedStartWithWorkDirResolver from the same firstStart/
+	// forceFresh/hasResumeKey test that already selects the prompt vs. the
+	// resume nudge), so a brand-new session's first-ever start never emits it.
+	if result.prepared.resumedFromSleep {
+		rec.Record(events.Event{
+			Type:      events.SessionResumed,
+			Actor:     "gc",
+			Subject:   tp.DisplayName(),
+			SessionID: info.ID,
+		})
+	}
 	telemetry.RecordAgentStart(context.Background(), name, tp.DisplayName(), nil)
 	if trace != nil {
 		trace.RecordMutation(TraceSiteMutationBeadMetadata, TraceReasonUnknown, TraceOutcomeSuccess, "metadata_batch", info.ID, "started_config_hash", traceRecordPayload{
