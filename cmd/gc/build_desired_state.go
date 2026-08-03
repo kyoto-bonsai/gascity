@@ -4040,7 +4040,14 @@ func stampRunSessionIdentity(workBeads []beads.Bead, workStores []beads.Store, s
 		if sessionName != "" && strings.TrimSpace(wb.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
 			patch[beadmeta.SessionNameMetadataKey] = sessionName
 		}
-		if workDir != "" && strings.TrimSpace(wb.Metadata[beadmeta.WorkDirMetadataKey]) != workDir {
+		// A bead parked on gc.awaiting may be assigned to this session through
+		// no fault of its own dispatch (ga-982pdy R1: the claim is rightful,
+		// gc.awaiting is never a claim-eligibility gate). Stamping this
+		// session's work_dir onto it would repoint the resume pointer of a
+		// bead that actually lives elsewhere — the durability corruption
+		// ga-kk6mke traces to this reconciler. gc.session_name above is still
+		// accurate (the assignee genuinely is this session) and is kept.
+		if workDir != "" && !awaitingParkedHookBead(wb.Metadata) && strings.TrimSpace(wb.Metadata[beadmeta.WorkDirMetadataKey]) != workDir {
 			patch[beadmeta.WorkDirMetadataKey] = workDir
 		}
 		if len(patch) > 0 {
@@ -4081,7 +4088,9 @@ func stampRunRootFromStep(store beads.Store, step beads.Bead, sessionName, workD
 	if sessionName != "" && strings.TrimSpace(root.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
 		patch[beadmeta.SessionNameMetadataKey] = sessionName
 	}
-	if workDir != "" && strings.TrimSpace(root.Metadata[beadmeta.WorkDirMetadataKey]) != workDir {
+	// See the matching guard in stampRunSessionIdentity: a root parked on its
+	// own gc.awaiting must keep its real work_dir (ga-kk6mke).
+	if workDir != "" && !awaitingParkedHookBead(root.Metadata) && strings.TrimSpace(root.Metadata[beadmeta.WorkDirMetadataKey]) != workDir {
 		patch[beadmeta.WorkDirMetadataKey] = workDir
 	}
 	if len(patch) == 0 {
@@ -4090,6 +4099,13 @@ func stampRunRootFromStep(store beads.Store, step beads.Bead, sessionName, workD
 	if err := store.SetMetadataBatch(rootID, patch); err != nil && stderr != nil {
 		fmt.Fprintf(stderr, "stampRunSessionIdentity root %s: %v\n", rootID, err) //nolint:errcheck
 	}
+}
+
+// awaitingParkedHookBead reports whether md carries a non-empty gc.awaiting —
+// the bead is parked pending some other actor's decision (ga-982pdy R1), not
+// necessarily this session's own dispatched work.
+func awaitingParkedHookBead(md map[string]string) bool {
+	return strings.TrimSpace(md[beadmeta.AwaitingMetadataKey]) != ""
 }
 
 // canonicalizeLegacyBoundAssignedWork re-homes the Assignee and gc.routed_to of
