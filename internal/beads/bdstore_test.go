@@ -4291,8 +4291,15 @@ func TestBdStoreListWispsUsesBdListWithClientTierFilter(t *testing.T) {
 	if queryCmd := firstCommandWithPrefix(calls, "bd query "); !strings.Contains(queryCmd, "ephemeral=true AND label=order-tracking") {
 		t.Fatalf("calls = %#v, want matching bd query ephemeral read", calls)
 	}
-	if len(got) != 2 || got[0].ID != "bd-nh" || got[1].ID != "bd-w" || !got[0].NoHistory || !got[1].Ephemeral {
-		t.Fatalf("got = %+v, want no-history and ephemeral rows only", got)
+	// bd-w (00:00:02Z) is newer than bd-nh (00:00:01Z), so the merged order is
+	// [bd-w, bd-nh] under SortDefault. Before ga-0pg093's B1 fix this asserted
+	// the opposite ([bd-nh, bd-w]) -- not a real ordering contract, just the
+	// bd-list-tier-then-wisps-tier concatenation order mergeListTierResults
+	// happened to produce when SortDefault was a silent no-op at a merge site.
+	// No Limit is set here, so that bug never dropped rows in this fixture,
+	// only misordered them -- same defect class as B1, caught independently.
+	if len(got) != 2 || got[0].ID != "bd-w" || got[1].ID != "bd-nh" || !got[0].Ephemeral || !got[1].NoHistory {
+		t.Fatalf("got = %+v, want ephemeral (newer) then no-history (older) rows, newest-first", got)
 	}
 }
 
@@ -4430,12 +4437,20 @@ func TestBdStoreListBothTiersUnionsBdListAndEphemeralQuery(t *testing.T) {
 // Limit on BOTH the bd-list and bd-query legs of a TierBoth read regardless of
 // what the caller asked for — an unbounded full scan on every named-persona
 // mail read under Dolt load. AssigneesAreAliases exempts exactly this case.
-// TestBdStoreListBothTiersAssigneeAliasesAppliesLimit pins the ga-0pg093
-// fix shape: one Limit-bounded, ASSIGNEE-FILTERED query per alias, merged —
-// not a single Limit-bounded query with no assignee predicate at all. The
-// prior version of this test asserted the opposite (no assignee= clause
-// pushed for a multi-alias query); that was the unsafe combination this bug
-// shipped as desired behavior — see ga-0pg093. The mock here is
+//
+// This pins the ga-0pg093 B2 fix shape, not the original fan-out fix: the
+// wisps/bd-query tier (where every message bead actually lives) pushes ONE
+// disjunctive assignee clause server-side rather than fanning out one
+// Limit-bounded query per alias and merging in-process. bd query can express
+// an OR across assignees in one call; bd list cannot (--assignee is
+// single-valued), so the bd-list tier still fans out one query per alias —
+// this test's own prior version pinned exactly that shape for BOTH tiers,
+// which was correctness-safe but (a) 3x'd subprocess calls on the hot mail
+// read path (B3) and (b) relied on an in-process merge-then-truncate whose
+// sort was a no-op under the caller's actual SortDefault, silently dropping
+// the newest bead of whichever alias got merged last once one alias
+// saturated Limit on its own (B1) — see TestBdStoreSaturatingAliasKeepsNewestMailAcrossTiers
+// for a fixture that actually exercises that boundary. The mock here is
 // assignee-aware specifically so the test can tell "found this alias's own
 // wisp" apart from "found whatever the fixture always returns."
 func TestBdStoreListBothTiersAssigneeAliasesAppliesLimit(t *testing.T) {
@@ -4444,7 +4459,7 @@ func TestBdStoreListBothTiersAssigneeAliasesAppliesLimit(t *testing.T) {
 		full := name + " " + strings.Join(args, " ")
 		calls = append(calls, full)
 		if strings.HasPrefix(full, "bd query ") {
-			if strings.Contains(full, "assignee=persona-marcus") {
+			if strings.Contains(full, "(assignee=persona-marcus OR assignee=sess-1 OR assignee=qo-marcus-2)") {
 				return []byte(`[
 					{"id":"bd-w","title":"wisp for persona","status":"open","issue_type":"message","assignee":"persona-marcus","created_at":"2026-05-02T00:00:00Z","ephemeral":true}
 				]`), nil
@@ -4469,21 +4484,22 @@ func TestBdStoreListBothTiersAssigneeAliasesAppliesLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got[0].ID != "bd-w" {
-		t.Fatalf("got = %+v, want the one matching wisp found via its own alias's query", got)
+		t.Fatalf("got = %+v, want the one matching wisp found via the union query", got)
 	}
 	queryCalls := commandsWithPrefix(calls, "bd query ")
-	if len(queryCalls) != 3 {
-		t.Fatalf("bd query calls = %v, want exactly one per alias (3)", queryCalls)
+	if len(queryCalls) != 1 {
+		t.Fatalf("bd query calls = %v, want exactly ONE disjunctive query for all aliases (bd query can express OR, unlike bd list)", queryCalls)
 	}
-	for _, alias := range []string{"persona-marcus", "sess-1", "qo-marcus-2"} {
-		cmd := firstCommandWithPrefix(queryCalls, "bd query --json ephemeral=true AND status=open AND type=message AND assignee="+alias)
-		if cmd == "" {
-			t.Fatalf("bd query calls = %v, want one carrying assignee=%s", queryCalls, alias)
-		}
-		if !strings.Contains(cmd, "--limit 500") {
-			t.Fatalf("bd query command = %q, want --limit 500 per alias, not an unbounded full scan", cmd)
-		}
+	wantPrefix := "bd query --json ephemeral=true AND status=open AND type=message AND (assignee=persona-marcus OR assignee=sess-1 OR assignee=qo-marcus-2)"
+	if !strings.HasPrefix(queryCalls[0], wantPrefix) {
+		t.Fatalf("bd query command = %q, want prefix %q", queryCalls[0], wantPrefix)
 	}
+	if !strings.Contains(queryCalls[0], "--limit 500") {
+		t.Fatalf("bd query command = %q, want --limit 500 applied ONCE over the union, not per-alias", queryCalls[0])
+	}
+	// bd list has no OR mechanism, so it still fans out one Limit-bounded
+	// query per alias — always empty for message beads (bd list never sees
+	// ephemeral rows) but correctness-safe, unaffected by this fix.
 	listCalls := commandsWithPrefix(calls, "bd list ")
 	if len(listCalls) != 3 {
 		t.Fatalf("bd list calls = %v, want exactly one per alias (3)", listCalls)
@@ -4793,7 +4809,15 @@ func TestBdStoreListWispAwareTiersTolerateAdaptersWithoutBdQuery(t *testing.T) {
 		want string
 	}{
 		{name: "wisps", tier: beads.TierWisps, want: "bd-no-history"},
-		{name: "both", tier: beads.TierBoth, want: "bd-history"},
+		// "both" surfaces both fixture rows (TierWisps' own listViaBDList
+		// leg filters bd-history out; TierBoth's does not), so this case
+		// exercises mergeListTierResults' ordering. bd-no-history
+		// (00:00:01Z) is newer than bd-history (00:00:00Z); under
+		// SortDefault the merge must return newest-first (ga-0pg093 B1) —
+		// before that fix this pinned "bd-history" instead, which was only
+		// ever the mock's own declaration order (coincidentally
+		// oldest-first), not a real ordering contract.
+		{name: "both", tier: beads.TierBoth, want: "bd-no-history"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

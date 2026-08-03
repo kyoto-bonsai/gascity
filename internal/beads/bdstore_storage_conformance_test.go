@@ -337,17 +337,24 @@ func TestBdStoreListStorageTierConformance(t *testing.T) {
 			wantUnlimitedPrelimit: true,
 		},
 		{
+			// bd-ephemeral (00:00:02Z) is newer than bd-no-history
+			// (00:00:01Z); mergeListTierResults returns newest-first under
+			// SortDefault (ga-0pg093 B1) rather than the bd-list-tier-then-
+			// wisps-tier concatenation order this pinned before that fix.
 			name:                  "wisps tier keeps no-history and ephemeral rows",
 			query:                 beads.ListQuery{Label: "scope", TierMode: beads.TierWisps},
-			wantIDs:               []string{"bd-no-history", "bd-ephemeral"},
+			wantIDs:               []string{"bd-ephemeral", "bd-no-history"},
 			wantIncludeTemplates:  true,
 			wantUnlimitedPrelimit: true,
 			wantEphemeralQuery:    true,
 		},
 		{
+			// Same ordering fix, all three rows: newest-first is
+			// bd-ephemeral (00:00:02Z), bd-no-history (00:00:01Z),
+			// bd-history (00:00:00Z).
 			name:                 "both tiers keeps all storage rows",
 			query:                beads.ListQuery{Label: "scope", TierMode: beads.TierBoth},
-			wantIDs:              []string{"bd-history", "bd-no-history", "bd-ephemeral"},
+			wantIDs:              []string{"bd-ephemeral", "bd-no-history", "bd-history"},
 			wantIncludeTemplates: true,
 			wantEphemeralQuery:   true,
 		},

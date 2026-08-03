@@ -75,13 +75,17 @@ type ListQuery struct {
 	// AssigneesAreAliases tells backends that every entry in Assignees is a
 	// stable-mailbox spelling of ONE logical recipient (e.g. a live session's
 	// bead ID, alias, and session_name), not a fan-out across distinct
-	// recipients. bd-CLI-backed stores cannot push a multi-value assignee
-	// filter server-side in one call; when this is set they instead issue one
+	// recipients. Either way, applying Limit to a single unfiltered scan
+	// across every recipient is unsafe: it can silently drop the recipient's
+	// own mail entirely when other recipients' newer messages fill the
+	// window ahead of it (ga-0pg093). bd query CAN push a disjunctive
+	// multi-value assignee filter server-side in one call ("(assignee=a OR
+	// assignee=b)"), so BdStore's wisps-tier reads (listEphemeral) do that
+	// directly and apply Limit once over the true union. bd list cannot
+	// (--assignee is single-valued; repeating it yields no results), so
+	// BdStore's issues-tier reads (listViaBDList) instead issue one
 	// Limit-bounded, server-filtered query per alias and merge the results
-	// (see listByAliasesUnion), rather than applying Limit to a single
-	// unfiltered scan — the latter can silently drop the recipient's own mail
-	// entirely when other recipients' newer messages fill the window ahead of
-	// it (ga-0pg093).
+	// (see listByAliasesUnion).
 	AssigneesAreAliases bool
 	ParentID            string
 	// ParentIDs matches beads whose parent_id is any of the listed ids — a

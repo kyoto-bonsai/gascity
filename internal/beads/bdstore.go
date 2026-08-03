@@ -2443,21 +2443,51 @@ func bdServerQueryForAssignees(query ListQuery) (ListQuery, bool) {
 	}
 }
 
+// sortBeadsForMerge orders a concatenation of several already-Limit-bounded
+// sub-reads before the caller truncates to a combined Limit. It differs from
+// sortBeadsForQuery only in how it treats SortDefault: sortBeadsForQuery
+// leaves SortDefault as a no-op because a single bd subprocess call already
+// returns rows in its own native (newest-first) order, so re-sorting would be
+// redundant. That assumption breaks the moment the caller is concatenating
+// results from MULTIPLE bounded sub-reads (per-alias or per-tier): the
+// concatenation order reflects iteration order, not recency, so truncating
+// under a no-op sort can drop a newer row from a later-iterated source in
+// favor of an older row from an earlier one (ga-0pg093, B1). Every bd
+// subprocess call already defaults to newest-first when no explicit sort is
+// requested (live-verified, ga-0pg093), so at a merge site SortDefault means
+// "newest-first", not "leave the concatenation order alone".
+func sortBeadsForMerge(items []Bead, order SortOrder) {
+	if order == SortDefault {
+		order = SortCreatedDesc
+	}
+	sortBeadsForQuery(items, order)
+}
+
 // listByAliasesUnion resolves an AssigneesAreAliases query by issuing one
-// Limit-bounded, server-filtered query per alias via fn (listViaBDList or
-// listEphemeral) and merging the results, instead of applying Limit to a
-// single unfiltered scan across every recipient (ga-0pg093: the latter can
-// crowd the recipient's own mail entirely out of the window with other
+// Limit-bounded, server-filtered query per alias via fn (listViaBDList; see
+// listEphemeral for the wisps-tier equivalent, which pushes a single
+// disjunctive bd query instead since bd query — unlike bd list — can express
+// an OR across assignees) and merging the results, instead of applying Limit
+// to a single unfiltered scan across every recipient (ga-0pg093: the latter
+// can crowd the recipient's own mail entirely out of the window with other
 // recipients' newer messages).
 //
 // Bounding each sub-query to query.Limit is sufficient, not just convenient:
 // any bead that belongs in the true top-Limit set across the whole alias
 // union must also rank within its own alias's top-Limit (removing every
 // other alias's beads from consideration can only improve a bead's rank
-// within its own alias's results). So the merged, re-sorted, re-truncated
-// output here is exactly the same top-Limit set an unbounded scan would have
-// produced — this is not a heuristic, it is the standard top-K-merge-from-
-// sorted-partitions argument.
+// within its own alias's results). So the top-Limit set is preserved by
+// bounding each sub-query — but only if the merge step that follows imposes
+// a real recency order before truncating. sortBeadsForQuery(merged,
+// query.Sort) alone does not: SortDefault is documented (see SortOrder) as
+// leaving order unchanged, which is safe for a single already-ordered
+// source but not for N concatenated sources, whose concatenation order has
+// no relationship to recency — the production caller (beadmail's
+// messageCandidatesAll) always queries with SortDefault, so this was a live
+// gap (ga-0pg093 validation, B1: could drop the newest bead of whichever
+// alias iterated last). sortBeadsForMerge closes it by treating SortDefault
+// as "newest-first" at merge sites specifically, matching every bd
+// subprocess call's own native default order.
 func (s *BdStore) listByAliasesUnion(query ListQuery, fn func(ListQuery) ([]Bead, error)) ([]Bead, error) {
 	merged := make([]Bead, 0, len(query.Assignees))
 	seen := make(map[string]bool, len(query.Assignees))
@@ -2481,7 +2511,7 @@ func (s *BdStore) listByAliasesUnion(query ListQuery, fn func(ListQuery) ([]Bead
 		}
 	}
 
-	sortBeadsForQuery(merged, query.Sort)
+	sortBeadsForMerge(merged, query.Sort)
 	if query.Limit > 0 && len(merged) > query.Limit {
 		merged = merged[:query.Limit]
 	}
@@ -2513,19 +2543,49 @@ func (s *BdStore) listWispsTier(query ListQuery) ([]Bead, error) {
 // TierWisps and TierBoth must union this path with bd list results.
 func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
 	serverQuery, clientFilteredAssignees := bdServerQueryForAssignees(query)
-	if clientFilteredAssignees && query.AssigneesAreAliases {
-		return s.listByAliasesUnion(query, s.listEphemeral)
-	}
 	clauses := []string{"ephemeral=true"}
-	// A query that reaches here with clientFilteredAssignees true is, by
-	// construction, a genuine multi-recipient filter (the AssigneesAreAliases
-	// case fans out through listByAliasesUnion above instead) — the same
-	// unbounded-fetch requirement as bdListRequiresClientLimit's bd-list tier.
-	serverFilteredOnly := !clientFilteredAssignees
+	// A query that reaches here with clientFilteredAssignees true and
+	// AssigneesAreAliases false is, by construction, a genuine multi-recipient
+	// filter — the same unbounded-fetch requirement as
+	// bdListRequiresClientLimit's bd-list tier. AssigneesAreAliases queries no
+	// longer take that unbounded path: unlike bd list (whose --assignee flag
+	// is single-valued), bd query can express an OR across assignees in one
+	// clause (ga-0pg093, B2 — live-verified against the real backend:
+	// `bd query 'ephemeral=true AND ... AND (assignee=a OR assignee=b)'
+	// --limit N` returns the true union, newest-first, in one server-side
+	// pass), so the union is pushed server-side directly below instead of
+	// fanning out through listByAliasesUnion. That makes B1 (the merge-order
+	// bug in listByAliasesUnion's in-process concatenation) unrepresentable
+	// on this tier rather than merely patched, and collapses what was N
+	// subprocess calls into 1 on the tier that actually holds mail — every
+	// open message bead is ephemeral=true, so this is the tier
+	// beadmail.messageCandidatesAll's alias-union reads actually depend on.
+	//
+	// serverFilteredOnly starts true whenever a real server-side assignee
+	// predicate is coming: the single-assignee case (!clientFilteredAssignees)
+	// always has one, and the alias-union case optimistically assumes the
+	// clause below will build — appendBdQueryClause only ever downgrades
+	// true->false (never the reverse), and the union-clause branch does the
+	// same explicitly when it can't build a safe clause, so this is not
+	// double-counting either path.
+	serverFilteredOnly := !clientFilteredAssignees || query.AssigneesAreAliases
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "label", serverQuery.Label)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "status", serverQuery.Status)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "type", serverQuery.Type)
-	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "assignee", serverQuery.Assignee)
+	if clientFilteredAssignees && query.AssigneesAreAliases {
+		if clause, ok := bdQueryAssigneeUnionClause(query.Assignees); ok {
+			clauses = append(clauses, clause)
+		} else {
+			// An alias value can't be safely inlined as a bare bd query token
+			// (e.g. a "rig/agent.name" session route) — fall back to the same
+			// unbounded, client-filtered read a genuine multi-recipient query
+			// takes, rather than emit a clause with no assignee predicate at
+			// all (the exact unsafe combination ga-0pg093 was filed about).
+			serverFilteredOnly = false
+		}
+	} else {
+		clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "assignee", serverQuery.Assignee)
+	}
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "parent", serverQuery.ParentID)
 
 	args := []string{"query", "--json", strings.Join(clauses, " AND ")}
@@ -2641,6 +2701,30 @@ func appendBdQueryClause(clauses []string, serverFilteredOnly bool, field, value
 	return append(clauses, field+"="+value), serverFilteredOnly
 }
 
+// bdQueryAssigneeUnionClause builds a disjunctive bd query clause matching
+// any of the given assignees, e.g. "(assignee=a OR assignee=b)". Unlike bd
+// list's --assignee flag (single-valued; repeating it yields no results), bd
+// query can express this server-side (ga-0pg093, B2), so the backend applies
+// Limit once over the true union in its native newest-first order instead of
+// requiring a client-side fan-out-and-merge. Returns ok=false if any value
+// cannot be safely inlined as a bare bd query token (same restriction
+// appendBdQueryClause already applies to a single assignee), so the caller
+// can fall back to an unbounded, client-filtered read rather than build a
+// malformed or injectable clause.
+func bdQueryAssigneeUnionClause(assignees []string) (string, bool) {
+	if len(assignees) == 0 {
+		return "", false
+	}
+	parts := make([]string, 0, len(assignees))
+	for _, a := range assignees {
+		if !isBareBdQueryValue(a) {
+			return "", false
+		}
+		parts = append(parts, "assignee="+a)
+	}
+	return "(" + strings.Join(parts, " OR ") + ")", true
+}
+
 func isBareBdQueryValue(value string) bool {
 	upper := strings.ToUpper(value)
 	if upper == "AND" || upper == "OR" || upper == "NOT" {
@@ -2694,7 +2778,16 @@ func mergeListTierResults(query ListQuery, op string, primary []Bead, primaryErr
 	for _, b := range ephemeral {
 		add(b)
 	}
-	sortBeadsForQuery(merged, query.Sort)
+	// Same merge-of-multiple-bounded-sources hazard as listByAliasesUnion
+	// (ga-0pg093, B1): primary and ephemeral are two independently
+	// Limit-bounded reads concatenated here, so SortDefault must resolve to
+	// an explicit recency order before truncating, not a no-op. Currently
+	// masked for message beads specifically (primary is always empty — bd
+	// list never sees ephemeral rows — so there is nothing for this
+	// truncation to drop), but fixing it unconditionally rather than relying
+	// on that coincidence, since it is the identical shape marcus's
+	// validation flagged one call site over.
+	sortBeadsForMerge(merged, query.Sort)
 	if query.Limit > 0 && len(merged) > query.Limit {
 		merged = merged[:query.Limit]
 	}
