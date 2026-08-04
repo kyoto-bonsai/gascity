@@ -605,6 +605,121 @@ func TestInboxTruncatedSignalsFullWindow(t *testing.T) {
 	}
 }
 
+// TestCheckTruncatedSignalsFullWindow mirrors
+// TestInboxTruncatedSignalsFullWindow for Check (ga-awj0th): a bounded read
+// that comes back with a full window must say so, never silently pass off a
+// possibly-incomplete result as complete.
+func TestCheckTruncatedSignalsFullWindow(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	const seeded = messageCandidatesLimit + 1
+	for i := 0; i < seeded; i++ {
+		if _, err := p.Send("mayor", "human", "", "body"); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+	}
+
+	messages, truncated, err := p.CheckTruncated("human")
+	if err != nil {
+		t.Fatalf("CheckTruncated: %v", err)
+	}
+	if len(messages) != messageCandidatesLimit {
+		t.Fatalf("CheckTruncated returned %d messages, want exactly the %d-row bound", len(messages), messageCandidatesLimit)
+	}
+	if !truncated {
+		t.Fatalf("CheckTruncated returned the full %d-row window for a recipient with %d messages waiting but reported truncated=false — "+
+			"this is ga-awj0th's silent-loss shape: %d messages exist beyond what was returned with no signal",
+			messageCandidatesLimit, seeded, seeded-messageCandidatesLimit)
+	}
+
+	// Control: a recipient well under the bound must never be flagged, or
+	// this signal is noise, not a signal.
+	if _, err := p.Send("mayor", "not-human", "", "body"); err != nil {
+		t.Fatalf("Send control: %v", err)
+	}
+	controlMessages, controlTruncated, err := p.CheckTruncated("not-human")
+	if err != nil {
+		t.Fatalf("CheckTruncated (control): %v", err)
+	}
+	if len(controlMessages) != 1 {
+		t.Fatalf("control CheckTruncated returned %d messages, want 1", len(controlMessages))
+	}
+	if controlTruncated {
+		t.Fatalf("control CheckTruncated reported truncated=true for a recipient with only 1 message — false positive")
+	}
+
+	// Check (the pre-existing exported method every caller still uses) must
+	// be unaffected: CheckTruncated is strictly additive, not a behavior
+	// change.
+	checkMessages, err := p.Check("human")
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if len(checkMessages) != messageCandidatesLimit {
+		t.Fatalf("Check returned %d messages, want %d (CheckTruncated must not change Check's own behavior)", len(checkMessages), messageCandidatesLimit)
+	}
+}
+
+// TestCountRecipientsTruncatedSignalsFullWindow mirrors
+// TestInboxTruncatedSignalsFullWindow for CountRecipients (ga-awj0th): a
+// bounded read that comes back with a full window must say so via the
+// truncated return value, even though the returned counts themselves look
+// like ordinary small integers with no texture to be suspicious of — the
+// exact silent-authority shape ga-awj0th was filed against.
+func TestCountRecipientsTruncatedSignalsFullWindow(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	const seeded = messageCandidatesLimit + 1
+	for i := 0; i < seeded; i++ {
+		if _, err := p.Send("mayor", "human", "", "body"); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+	}
+
+	total, unread, truncated, err := p.CountRecipientsTruncated([]string{"human"})
+	if err != nil {
+		t.Fatalf("CountRecipientsTruncated: %v", err)
+	}
+	if total != messageCandidatesLimit || unread != messageCandidatesLimit {
+		t.Fatalf("CountRecipientsTruncated = (%d, %d), want (%d, %d) — the bound", total, unread, messageCandidatesLimit, messageCandidatesLimit)
+	}
+	if !truncated {
+		t.Fatalf("CountRecipientsTruncated returned the full %d-row bound as (total, unread) for a recipient with %d messages waiting but reported truncated=false — "+
+			"this is ga-awj0th's silent-loss shape: a count that looks authoritative but undercounts by %d with no signal",
+			messageCandidatesLimit, seeded, seeded-messageCandidatesLimit)
+	}
+
+	// Control: a recipient well under the bound must never be flagged, or
+	// this signal is noise, not a signal.
+	if _, err := p.Send("mayor", "not-human", "", "body"); err != nil {
+		t.Fatalf("Send control: %v", err)
+	}
+	controlTotal, controlUnread, controlTruncated, err := p.CountRecipientsTruncated([]string{"not-human"})
+	if err != nil {
+		t.Fatalf("CountRecipientsTruncated (control): %v", err)
+	}
+	if controlTotal != 1 || controlUnread != 1 {
+		t.Fatalf("control CountRecipientsTruncated = (%d, %d), want (1, 1)", controlTotal, controlUnread)
+	}
+	if controlTruncated {
+		t.Fatalf("control CountRecipientsTruncated reported truncated=true for a recipient with only 1 message — false positive")
+	}
+
+	// CountRecipients (the pre-existing exported method every caller still
+	// uses) must be unaffected: CountRecipientsTruncated is strictly
+	// additive, not a behavior change.
+	countTotal, countUnread, err := p.CountRecipients([]string{"human"})
+	if err != nil {
+		t.Fatalf("CountRecipients: %v", err)
+	}
+	if countTotal != messageCandidatesLimit || countUnread != messageCandidatesLimit {
+		t.Fatalf("CountRecipients = (%d, %d), want (%d, %d) (CountRecipientsTruncated must not change CountRecipients's own behavior)",
+			countTotal, countUnread, messageCandidatesLimit, messageCandidatesLimit)
+	}
+}
+
 func hasMailMessageID(messages []mail.Message, id string) bool {
 	for _, message := range messages {
 		if message.ID == id {

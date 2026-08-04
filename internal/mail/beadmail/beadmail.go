@@ -562,6 +562,13 @@ func (p *Provider) Check(recipient string) ([]mail.Message, error) {
 	return msgs, err
 }
 
+// CheckTruncated behaves like Check but additionally reports whether the read
+// may have been bounded by messageCandidatesLimit before scanning all of
+// recipient's open mail (ga-awj0th, mirrors InboxTruncated).
+func (p *Provider) CheckTruncated(recipient string) ([]mail.Message, bool, error) {
+	return p.filterMessages(recipient, false)
+}
+
 // CheckAutoHandoffs returns unread continuation mail carrying both labels that
 // opt it into automatic SessionStart delivery. It deliberately excludes normal
 // mail so a recycle does not duplicate the UserPromptSubmit inbox injection.
@@ -800,6 +807,34 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 		}
 	}
 	return total, unread, nil
+}
+
+// CountRecipientsTruncated behaves like CountRecipients but additionally
+// reports whether the read may have been bounded by messageCandidatesLimit
+// before scanning all matching mail (ga-awj0th, mirrors InboxTruncated).
+func (p *Provider) CountRecipientsTruncated(recipients []string) (int, int, bool, error) {
+	if len(recipients) == 0 {
+		return 0, 0, false, nil
+	}
+	routes := p.recipientRoutesForAll(recipients)
+	candidates, truncated, err := p.messageCandidatesForRoutes(routes, len(recipients) == 1)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("listing messages: %w", err)
+	}
+	var total, unread int
+	for _, b := range candidates {
+		if b.Status != "open" {
+			continue
+		}
+		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+			continue
+		}
+		total++
+		if !hasLabel(b.Labels, "read") {
+			unread++
+		}
+	}
+	return total, unread, truncated, nil
 }
 
 // filterMessages returns open message beads assigned to the recipient.

@@ -68,6 +68,12 @@ type mailCountJSONResult struct {
 	Recipients    []string `json:"recipients"`
 	Total         int      `json:"total"`
 	Unread        int      `json:"unread"`
+	// PossiblyTruncated is true when a bounded read returned a full window
+	// (ga-awj0th, mirrors mail inbox's ga-4derp8 signal): the total/unread
+	// counts may undercount. Always explicit, never omitted, so a caller can
+	// tell "checked, complete" from "checked, maybe not" — never confuse
+	// either with "field absent, unknown".
+	PossiblyTruncated bool `json:"possibly_truncated"`
 }
 
 type mailActionResult struct {
@@ -710,6 +716,16 @@ func doMailCheckFallback(args []string, inject bool, hookFormat string, stdout, 
 	return doMailCheckTargetWithFormat(mp, target, inject, hookFormat, stdout, stderr)
 }
 
+// mailCheckTruncationReader is an optional capability a mail.Provider backend
+// may implement to report possible truncation on a Check read (ga-awj0th,
+// mirrors mailInboxTruncationReader). Deliberately NOT part of the
+// mail.Provider contract: backends that don't implement it (mocks, alternate
+// stores) are treated as never truncated, so this is a best-effort
+// diagnostic probe, not a required method every implementation must carry.
+type mailCheckTruncationReader interface {
+	CheckTruncated(recipient string) ([]mail.Message, bool, error)
+}
+
 // doMailCheck checks for unread messages. Without --inject, prints the count
 // and returns 0 if mail exists, 1 if empty. With --inject, outputs a
 // <system-reminder> block for hook injection and always returns 0.
@@ -722,7 +738,14 @@ func doMailCheckTarget(mp mail.Provider, target resolvedMailTarget, inject bool,
 }
 
 func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, inject bool, hookFormat string, stdout, stderr io.Writer) int {
-	messages, err := collectMailMessages(mp.Check, target.recipients)
+	var messages []mail.Message
+	var truncated bool
+	var err error
+	if ta, ok := mp.(mailCheckTruncationReader); ok {
+		messages, truncated, err = collectMailMessagesTruncated(ta.CheckTruncated, target.recipients)
+	} else {
+		messages, err = collectMailMessages(mp.Check, target.recipients)
+	}
 	if err != nil {
 		if inject {
 			fmt.Fprintf(stderr, "gc mail check: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -730,6 +753,13 @@ func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, in
 		}
 		fmt.Fprintf(stderr, "gc mail check: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if truncated {
+		// ga-awj0th: mirrors gc mail inbox's ga-4derp8 signal — a bounded read
+		// came back with a full window. Printed unconditionally (both
+		// --inject and plain modes) so a truncated check is never mistaken
+		// for complete.
+		fmt.Fprintf(stderr, "WARN: gc mail check %s: read returned a full bounded window — more mail may exist beyond it; do not treat this result as complete (ga-awj0th)\n", target.display) //nolint:errcheck // best-effort stderr
 	}
 
 	if inject {
@@ -1471,6 +1501,16 @@ func collectMailCounts(count func(string) (int, int, error), recipients []string
 
 type multiRecipientMailCounter interface {
 	CountRecipients([]string) (int, int, error)
+}
+
+// mailCountTruncationReader is an optional capability a mail.Provider backend
+// may implement to report possible truncation on a Count read (ga-awj0th,
+// mirrors mailInboxTruncationReader). Deliberately NOT part of the
+// mail.Provider contract: backends that don't implement it (mocks, alternate
+// stores) are treated as never truncated, so this is a best-effort
+// diagnostic probe, not a required method every implementation must carry.
+type mailCountTruncationReader interface {
+	CountRecipientsTruncated([]string) (int, int, bool, error)
 }
 
 func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -2764,8 +2804,11 @@ func doMailCountTarget(mp mail.Provider, target resolvedMailTarget, stdout, stde
 
 func doMailCountTargetWithJSON(mp mail.Provider, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
 	var total, unread int
+	var truncated bool
 	var err error
-	if counter, ok := mp.(multiRecipientMailCounter); ok {
+	if counter, ok := mp.(mailCountTruncationReader); ok {
+		total, unread, truncated, err = counter.CountRecipientsTruncated(target.recipients)
+	} else if counter, ok := mp.(multiRecipientMailCounter); ok {
 		total, unread, err = counter.CountRecipients(target.recipients)
 	} else {
 		total, unread, err = collectMailCounts(mp.Count, target.recipients)
@@ -2774,13 +2817,21 @@ func doMailCountTargetWithJSON(mp mail.Provider, target resolvedMailTarget, json
 		fmt.Fprintf(stderr, "gc mail count: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if truncated {
+		// ga-awj0th: mirrors gc mail inbox's ga-4derp8 signal — a bounded
+		// read came back with a full window. Printed regardless of jsonOut
+		// so a truncated count is never mistaken for a complete,
+		// authoritative one.
+		fmt.Fprintf(stderr, "WARN: gc mail count %s: read returned a full bounded window — total/unread may undercount; do not treat this result as complete (ga-awj0th)\n", target.display) //nolint:errcheck // best-effort stderr
+	}
 	if jsonOut {
 		if err := writeCLIJSONLine(stdout, mailCountJSONResult{
-			SchemaVersion: "1",
-			Recipient:     target.display,
-			Recipients:    jsonRecipients(target),
-			Total:         total,
-			Unread:        unread,
+			SchemaVersion:     "1",
+			Recipient:         target.display,
+			Recipients:        jsonRecipients(target),
+			Total:             total,
+			Unread:            unread,
+			PossiblyTruncated: truncated,
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc mail count: %v\n", err) //nolint:errcheck
 			return 1
