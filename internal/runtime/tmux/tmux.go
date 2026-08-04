@@ -339,7 +339,13 @@ func wrapError(err error, stderr string, args []string) error {
 	if strings.Contains(stderr, "no server running") ||
 		strings.Contains(stderr, "error connecting to") ||
 		strings.Contains(stderr, "server exited unexpectedly") {
-		return ErrNoServer
+		// Preserve the raw stderr (it often carries the socket path tmux
+		// actually tried, e.g. "error connecting to /tmp/tmux-.../gascity
+		// (Connection refused)") instead of collapsing three distinct tmux
+		// failure modes into one indistinguishable sentinel string. Wraps
+		// ErrNoServer so existing errors.Is(ErrNoServer) callers are
+		// unaffected — see ErrNoCurrentTarget above for the same pattern.
+		return fmt.Errorf("%w: %s", ErrNoServer, stderr)
 	}
 	if strings.Contains(stderr, "duplicate session") {
 		return ErrSessionExists
