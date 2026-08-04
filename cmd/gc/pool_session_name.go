@@ -602,6 +602,70 @@ func directSessionBeadIDCandidates(assignee string) []string {
 	return candidates
 }
 
+// resolveLiveSessionAssignment finds the live session bead (if any) whose
+// assignee-identity set contains assignee, returning the matched bead so a
+// caller can report which live session actually holds an assignment instead
+// of guessing from the raw string. Mirrors liveOpenSessionAssignmentExists'
+// two-tier lookup (cheap direct-ID candidates, then a full live-session scan)
+// but deliberately does NOT share its fail-open-on-list-error contract:
+// liveOpenSessionAssignmentExists must fail open to true because it gates
+// orphaned-work release (a false negative there resets in-progress work out
+// from under a live owner); this function only resolves a display identity
+// for a claim-conflict message, so a list error is exactly a "could not
+// resolve" miss (false, zero value) and the caller falls back to showing the
+// raw assignee string. Sharing one implementation across both would force one
+// of the two call sites to accept the other's wrong failure mode.
+//
+// The direct string-comparison this performs (against the FULL identity set
+// of each live session bead — ID, session_name, configured_named_identity,
+// alias, alias_history — never against a caller's own single env var) is what
+// makes it safe against the numbered-alias near-miss documented on ga-64l8t8:
+// an assignee value like "persona-marcus-4" (a session-bead title) and a
+// live session's own GC_SESSION_NAME like "persona-marcus-ga-t7hd89" can
+// share a coincidental number while naming unrelated seats, or can name the
+// same seat under different forms — eyeballing the number is a live trap in
+// both directions; matching against a specific session's complete identity
+// set is not.
+func resolveLiveSessionAssignment(store beads.Store, assignee string) (beads.Bead, bool) {
+	assignee = strings.TrimSpace(assignee)
+	if store == nil || assignee == "" {
+		return beads.Bead{}, false
+	}
+	for _, id := range directSessionBeadIDCandidates(assignee) {
+		sb, err := store.Get(id)
+		if err != nil {
+			continue
+		}
+		if sb.Status == "closed" || !isSessionBead(sb) {
+			continue
+		}
+		for _, candidate := range sessionBeadAssigneeIdentities(sb) {
+			if assignee == candidate {
+				return sb, true
+			}
+		}
+	}
+	sessions, err := store.List(beads.ListQuery{
+		Label: sessionBeadLabel,
+		Live:  true,
+	})
+	if err != nil {
+		log.Printf("resolveLiveSessionAssignment: live session lookup failed for assignee %q: %v", assignee, err)
+		return beads.Bead{}, false
+	}
+	for _, sb := range sessions {
+		if sb.Status == "closed" || !isSessionBead(sb) {
+			continue
+		}
+		for _, id := range sessionBeadAssigneeIdentities(sb) {
+			if assignee == id {
+				return sb, true
+			}
+		}
+	}
+	return beads.Bead{}, false
+}
+
 // liveWorkAssignmentStillReleasable confirms the snapshot is not stale
 // before clearing assignee. The expectedStatus must match the snapshot
 // status the caller observed: if the bead has since transitioned (e.g. a

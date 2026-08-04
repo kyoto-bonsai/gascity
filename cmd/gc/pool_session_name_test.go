@@ -749,6 +749,113 @@ func TestLiveSessionBeadExistsByIdentity_SkipsNonSessionBead(t *testing.T) {
 	}
 }
 
+// TestResolveLiveSessionAssignment covers the identity-resolution helper
+// ga-64l8t8's claim-on-start refusal path uses to name the live sibling
+// holding a bead, instead of guessing from the raw assignee string. The
+// "numbered-alias near-miss" case models the concrete incident on that bead:
+// an assignee string and a live session's own identity can share a
+// coincidental number while naming unrelated seats, or can name the same seat
+// under different forms — only a full identity-set match is safe either way.
+func TestResolveLiveSessionAssignment(t *testing.T) {
+	store := beads.NewMemStore()
+	winner, err := store.Create(beads.Bead{
+		Title:  "live session, session_name form",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "persona-marcus-ga-t7hd89",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create winner session bead: %v", err)
+	}
+	decoy, err := store.Create(beads.Bead{
+		Title:  "unrelated live session that merely shares a number",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "persona-marcus-ga-differentSeat00",
+			"alias":        "persona-marcus-4", // the near-miss string, on the WRONG seat
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create decoy session bead: %v", err)
+	}
+	closedHolder, err := store.Create(beads.Bead{
+		Title:  "closed session that used to hold this identity",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "worker-mc-retired",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create closed session bead: %v", err)
+	}
+	if err := store.Close(closedHolder.ID); err != nil {
+		t.Fatalf("Close retired session bead: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		assignee   string
+		wantFound  bool
+		wantBeadID string
+	}{
+		{
+			name:       "matches by session_name via the live-list fallback tier",
+			assignee:   "persona-marcus-ga-t7hd89",
+			wantFound:  true,
+			wantBeadID: winner.ID,
+		},
+		{
+			name:      "numbered-alias near-miss: raw string names a real seat, not the decoy",
+			assignee:  "persona-marcus-4",
+			wantFound: true,
+			// The decoy carries "persona-marcus-4" as an alias — matching it
+			// (not silently preferring some other seat with a coincidentally
+			// similar number) is the whole point: resolution must follow the
+			// identity set, never eyeball a shared number.
+			wantBeadID: decoy.ID,
+		},
+		{
+			name:      "closed session's identity does not resolve as live",
+			assignee:  "worker-mc-retired",
+			wantFound: false,
+		},
+		{
+			name:      "unknown assignee resolves to nothing",
+			assignee:  "nobody-holds-this",
+			wantFound: false,
+		},
+		{
+			name:      "empty assignee resolves to nothing",
+			assignee:  "",
+			wantFound: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := resolveLiveSessionAssignment(store, tt.assignee)
+			if ok != tt.wantFound {
+				t.Fatalf("resolveLiveSessionAssignment(%q) ok = %v, want %v", tt.assignee, ok, tt.wantFound)
+			}
+			if ok && got.ID != tt.wantBeadID {
+				t.Fatalf("resolveLiveSessionAssignment(%q) matched bead %q, want %q", tt.assignee, got.ID, tt.wantBeadID)
+			}
+		})
+	}
+}
+
+// TestResolveLiveSessionAssignment_NilStore guards the nil-safety early
+// return; a caller wiring this into a fresh code path is the likeliest place
+// to pass an unconfigured store.
+func TestResolveLiveSessionAssignment_NilStore(t *testing.T) {
+	if _, ok := resolveLiveSessionAssignment(nil, "anyone"); ok {
+		t.Error("resolveLiveSessionAssignment(nil, ...) = true, want false")
+	}
+}
+
 func TestReleaseOrphanedPoolAssignments_SkipsLiveSessionMissingFromSnapshot(t *testing.T) {
 	store := beads.NewMemStore()
 	sessionBead, err := store.Create(beads.Bead{

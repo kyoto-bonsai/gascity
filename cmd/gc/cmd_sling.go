@@ -850,7 +850,7 @@ func printSlingWarnings(result sling.SlingResult, stderr io.Writer) {
 
 // printSlingResult formats a SlingResult for CLI display.
 // Warnings go to stderr, messages go to stdout -- matching original behavior.
-func printSlingResult(result sling.SlingResult, stdout, _ io.Writer) {
+func printSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
 	// Skip display messages for idempotent/dry-run (handled separately).
 	if result.Idempotent {
 		fmt.Fprintf(stdout, "Bead %s already routed to %s — skipping (idempotent)\n", result.BeadID, result.Target) //nolint:errcheck
@@ -891,6 +891,15 @@ func printSlingResult(result sling.SlingResult, stdout, _ io.Writer) {
 		fmt.Fprintf(stdout, "Slung %s (with default formula %q) → %s\n", result.BeadID, result.FormulaName, result.Target) //nolint:errcheck
 	default:
 		fmt.Fprintf(stdout, "Slung %s → %s\n", result.BeadID, result.Target) //nolint:errcheck
+		// Bare routed_to dispatch (no formula/workflow/wisp) hands the bead to
+		// an existing persona family rather than spawning a fresh pool worker,
+		// so nothing claims it automatically the way a pool spawn's own
+		// startup hook would. Prescribe the on-ramp for claim-on-start
+		// (ga-64l8t8): a discovering session should claim before acting so a
+		// live sibling of the same family gets a loud, attributable refusal
+		// instead of silently overwriting its decision. Advisory text only —
+		// no enforcement lives here.
+		fmt.Fprintf(stderr, "note: before acting on %s, run: gc hook --claim --id %s\n", result.BeadID, result.BeadID) //nolint:errcheck
 	}
 }
 

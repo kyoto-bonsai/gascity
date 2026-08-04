@@ -45,11 +45,21 @@ gc bd show <id>                           # Show bead details
 ## Claiming and updating
 
 ```
-gc bd update <id> --claim                 # Claim a bead (sets assignee + in_progress) — races in a multi-agent city; prefer `gc hook --claim` there
+gc bd update <id> --claim                 # Claim a bead (sets assignee + in_progress) — races in a multi-agent city; prefer `gc hook --claim --id <id>` there
 gc bd update <id> --status in_progress    # Update status
 gc bd update <id> --add-label <key>=<value>  # Add/update labels
 gc bd update <id> --append-notes "progress..."  # Append a note (does not replace existing notes)
 ```
+
+**Claim before acting on a bead you found by search, not by pool dispatch.**
+If you discovered a `gc.routed_to`-addressed bead by reading mail, the
+handoff-watchdog, or `gc bd list` — rather than via your own pool-worker
+startup hook — run `gc hook --claim --id <id>` *before* acting on it, not
+after. When multiple live sessions of the same persona family are up (the
+common case in this fleet), `gc.routed_to` names the whole family, not one
+seat, so more than one of you can land on the identical bead with no
+arbitration unless you claim first. A refused claim names the live sibling
+who already holds it — that is your cue to stand down, not to proceed anyway.
 
 ## Closing work
 
@@ -63,4 +73,5 @@ gc bd close <id> --reason "done"          # Close with reason
 ```
 gc hook [agent]                        # Show routed work for an agent (defaults to $GC_AGENT)
 gc hook --claim                        # Atomically claim one routed work item onto this agent's hook
+gc hook --claim --id <bead-id>         # Atomically claim THIS SPECIFIC bead instead of auto-selecting one
 ```

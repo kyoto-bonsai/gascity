@@ -65,6 +65,10 @@ type hookClaimOps struct {
 	// mutating the session bead after a successful work claim.
 	PublishRunMap hookPublishRunMapFunc
 	Now           func() time.Time
+	// Store returns a beads.Store scoped to (dir, env, actor). Used only by
+	// doHookClaimByID (the --id path) to fetch/re-read a specific bead; see
+	// hookClaimStoreFunc.
+	Store hookClaimStoreFunc
 }
 
 type (
@@ -76,6 +80,13 @@ type (
 	hookResolveWorkBranchFunc  func(dir string) string
 	hookStampWorkMetaFunc      func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
 	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
+	// hookClaimStoreFunc returns a beads.Store scoped to (dir, env, actor), used
+	// only by the --id single-bead claim path (doHookClaimByID) to fetch and
+	// re-read a specific bead by id — the work-query-driven candidate path
+	// above never needs a store handle, only Runner + Claim. A distinct seam
+	// (not reusing Claim) because doHookClaimByID needs Get/List, not a claim
+	// mutation, for its route/refusal reporting.
+	hookClaimStoreFunc func(dir string, env []string, actor string) beads.Store
 )
 
 type hookClaimJSONResult struct {
@@ -205,6 +216,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.PublishRunMap == nil {
 		ops.PublishRunMap = writeRunMap
+	}
+	if ops.Store == nil {
+		ops.Store = func(dir string, env []string, actor string) beads.Store { return hookClaimBdStore(dir, env, actor) }
 	}
 }
 
