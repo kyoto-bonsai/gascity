@@ -27,6 +27,7 @@ func newHookCmd(stdout, stderr io.Writer) *cobra.Command {
 	var inject bool
 	var hookFormat string
 	var claim bool
+	var claimID string
 	var drainAck bool
 	var jsonOut bool
 	cmd := &cobra.Command{
@@ -37,6 +38,17 @@ func newHookCmd(stdout, stderr io.Writer) *cobra.Command {
 Without --inject: prints normalized ready-only output, exits 0 if work exists, 1 if empty.
 With --inject: silent legacy Stop-hook compatibility; skips the work query and always exits 0.
 With --claim: runs the standard startup claim protocol for one work item.
+With --claim --id <bead-id>: atomically claims that SPECIFIC bead instead of
+auto-selecting from the routed candidate pool — for a session that has
+already discovered a gc.routed_to-addressed bead by search/read (officer-style
+dispatch) rather than via the pool-worker hook-claim flow, and needs a
+claim-on-start step before acting so a live sibling of the same persona family
+is refused loudly instead of silently overwritten (ga-64l8t8). Uses the exact
+same atomic claim primitive and bead.claim_rejected audit event as the
+pool-worker path; a lost race names the live session that holds the bead when
+one can be resolved. Only the current agent's primary store is checked (no
+cross-store federation), matching how the bead was discovered in the first
+place.
 
 		The agent is determined from $GC_AGENT or a positional argument.`,
 		Args: cobra.MaximumNArgs(1),
@@ -45,6 +57,7 @@ With --claim: runs the standard startup claim protocol for one work item.
 				Inject:     inject,
 				HookFormat: hookFormat,
 				Claim:      claim,
+				ClaimID:    claimID,
 				DrainAck:   drainAck,
 				JSON:       jsonOut,
 			}
@@ -57,6 +70,7 @@ With --claim: runs the standard startup claim protocol for one work item.
 	cmd.Flags().BoolVar(&inject, "inject", false, "silent legacy Stop-hook compatibility; skip work query and exit 0")
 	cmd.Flags().StringVar(&hookFormat, "hook-format", "", "format hook output for a provider")
 	cmd.Flags().BoolVar(&claim, "claim", false, "atomically claim one routed work item for the current session")
+	cmd.Flags().StringVar(&claimID, "id", "", "with --claim, claim this specific bead id instead of auto-selecting one")
 	cmd.Flags().BoolVar(&drainAck, "drain-ack", false, "with --claim, acknowledge runtime drain when no work is available")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit a JSON protocol result (always with --claim; on the discovery door only for a drain refusal)")
 	if flag := cmd.Flags().Lookup("hook-format"); flag != nil {
@@ -233,6 +247,7 @@ type hookCommandOptions struct {
 	Inject     bool
 	HookFormat string
 	Claim      bool
+	ClaimID    string
 	DrainAck   bool
 	JSON       bool
 }
@@ -257,6 +272,10 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 	_ = opts.HookFormat
 	if opts.DrainAck && !opts.Claim {
 		fmt.Fprintln(stderr, "gc hook: --drain-ack requires --claim") //nolint:errcheck
+		return 1
+	}
+	if strings.TrimSpace(opts.ClaimID) != "" && !opts.Claim {
+		fmt.Fprintln(stderr, "gc hook: --id requires --claim") //nolint:errcheck
 		return 1
 	}
 
@@ -478,6 +497,9 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			Env:                queryEnv,
 			DrainAck:           opts.DrainAck,
 			JSON:               opts.JSON,
+		}
+		if id := strings.TrimSpace(opts.ClaimID); id != "" {
+			return doHookClaimByID(id, workDir, claimOpts, hookClaimOps{}, stdout, stderr)
 		}
 		return claimHookWork(cityPath, workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
 	}
