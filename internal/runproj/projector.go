@@ -1,6 +1,8 @@
 package runproj
 
 import (
+	"context"
+
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 )
@@ -22,6 +24,17 @@ type Projector struct {
 	decodeMisses int
 }
 
+// RunProjectionSnapshot is one immutable bead snapshot published by an
+// incremental run projector. Ready distinguishes a genuinely empty city from a
+// cold replay that has not completed. Beads and their nested values are
+// immutable after publication, so concurrent readers may share the slice.
+type RunProjectionSnapshot struct {
+	Ready        bool
+	Beads        []beads.Bead
+	DecodeMisses int
+	Partial      bool
+}
+
 // NewProjector returns an empty projector.
 func NewProjector() *Projector {
 	return &Projector{beads: make(map[string]beads.Bead)}
@@ -35,7 +48,7 @@ func NewProjector() *Projector {
 // call once on a fresh projector before the incremental tail begins; Apply is
 // seq-idempotent so the transient .gz/rotating overlap folds cleanly.
 func (p *Projector) ColdLoad(path string) error {
-	evts, err := events.ReadFilteredWithInFlight(path, events.Filter{})
+	evts, err := events.ReadFilteredWithInFlight(context.Background(), path, events.Filter{})
 	if err != nil {
 		return err
 	}

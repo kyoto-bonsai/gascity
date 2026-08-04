@@ -51,7 +51,12 @@ var providersSkippingEscapeBeforeEnter = []string{"claude", "codex", "copilot", 
 // Config holds configurable timeouts and intervals for the tmux provider.
 // All fields have sensible defaults matching the original hardcoded values.
 type Config struct {
-	SetupTimeout       time.Duration
+	SetupTimeout time.Duration
+	// SetupMaxTimeout, when > 0, switches setup/pre_start commands from the
+	// fixed SetupTimeout wall-clock deadline to an activity-aware budget:
+	// SetupTimeout bounds output silence (idle), SetupMaxTimeout bounds total
+	// runtime (runaway ceiling). Zero (the default) keeps the fixed deadline.
+	SetupMaxTimeout    time.Duration
 	NudgeReadyTimeout  time.Duration
 	NudgeRetryInterval time.Duration
 	NudgeLockTimeout   time.Duration
@@ -149,6 +154,12 @@ var (
 	ErrServerDegraded = errors.New("tmux server degraded: refusing new-session to avoid socket clobber")
 )
 
+// ErrNoCurrentTarget is tmux's reply when the server IS alive but holds no
+// sessions (exit-empty off — gc's configured default). It wraps ErrNoServer so
+// existing idempotent-teardown callers are unchanged; only the new-session
+// preflight distinguishes it.
+var ErrNoCurrentTarget = fmt.Errorf("%w: no current target", ErrNoServer)
+
 const (
 	hiddenAttachReadyTimeout = 2 * time.Second
 	hiddenAttachMaxLifetime  = 20 * time.Second
@@ -197,6 +208,7 @@ type realExecutor struct{}
 
 func (realExecutor) execute(args []string) (string, error) {
 	cmd := exec.Command("tmux", args...)
+	cmd.Env = SubprocessEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -209,6 +221,7 @@ func (realExecutor) execute(args []string) (string, error) {
 
 func (realExecutor) executeCtx(ctx context.Context, args []string) (string, error) {
 	cmd := exec.CommandContext(ctx, "tmux", args...)
+	cmd.Env = SubprocessEnv()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -225,7 +238,6 @@ type Tmux struct {
 	exec                 executor
 	interactionDedup     *approvalDedup
 	interactionDedupOnce sync.Once
-	configureOnce        sync.Once
 	hiddenAttachMu       sync.Mutex
 	hiddenAttachClients  map[string]*hiddenAttachClient
 	hiddenAttachSeq      atomic.Uint64
@@ -239,6 +251,12 @@ type Tmux struct {
 	// agentSlice wraps pane commands in a transient systemd user scope when
 	// GC_AGENT_SLICE is set (see AgentSliceEnv in agent_slice.go).
 	agentSlice agentSliceWrapper
+
+	// serverSocketObserver observes a named socket only after tmux reports
+	// ErrNoServer during the new-session preflight. Nil selects the production
+	// observer; tests inject a deterministic observation without opening a
+	// socket.
+	serverSocketObserver func(context.Context, string) error
 }
 
 // pokeInfo records a gc-initiated send-keys ("poke", e.g. a wake or nudge) to a
@@ -315,9 +333,13 @@ func wrapError(err error, stderr string, args []string) error {
 	stderr = strings.TrimSpace(stderr)
 
 	// Detect specific error types
+	if strings.Contains(stderr, "no current target") {
+		// The server answered — it is simply holding zero sessions. Wraps
+		// ErrNoServer so idempotent-teardown callers are unaffected.
+		return ErrNoCurrentTarget
+	}
 	if strings.Contains(stderr, "no server running") ||
 		strings.Contains(stderr, "error connecting to") ||
-		strings.Contains(stderr, "no current target") ||
 		strings.Contains(stderr, "server exited unexpectedly") {
 		return ErrNoServer
 	}
@@ -347,8 +369,10 @@ func wrapError(err error, stderr string, args []string) error {
 //   - nil when SocketName is empty (default-server case is out of scope) or
 //     when the server replies (alive — including the expected "session not
 //     found" for the bogus probe target).
-//   - nil with ErrNoServer semantics absorbed (no server bound is safe; tmux
-//     will create a fresh server cleanly).
+//   - nil when tmux reports "no current target" (ErrNoCurrentTarget): the
+//     server answered and is alive with zero sessions, so new-session attaches
+//     rather than unlinking and rebinding.
+//   - nil when ErrNoServer is corroborated by a safely absent or stale socket.
 //   - ErrServerDegraded when the probe times out or returns any other error,
 //     indicating the server is in a state where new-session would risk
 //     clobbering. Callers MUST surface this and refuse to proceed.
@@ -368,10 +392,24 @@ func (t *Tmux) probeServerAlive() error {
 		// Healthy server, just doesn't have the probe session. Safe.
 		return nil
 	}
-	if errors.Is(err, ErrNoServer) {
-		// No server bound (stale socket or never existed). Safe — tmux will
-		// unlink any stale socket and bind a fresh server.
+	if errors.Is(err, ErrNoCurrentTarget) {
+		// The server answered: it is alive with zero sessions, so new-session
+		// attaches rather than unlinking and rebinding. Never a stale socket.
 		return nil
+	}
+	if errors.Is(err, ErrNoServer) {
+		observer := t.serverSocketObserver
+		if observer == nil {
+			observer = observeNamedSocket
+		}
+		path := namedSocketPath(t.cfg.SocketName)
+		observationErr := observer(ctx, path)
+		if observationErr == nil {
+			return nil
+		}
+		// Do not wrap ErrNoServer here: callers such as EnsureSessionFresh
+		// must not retry a guarded no-server result as an ordinary absence.
+		return fmt.Errorf("%w: protocol=no-server path=%s observation=%w", ErrServerDegraded, path, observationErr)
 	}
 	// Timeout, fork failure, or any other unrecognized error: server is in
 	// an indeterminate state. Refuse to proceed rather than let tmux silently
@@ -431,16 +469,11 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 	return nil
 }
 
-// NewSessionWithCommandAndEnv creates a new detached tmux session with environment
-// variables set via -e flags. This ensures the initial shell process inherits the
-// correct environment from the session, rather than inheriting from the tmux server
-// or parent process. The -e flags set session-level environment before the shell
-// starts, preventing stale env vars (e.g., GT_ROLE from a parent mayor session)
-// from leaking into crew/polecat shells.
-//
-// The command should still use 'exec env' for WaitForCommand detection compatibility,
-// but -e provides defense-in-depth for the initial shell environment.
-// Requires tmux >= 3.2.
+// NewSessionWithCommandAndEnv creates a new detached tmux session with the supplied
+// environment. Values are never passed through tmux argv: the pane receives them
+// from a mode-0600 shell source file, while the tmux session environment is updated
+// through a mode-0600 tmux source-file. This keeps credentials out of the process
+// table while preserving GetEnvironment/SetMeta compatibility.
 func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) error {
 	if err := validateSessionName(name); err != nil {
 		return err
@@ -448,47 +481,196 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	if err := t.probeServerAlive(); err != nil {
 		return err
 	}
+	envFiles, err := writeSessionEnvFiles(name, env)
+	if err != nil {
+		return err
+	}
+	if envFiles.shellPath != "" {
+		command = commandWithShellEnvFile(command, envFiles.shellPath)
+	}
 	args := []string{"new-session", "-d", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	// Add -e flags to set environment variables in the session before the shell starts.
-	// Keys are sorted for deterministic behavior.
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var unsetKeys []string
-	for _, k := range keys {
-		if env[k] == "" {
-			// Empty values mean "unset this var". Collect for env -u prefix.
-			unsetKeys = append(unsetKeys, k)
-		} else {
-			args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
-		}
-	}
-	// For vars that need unsetting, prefix the command with env -u flags.
-	// tmux -e sets session-level env but the shell process still inherits
-	// from the tmux server's global environment. env -u ensures the var
-	// is actually absent from the child process.
-	if len(unsetKeys) > 0 && command != "" {
-		var prefix string
-		for _, k := range unsetKeys {
-			prefix += " -u " + k
-		}
-		command = "env" + prefix + " " + command
-	}
 	// Add the command as the last argument
 	args = append(args, t.wrapPaneCommand(command))
-	_, err := t.run(args...)
+	_, err = t.run(args...)
 	if err != nil {
+		_ = removeSensitiveFile(envFiles.shellPath)
+		_ = removeSensitiveFile(envFiles.tmuxPath)
 		return err
+	}
+	if envFiles.tmuxPath != "" {
+		_, err = t.run("source-file", envFiles.tmuxPath)
+		removeErr := removeSensitiveFile(envFiles.tmuxPath)
+		if err != nil {
+			_ = removeSensitiveFile(envFiles.shellPath)
+			_ = t.KillSessionWithProcesses(name)
+			if removeErr != nil {
+				return errors.Join(err, removeErr)
+			}
+			return err
+		}
+		if removeErr != nil {
+			_ = t.KillSessionWithProcesses(name)
+			return removeErr
+		}
 	}
 	_ = t.ConfigureServer()
 	// tmux 3.3+: reset window-size from manual to latest (see NewSession).
 	t.run("set-option", "-wt", name, "window-size", "latest") //nolint:errcheck // best-effort
 	return nil
+}
+
+type sessionEnvFiles struct {
+	shellPath string
+	tmuxPath  string
+}
+
+func writeSessionEnvFiles(sessionName string, env map[string]string) (sessionEnvFiles, error) {
+	if len(env) == 0 {
+		return sessionEnvFiles{}, nil
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if !isEnvName(k) {
+			return sessionEnvFiles{}, fmt.Errorf("invalid environment key %q", k)
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	dir, err := ensureSessionEnvDir()
+	if err != nil {
+		return sessionEnvFiles{}, err
+	}
+	shellFile, err := writeShellEnvSourceFile(dir, sessionName, keys, env)
+	if err != nil {
+		return sessionEnvFiles{}, err
+	}
+	tmuxFile, err := writeTmuxEnvSourceFile(dir, sessionName, keys, env)
+	if err != nil {
+		_ = removeSensitiveFile(shellFile)
+		return sessionEnvFiles{}, err
+	}
+	return sessionEnvFiles{shellPath: shellFile, tmuxPath: tmuxFile}, nil
+}
+
+func ensureSessionEnvDir() (string, error) {
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf(".gc-%d", os.Getuid()), "tmux-env")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("creating tmux env dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", fmt.Errorf("chmod tmux env dir: %w", err)
+	}
+	return dir, nil
+}
+
+func writeShellEnvSourceFile(dir, sessionName string, keys []string, env map[string]string) (string, error) {
+	f, err := os.CreateTemp(dir, "gc-"+sessionName+"-*.shenv")
+	if err != nil {
+		return "", fmt.Errorf("creating shell env file: %w", err)
+	}
+	path := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("chmod shell env file: %w", err)
+	}
+	var b strings.Builder
+	for _, k := range keys {
+		if env[k] == "" {
+			fmt.Fprintf(&b, "unset %s\n", k)
+			continue
+		}
+		fmt.Fprintf(&b, "export %s=%s\n", k, shellquote.Quote(env[k]))
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		_ = f.Close()
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("writing shell env file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("closing shell env file: %w", err)
+	}
+	return path, nil
+}
+
+func writeTmuxEnvSourceFile(dir, sessionName string, keys []string, env map[string]string) (string, error) {
+	f, err := os.CreateTemp(dir, "gc-"+sessionName+"-*.tmuxenv")
+	if err != nil {
+		return "", fmt.Errorf("creating tmux env file: %w", err)
+	}
+	path := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("chmod tmux env file: %w", err)
+	}
+	var b strings.Builder
+	target := "=" + sessionName
+	for _, k := range keys {
+		if env[k] == "" {
+			fmt.Fprintf(&b, "set-environment -t %s -u %s\n", shellquote.Quote(target), k)
+			continue
+		}
+		fmt.Fprintf(&b, "set-environment -t %s %s %s\n", shellquote.Quote(target), k, shellquote.Quote(env[k]))
+	}
+	if _, err := f.WriteString(b.String()); err != nil {
+		_ = f.Close()
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("writing tmux env file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = removeSensitiveFile(path)
+		return "", fmt.Errorf("closing tmux env file: %w", err)
+	}
+	return path, nil
+}
+
+func commandWithShellEnvFile(command, shellEnvFile string) string {
+	quotedEnvFile := shellquote.Quote(shellEnvFile)
+	tail := "exec ${SHELL:-/bin/sh} -l"
+	if strings.TrimSpace(command) != "" {
+		tail = "exec " + command
+	}
+	script := fmt.Sprintf(`__gc_env=%s; . "$__gc_env"; __gc_status=$?; : > "$__gc_env"; rm -f "$__gc_env"; [ "$__gc_status" -eq 0 ] || exit "$__gc_status"; %s`, quotedEnvFile, tail)
+	return "sh -c " + shellquote.Quote(script)
+}
+
+func removeSensitiveFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		if size := info.Size(); size > 0 {
+			_ = os.WriteFile(path, make([]byte, size), 0o600)
+		}
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func isEnvName(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i, r := range key {
+		switch {
+		case r == '_':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	first := key[0]
+	return first == '_' || (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z')
 }
 
 // EnsureSessionFresh ensures a session is available and healthy.
@@ -976,13 +1158,10 @@ func (t *Tmux) KillServer() error {
 }
 
 // ConfigureServer sets tmux server options required for Gas City lifecycle
-// ownership. It is idempotent per Tmux instance.
+// ownership. It is safe to call repeatedly because the wrapper may outlive the
+// server bound to its socket.
 func (t *Tmux) ConfigureServer() error {
-	var err error
-	t.configureOnce.Do(func() {
-		err = t.SetExitEmpty(false)
-	})
-	return err
+	return t.SetExitEmpty(false)
 }
 
 // TeardownServer terminates the tmux server after all sessions are drained.
@@ -1370,7 +1549,7 @@ func (t *Tmux) ensureHiddenAttachedClient(target string) error {
 	}
 	cmdArgs = append(cmdArgs, "attach-session", "-t", target)
 	cmd := exec.CommandContext(ctx, "script", hiddenAttachScriptArgs(goruntime.GOOS, cmdArgs)...)
-	cmd.Env = append(cmd.Environ(), "TERM=xterm-256color")
+	cmd.Env = append(SubprocessEnv(), "TERM=xterm-256color")
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 
@@ -1588,6 +1767,13 @@ func (t *Tmux) sendHiddenAttachedText(target, text string) (bool, error) {
 	if text == "" {
 		return true, nil
 	}
+	// A hidden attach client injects gc's own keystrokes just like NudgeSession,
+	// so record a poke here too (the residual NudgeNow gap): capture the
+	// pre-nudge activity before the first write and stamp it only after the
+	// trailing Enter is delivered, so a later GetSessionActivity discounts gc's
+	// echo instead of counting this nudge as the agent responding (see
+	// discountPokeActivity). A failed write records nothing.
+	commitPoke := t.beginPoke(target)
 	if err := client.write([]byte(text)); err != nil {
 		return true, err
 	}
@@ -1597,6 +1783,7 @@ func (t *Tmux) sendHiddenAttachedText(target, text string) (bool, error) {
 	if err := client.write([]byte{'\r'}); err != nil {
 		return true, err
 	}
+	commitPoke()
 	return true, nil
 }
 
@@ -1821,6 +2008,23 @@ func (t *Tmux) NudgeSession(session, message string) error {
 		target = agentPane
 	}
 
+	// Snapshot genuine activity BEFORE the first keystroke, and stamp the poke
+	// only once delivery is actually confirmed (see delivered below). This
+	// mirrors recordPoke/GetSessionActivity (see discountPokeActivity) so gc's
+	// own nudge keystrokes don't inflate last_active, but captures prior up
+	// front and stamps `at` after the LAST keystroke: submitEnterAndConfirm's
+	// polling can burn several seconds — longer than pokeEcho — so stamping at
+	// entry would let the final Enter's echo land outside the discount window.
+	// pokePrior also carries a still-unanswered earlier poke's baseline forward
+	// so chained nudges inside pokeGrace don't record gc's own echo as prior.
+	commitPoke := t.beginPoke(session)
+	delivered := false
+	defer func() {
+		if delivered {
+			commitPoke()
+		}
+	}()
+
 	// Wake a detached pane BEFORE the first send. A fully-detached pool TUI
 	// (e.g. grok, never observed by a client) may not be servicing its event
 	// loop, so the initial paste is silently dropped at the application layer
@@ -1864,6 +2068,7 @@ func (t *Tmux) NudgeSession(session, message string) error {
 		if _, err := submitEnterAndConfirm(sendEnter, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep); err != nil {
 			return fmt.Errorf("failed to send Enter: %w", err)
 		}
+		delivered = true
 		return nil
 	}
 	// Fallback: best-effort single delivery (unchanged historical behavior).
@@ -1878,6 +2083,7 @@ func (t *Tmux) NudgeSession(session, message string) error {
 		}
 		// 6. Wake again so the submitted turn is processed promptly.
 		wake()
+		delivered = true
 		return nil
 	}
 	return fmt.Errorf("failed to send Enter after %d attempts: %w", submitEnterMaxSends, lastErr)
@@ -1894,6 +2100,17 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		return fmt.Errorf("nudge lock timeout for pane %q: previous nudge may be hung", pane)
 	}
 	defer releaseNudgeLock(pane)
+
+	// See NudgeSession for why prior is captured before the first keystroke
+	// (via pokePrior, which also carries a still-unanswered earlier poke's
+	// baseline forward) and the poke stamped only on confirmed delivery.
+	commitPoke := t.beginPoke(pane)
+	delivered := false
+	defer func() {
+		if delivered {
+			commitPoke()
+		}
+	}()
 
 	// 1. Send text in literal mode with retry on transient errors
 	if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
@@ -1925,6 +2142,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		}
 		// 6. Wake again so the submitted turn is processed promptly.
 		t.WakePaneIfDetached(pane)
+		delivered = true
 		return nil
 	}
 	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
@@ -2327,12 +2545,52 @@ func (t *Tmux) recordPoke(session string) {
 	if err != nil {
 		prior = time.Time{}
 	}
+	t.recordPokeAt(session, prior, time.Now())
+}
+
+// recordPokeAt stamps a poke with an explicit prior activity and timestamp,
+// for callers (NudgeSession/NudgePane) whose send spans longer than pokeEcho:
+// they capture prior BEFORE the first keystroke and stamp `at` AFTER the last,
+// so the echo window brackets the final keystroke regardless of delivery load.
+func (t *Tmux) recordPokeAt(session string, prior, at time.Time) {
 	t.pokeMu.Lock()
 	if t.pokes == nil {
 		t.pokes = make(map[string]pokeInfo)
 	}
-	t.pokes[session] = pokeInfo{at: time.Now(), prior: prior}
+	t.pokes[session] = pokeInfo{at: at, prior: prior}
 	t.pokeMu.Unlock()
+}
+
+// beginPoke snapshots the genuine pre-nudge activity for session (via pokePrior,
+// which also carries a still-unanswered earlier poke's baseline forward) and
+// returns a commit closure. Callers invoke commit only after the nudge's final
+// keystroke is confirmed delivered; it stamps the poke so a later
+// GetSessionActivity discounts gc's own keystroke echo (see discountPokeActivity)
+// instead of counting the nudge as the agent responding. A nudge that never
+// confirms delivery must not call commit, leaving last_active untouched. This is
+// the shared prior-before-write / stamp-after-delivery contract used by
+// NudgeSession, NudgePane, and the hidden-attached send path.
+func (t *Tmux) beginPoke(session string) (commit func()) {
+	prior := t.pokePrior(session)
+	return func() { t.recordPokeAt(session, prior, time.Now()) }
+}
+
+// pokePrior snapshots the genuine session activity to record as a new poke's
+// prior. It reads raw window activity but, when an earlier unanswered poke is
+// still on record, carries that poke's prior forward (see pokePriorBaseline) so
+// chained gc nudges inside pokeGrace don't ratchet last_active up to gc's own
+// earlier keystroke echo. Returns the zero time when raw activity cannot be
+// read, matching GetSessionActivity's degradation (discountPokeActivity then
+// declines to discount a zero prior).
+func (t *Tmux) pokePrior(session string) time.Time {
+	raw, err := t.rawSessionActivity(session)
+	if err != nil {
+		return time.Time{}
+	}
+	t.pokeMu.Lock()
+	pk, ok := t.pokes[session]
+	t.pokeMu.Unlock()
+	return pokePriorBaseline(raw, pk, ok)
 }
 
 // discountPokeActivity resolves the genuine activity time from the raw tmux
@@ -2353,6 +2611,22 @@ func discountPokeActivity(wa time.Time, pk pokeInfo, now time.Time) time.Time {
 		return pk.prior
 	}
 	return wa
+}
+
+// pokePriorBaseline selects the genuine activity to record as a new poke's
+// prior. When an earlier poke is still on record and the current raw window
+// activity is only that poke's own echo (raw within pokeEcho of the earlier
+// poke, i.e. no genuine agent output since), the last genuine activity is the
+// earlier poke's prior, so it is carried forward. This stops chained unanswered
+// nudges inside pokeGrace from recording gc's own earlier nudge echo as the new
+// baseline — which discountPokeActivity would otherwise later surface as
+// last_active, masking a stalled agent. Otherwise the freshly observed raw
+// activity is genuine and becomes the new prior. Pure function for testability.
+func pokePriorBaseline(raw time.Time, pk pokeInfo, hasPoke bool) time.Time {
+	if hasPoke && !pk.at.IsZero() && !pk.prior.IsZero() && raw.Sub(pk.at).Abs() <= pokeEcho {
+		return pk.prior
+	}
+	return raw
 }
 
 func latestActivityTimestamp(out string) (int64, error) {

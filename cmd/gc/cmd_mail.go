@@ -123,6 +123,17 @@ func newMailNudgeFunc(sender string) nudgeFunc {
 	}
 }
 
+// mailShouldAttemptNudge reports whether gc mail send/reply should attempt a
+// live-session nudge for this message. Predicate-based (ga-2w649o), not
+// flag-gated: attempted whenever a store is available to resolve the target,
+// regardless of --notify/--nudge (both kept for backward compatibility but no
+// longer control this). Whether the recipient is actually live -- and so
+// whether a nudge really lands -- is decided deeper in the call chain
+// (sendMailNotifyWithWorker checks obs.Running before attempting delivery).
+func mailShouldAttemptNudge(store beads.Store) bool {
+	return store != nil
+}
+
 func newMailCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mail",
@@ -569,7 +580,7 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 					_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", notice)
 					return 0
 				}
-			} else if !api.ShouldFallbackForRead(err) {
+			} else if !api.ShouldFallbackForRead(c, err) {
 				logRoute(stderr, cmdName, "api", "error")
 				if api.IsStoreSlowError(err) {
 					_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", formatMailCheckDegradedNotice())
@@ -591,12 +602,12 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 			logRoute(stderr, cmdName, "api", "")
 			return renderMailCheckFromAPI(cr, recipient, inject, hookFormat, stdout)
 		}
-		if !api.ShouldFallbackForRead(err) {
+		if !api.ShouldFallbackForRead(c, err) {
 			logRoute(stderr, cmdName, "api", "error")
 			fmt.Fprintf(stderr, "gc mail check: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
+		logRoute(stderr, cmdName, "fallback", api.FallbackReason(c, err))
 	} else {
 		logRoute(stderr, cmdName, "fallback", nilReason)
 	}
@@ -722,7 +733,11 @@ func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, in
 				fmt.Fprintf(stderr, "gc mail check: writing hook output: %v\n", err) //nolint:errcheck // best-effort stderr
 				return 0
 			}
-			injectedMessages := messages
+			// Archive the SAME messages that were injected: priority-sort
+			// before the clamp so the archived set matches formatInjectOutput's
+			// displayed set (a priority:1 handoff that floats into the window is
+			// injected AND archived, never injected-but-not-archived).
+			injectedMessages := sortMailByPriority(messages)
 			if len(injectedMessages) > mailInjectMaxMessages {
 				injectedMessages = injectedMessages[:mailInjectMaxMessages]
 			}
@@ -757,9 +772,36 @@ func archiveInjectedAutoHandoffMessages(mp mail.Provider, messages []mail.Messag
 	}
 }
 
+// sortMailByPriority returns a copy of messages ordered by descending Priority
+// (higher first), stable so ties keep arrival (oldest-first) order. This runs
+// BEFORE the mailInjectMaxMessages clamp so a higher-priority unread message
+// (e.g. a restart handoff tagged priority:1) surfaces within the injection
+// window instead of being dropped by arrival order. It returns a copy so the
+// caller's (possibly cached, e.g. api.CachedRead) backing slice is never
+// reordered as a side effect.
+//
+// Safety: mail.Message.Priority has no writer for ordinary mail today —
+// extractPriority parses a numeric `priority:N` label and every normal message
+// is priority 0 — so on existing all-priority-0 mail SliceStable is a provable
+// no-op that preserves oldest-first order. Only newly priority-tagged mail
+// floats. See STAGED-mail-priority (gastownhall/gascity Phase-4
+// priority-stratified inbox check).
+func sortMailByPriority(messages []mail.Message) []mail.Message {
+	sorted := make([]mail.Message, len(messages))
+	copy(sorted, messages)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Priority > sorted[j].Priority // higher priority first; ties keep arrival order
+	})
+	return sorted
+}
+
 // formatInjectOutput formats messages as a <system-reminder> block for
-// injection into an agent's prompt via a UserPromptSubmit hook.
+// injection into an agent's prompt via a UserPromptSubmit hook. It priority-
+// sorts before the display clamp so both inject render paths
+// (renderMailCheckFromAPI and doMailCheckTargetWithFormat) surface higher-
+// priority unread first.
 func formatInjectOutput(messages []mail.Message) string {
+	messages = sortMailByPriority(messages)
 	var sb strings.Builder
 	sb.WriteString("<system-reminder>\n")
 	fmt.Fprintf(&sb, "You have %d unread message(s).\n\n", len(messages))
@@ -1397,6 +1439,7 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var to string
 	var subject string
 	var message string
+	var bodyFile string
 	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "send [<to>] [<body>]",
@@ -1404,25 +1447,50 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to nudge
-the recipient after sending. Use --from to override the sender identity.
-Use --to as an alternative to the positional <to> argument.
-Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").`,
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". If the recipient is a
+currently-live session, it is nudged automatically -- no flag required.
+Use --from to override the sender identity. Use --to as an alternative to
+the positional <to> argument. Use -s/--subject for the summary line and
+-m/--message for the body text. Use --body-file to read the body from a file
+instead (pass - for stdin). Prefer --body-file over -m/positional body when
+the text may contain backticks or $(...): the invoking shell expands those
+as command substitution inside a double-quoted argument before gc ever sees
+them, silently corrupting (or executing) the body. A file path never
+transits a shell argument, so its contents round-trip byte-for-byte.
+Use --all to broadcast to all live sessions (excluding sender and "human").
+--notify/--nudge are accepted for backward compatibility and have no
+additional effect.`,
 		Example: `  gc mail send mayor "Build is green"
   gc mail send mayor -s "Build is green"
   gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
+  gc mail send myrig/witness -s "Findings" --body-file findings.md
   gc mail send --to mayor "Build is green"
   gc mail send human "Review needed for PR #42"
-  gc mail send polecat "Priority task" --notify
   gc mail send --all "Status update: tests passing"`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
+			effectiveMessage := message
+			if bodyFile != "" {
+				positionalBody := len(args) > 1
+				if all || to != "" {
+					positionalBody = len(args) > 0
+				}
+				if positionalBody {
+					fmt.Fprintln(stderr, "gc mail send: cannot combine --body-file with a positional body") //nolint:errcheck // best-effort stderr
+					return errExit
+				}
+				content, err := readMailBodyFile(bodyFile)
+				if err != nil {
+					fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
+					return errExit
+				}
+				effectiveMessage = content
+			}
 			code := 0
 			if jsonOut {
-				code = cmdMailSendJSON(args, notify, all, from, to, subject, message, true, stdout, stderr)
+				code = cmdMailSendJSON(args, notify, all, from, to, subject, effectiveMessage, true, stdout, stderr)
 			} else {
-				code = cmdMailSend(args, notify, all, from, to, subject, message, stdout, stderr)
+				code = cmdMailSend(args, notify, all, from, to, subject, effectiveMessage, stdout, stderr)
 			}
 			if code != 0 {
 				return errExit
@@ -1430,7 +1498,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&notify, "notify", false, "nudge the recipient about this message, even if earlier mail is still unread")
+	cmd.Flags().BoolVar(&notify, "notify", false, "no-op, kept for backward compatibility -- live recipients are nudged automatically")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
 	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
@@ -1438,9 +1506,30 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 	cmd.Flags().StringVar(&to, "to", "", "recipient address (alternative to positional argument)")
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
+	cmd.Flags().StringVar(&bodyFile, "body-file", "", "read message body from file (use - for stdin)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
 	cmd.MarkFlagsMutuallyExclusive("to", "all")
+	cmd.MarkFlagsMutuallyExclusive("message", "body-file")
 	return cmd
+}
+
+// readMailBodyFile reads a message body from a file. path == "-" reads from
+// stdin instead, mirroring bd create's --body-file convention. A file path
+// never transits a shell argument, so unlike -m/positional text its contents
+// cannot be backtick/$()-expanded by the invoking shell before gc sees them.
+func readMailBodyFile(path string) (string, error) {
+	if path == "-" {
+		content, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", fmt.Errorf("reading body from stdin: %w", err)
+		}
+		return string(content), nil
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading body file: %w", err)
+	}
+	return string(content), nil
 }
 
 func newMailInboxCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -1517,8 +1606,10 @@ func newMailReplyCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Reply to a message. The reply is addressed to the original sender.
 
 Inherits the thread ID from the original message for conversation tracking.
-Use --notify to nudge the recipient after replying.
-Use -s/--subject for the reply subject and -m/--message for the reply body.`,
+If the recipient is a currently-live session, it is nudged automatically --
+no flag required. Use -s/--subject for the reply subject and -m/--message
+for the reply body. --notify/--nudge are accepted for backward compatibility
+and have no additional effect.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0
@@ -1535,7 +1626,7 @@ Use -s/--subject for the reply subject and -m/--message for the reply body.`,
 	}
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "reply subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "reply body text")
-	cmd.Flags().BoolVar(&notify, "notify", false, "nudge the recipient about this reply, even if earlier mail is still unread")
+	cmd.Flags().BoolVar(&notify, "notify", false, "no-op, kept for backward compatibility -- live recipients are nudged automatically")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
 	_ = cmd.Flags().MarkHidden("nudge")
@@ -1714,8 +1805,12 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 		}
 	}
 
+	// The store is already opened unconditionally above for sender/recipient
+	// identity resolution, so mailShouldAttemptNudge's auto-detect costs
+	// nothing extra here.
+	_ = notify
 	var nf nudgeFunc
-	if notify && store != nil {
+	if mailShouldAttemptNudge(store) {
 		nf = newMailNudgeFunc(sender)
 	}
 
@@ -1915,16 +2010,20 @@ func cmdMailInboxWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer)
 	return doMailInboxTargetWithJSON(mp, target, jsonOut, stdout, stderr)
 }
 
+type mailInboxReader interface {
+	Inbox(recipient string) ([]mail.Message, error)
+}
+
 // doMailInbox lists unread messages for a recipient.
-func doMailInbox(mp mail.Provider, recipient string, stdout, stderr io.Writer) int {
+func doMailInbox(mp mailInboxReader, recipient string, stdout, stderr io.Writer) int {
 	return doMailInboxTarget(mp, resolvedMailTarget{display: recipient, recipients: []string{recipient}}, stdout, stderr)
 }
 
-func doMailInboxTarget(mp mail.Provider, target resolvedMailTarget, stdout, stderr io.Writer) int {
+func doMailInboxTarget(mp mailInboxReader, target resolvedMailTarget, stdout, stderr io.Writer) int {
 	return doMailInboxTargetWithJSON(mp, target, false, stdout, stderr)
 }
 
-func doMailInboxTargetWithJSON(mp mail.Provider, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
+func doMailInboxTargetWithJSON(mp mailInboxReader, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
 	messages, err := collectMailMessages(mp.Inbox, target.recipients)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -2010,16 +2109,21 @@ func doMailReadWithJSON(mp mail.Provider, rec events.Recorder, args []string, js
 }
 
 func cmdMailPeekWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
+	// The missing-ID guard stays PRE-resolve: in the hand-written form it ran
+	// before resolveReadTarget, so on the no-args path resolution/provider side
+	// effects never happen. Keeping it here preserves that exactly.
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail peek: missing message ID") //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	cityPath, err := resolveCity()
-	if err != nil {
-		return doMailPeekFallback(args, jsonOut, stdout, stderr)
-	}
-	c, reason := mailPeekAPIClient(cityPath)
-	return routeMailPeek(cityPath, args, c, reason, jsonOut, stdout, stderr)
+	// onResolveErr preserves mail peek's distinctive behavior: a resolve error
+	// (including a remote-client build error) falls back to the local read with
+	// no error line and no route= log — exactly the old `if err != nil` branch.
+	return routeReadCmdWithHooks("mail peek", stderr, readCmdHooks{
+		onResolveErr: func(error) int { return doMailPeekFallback(args, jsonOut, stdout, stderr) },
+	}, mailPeekAPIClient, func(cityPath string, c *api.Client, nilReason string) int {
+		return routeMailPeek(cityPath, args, c, nilReason, jsonOut, stdout, stderr)
+	})
 }
 
 // mailPeekAPIClient returns (client, "") when the API path is available,
@@ -2036,12 +2140,15 @@ var mailPeekAPIClient = func(cityPath string) (*api.Client, string) {
 // controller is up; otherwise falls back to the local mail-provider path.
 // Emits exactly one route=... log line per exit path (gated on GC_DEBUG).
 func routeMailPeek(_ string, args []string, c *api.Client, nilReason string, jsonOut bool, stdout, stderr io.Writer) int {
-	const cmdName = "mail peek"
 	id := args[0]
-	if c != nil {
-		cr, err := c.GetMail(id, "")
-		if err == nil {
-			logRoute(stderr, cmdName, "api", "")
+	var cr api.CachedRead[mail.Message]
+	return routeRead(c, "mail peek", nilReason, stderr,
+		func() error {
+			var err error
+			cr, err = c.GetMail(id, "")
+			return err
+		},
+		func() int {
 			if jsonOut {
 				if err := writeCLIJSONLine(stdout, mailMessageJSONResult{
 					SchemaVersion: "1",
@@ -2057,17 +2164,9 @@ func routeMailPeek(_ string, args []string, c *api.Client, nilReason string, jso
 				fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck // best-effort stdout
 			}
 			return 0
-		}
-		if !api.ShouldFallbackForRead(err) {
-			logRoute(stderr, cmdName, "api", "error")
-			fmt.Fprintf(stderr, "gc mail peek: %v\n", err) //nolint:errcheck // best-effort stderr
-			return 1
-		}
-		logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
-	} else {
-		logRoute(stderr, cmdName, "fallback", nilReason)
-	}
-	return doMailPeekFallback(args, jsonOut, stdout, stderr)
+		},
+		func() int { return doMailPeekFallback(args, jsonOut, stdout, stderr) },
+	)
 }
 
 // doMailPeekFallback is the direct-bd path for `gc mail peek`.
@@ -2179,8 +2278,15 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 		body = strings.Join(args[1:], " ")
 	}
 
+	// Predicate-based, not flag-gated (ga-2w649o): a live-session nudge is now
+	// attempted whenever a store resolved above, regardless of --notify --
+	// see mailShouldAttemptNudge. notify/--nudge are kept for backward
+	// compatibility: they still control whether the block above bothers
+	// opening a store at all for a bare human sender (unchanged from before),
+	// and the warning text below still names --notify since that's the only
+	// way a human sender reaches this branch.
 	var nf nudgeFunc
-	if notify && store != nil {
+	if mailShouldAttemptNudge(store) {
 		nf = newMailNudgeFunc(sender)
 	} else if notify && strings.HasPrefix(providerName, "exec:") && notifySetupErr != nil {
 		fmt.Fprintf(stderr, "gc mail reply: --notify requested but no city store available; nudge skipped: %v\n", notifySetupErr) //nolint:errcheck // best-effort stderr
@@ -2526,20 +2632,23 @@ var mailCountAPIClient = func(cityPath string) (*api.Client, string) {
 // controller is up; otherwise falls back to the local mail-provider path.
 // Emits exactly one route=... log line per exit path (gated on GC_DEBUG).
 func routeMailCount(_ string, args []string, c *api.Client, nilReason string, jsonOut bool, stdout, stderr io.Writer) int {
-	const cmdName = "mail count"
 	recipient := defaultMailIdentity()
 	if len(args) > 0 {
 		recipient = strings.TrimSpace(args[0])
 	}
-	if c != nil {
-		cr, err := c.CountMail(recipient, "")
-		if err == nil {
-			if mailCountHasPartial(cr.Body) {
-				logRoute(stderr, cmdName, "api", "error")
-				fmt.Fprintf(stderr, "gc mail count: %s\n", mailCountPartialErrorDetail(cr.Body)) //nolint:errcheck // best-effort stderr
-				return 1
+	var cr api.CachedRead[api.MailCountView]
+	return routeRead(c, "mail count", nilReason, stderr,
+		func() error {
+			var err error
+			if cr, err = c.CountMail(recipient, ""); err != nil {
+				return err
 			}
-			logRoute(stderr, cmdName, "api", "")
+			if mailCountHasPartial(cr.Body) {
+				return errorAfterFetch{Detail: mailCountPartialErrorDetail(cr.Body)}
+			}
+			return nil
+		},
+		func() int {
 			if jsonOut {
 				if err := writeCLIJSONLine(stdout, mailCountJSONResult{
 					SchemaVersion: "1",
@@ -2558,17 +2667,9 @@ func routeMailCount(_ string, args []string, c *api.Client, nilReason string, js
 				fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck // best-effort stdout
 			}
 			return 0
-		}
-		if !api.ShouldFallbackForRead(err) {
-			logRoute(stderr, cmdName, "api", "error")
-			fmt.Fprintf(stderr, "gc mail count: %v\n", err) //nolint:errcheck // best-effort stderr
-			return 1
-		}
-		logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
-	} else {
-		logRoute(stderr, cmdName, "fallback", nilReason)
-	}
-	return doMailCountFallback(args, jsonOut, stdout, stderr)
+		},
+		func() int { return doMailCountFallback(args, jsonOut, stdout, stderr) },
+	)
 }
 
 // doMailCountFallback is the direct-bd path for `gc mail count`.

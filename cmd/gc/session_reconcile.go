@@ -154,7 +154,9 @@ func sessionWithinDesiredConfigInfo(info sessionpkg.Info, cfg *config.City, pool
 	if agent == nil {
 		return nil, false
 	}
-	if isDrainedSessionInfo(info) {
+	// ComputeAwakeSet deliberately reuses drained always-mode named beads.
+	// Keep the display classifier aligned with that decision.
+	if isDrainedSessionInfo(info) && (!isNamedSessionInfo(info) || namedSessionModeInfo(info) != "always") {
 		return agent, false
 	}
 	if info.DependencyOnlyMetadata == "true" {
@@ -175,7 +177,7 @@ func sessionWithinDesiredConfig(session beads.Bead, cfg *config.City, poolDesire
 	if agent == nil {
 		return nil, false
 	}
-	if isDrainedSessionBead(session) {
+	if isDrainedSessionBead(session) && (!isNamedSessionBead(session) || namedSessionMode(session) != "always") {
 		return agent, false
 	}
 	if session.Metadata["dependency_only"] == "true" {
@@ -234,6 +236,19 @@ const staleCreatingStateTimeout = time.Minute
 // pendingCreateNeverStartedTimeout, so a slow provider.Start() is not reaped
 // out from under the reconciler's still-active never-started lease.
 const stalePendingCreateTimeout = 5 * time.Minute
+
+// staleStartPendingStateTimeout bounds how long a state=start-pending bead may
+// sit — a wake has been requested (RequestWakePatch) but no provider Start
+// attempt has begun yet (the boundary into state=creating, handled separately
+// by staleCreatingStateTimeout above) — before ProjectLifecycle ages it to
+// StateAsleep so the reconciler gets another chance at it rather than leaving
+// it stuck indefinitely. Set to the same order of magnitude as
+// stalePendingCreateTimeout (a deliberately longer grace than
+// staleCreatingStateTimeout's one minute): unlike an in-flight provider Start
+// call, start-pending can legitimately queue behind ordinary reconciler
+// backlog before a Start attempt even begins, per gc-durability-findings-
+// 2026-07-25.md §4 (three separate documented start-pending-hang incidents).
+const staleStartPendingStateTimeout = 5 * time.Minute
 
 // sessionMetadataStateInfo normalizes the RAW persisted state metadata
 // (Info.MetadataState, not the normalized Info.State) onto the display/decision
@@ -507,6 +522,20 @@ func checkRateLimitStability(info sessionpkg.Info, cfg *config.City, alive bool,
 	for dec == sessionpkg.ExitGatherScreen {
 		facts.Screen = sessionpkg.ScreenOther
 		if content, err := peek(rateLimitPeekLines); err == nil {
+			if runtime.ContainsLoginExpiredDialog(content) {
+				next, quarantineErr := recordLoginExpiredQuarantine(info, sessFront, clk)
+				if quarantineErr != nil {
+					return info, false, quarantineErr
+				}
+				return next, true, nil
+			}
+			if reason := runtime.ProviderResourceExhaustionReason(content); reason != "" {
+				next, quarantineErr := recordProviderResourceExhaustionQuarantine(info, sessFront, clk, reason)
+				if quarantineErr != nil {
+					return info, false, quarantineErr
+				}
+				return next, true, nil
+			}
 			if reason := runtime.ProviderTerminalErrorReason(content); reason != "" {
 				next, markErr := markProviderTerminalError(info, sessFront, clk, reason)
 				if markErr != nil {
@@ -577,6 +606,44 @@ func recordRateLimitQuarantine(info sessionpkg.Info, sessFront *sessionpkg.Store
 	next, err := sessFront.ApplyPatchInfo(info, batch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "recordRateLimitQuarantine: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck
+		return info, err
+	}
+	return next, nil
+}
+
+// recordProviderResourceExhaustionQuarantine backs off a session that exited
+// into a detected quota/credit exhaustion condition, same shape as
+// recordRateLimitQuarantine: not treated as a crash, conversation metadata
+// preserved (see ProviderResourceExhaustionQuarantinePatch's own doc — a
+// topped-up account should resume the same conversation, not restart from
+// zero, which is exactly what "seats died and were mass-replaced" cost
+// tonight's outage). reason is the specific detected condition
+// (quota_exceeded, credit_exhausted), recorded alongside the broad
+// sleep_reason class label.
+func recordProviderResourceExhaustionQuarantine(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Clock, reason string) (sessionpkg.Info, error) {
+	batch := sessionpkg.ProviderResourceExhaustionQuarantinePatch(
+		clk.Now().Add(defaultProviderResourceExhaustionQuarantineDuration), reason)
+	next, err := sessFront.ApplyPatchInfo(info, batch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "recordProviderResourceExhaustionQuarantine: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck
+		return info, err
+	}
+	return next, nil
+}
+
+// recordLoginExpiredQuarantine backs off a session that exited into a
+// detected login/auth-expiry prompt, same shape as
+// recordProviderResourceExhaustionQuarantine: not treated as a crash,
+// conversation metadata preserved so a re-authenticated seat resumes rather
+// than restarts from zero — the ga-uwptpu incident's own failure mode, and
+// the direct motivation for this bead. Best-effort patterns per the
+// operator's 2026-07-26 ruling on ga-5gsyts (runtime.
+// ContainsLoginExpiredDialog's own doc has the failure-asymmetry rationale).
+func recordLoginExpiredQuarantine(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Clock) (sessionpkg.Info, error) {
+	batch := sessionpkg.LoginExpiredQuarantinePatch(clk.Now().Add(defaultLoginExpiredQuarantineDuration))
+	next, err := sessFront.ApplyPatchInfo(info, batch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "recordLoginExpiredQuarantine: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck
 		return info, err
 	}
 	return next, nil
@@ -879,14 +946,17 @@ func mergeMetadataPatch(dst, src map[string]string) map[string]string {
 func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, clk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) map[string]string {
 	var now time.Time
 	var staleCreatingAfter time.Duration
+	var staleStartPendingAfter time.Duration
 	if clk != nil {
 		now = clk.Now()
 		staleCreatingAfter = staleCreatingStateTimeout
+		staleStartPendingAfter = staleStartPendingStateTimeout
 	}
 	lcInput := sessionpkg.LifecycleInputFromInfo(info)
 	lcInput.Runtime = sessionpkg.RuntimeFacts{Observed: true, Alive: alive}
 	lcInput.CreatedAt = info.CreatedAt
 	lcInput.StaleCreatingAfter = staleCreatingAfter
+	lcInput.StaleStartPendingAfter = staleStartPendingAfter
 	lcInput.Now = now
 	view := sessionpkg.ProjectLifecycle(lcInput)
 
@@ -954,33 +1024,29 @@ func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, clk clock.
 	return emptyNil(batch)
 }
 
-// healStateWithRollbackInfo is the session.Info sibling of healStateWithRollback:
-// it reads its heal decision off the coherent infoByID snapshot entry instead of
-// the raw *session bead, persists the batch through sessFront.ApplyPatch, and
-// returns the batch for the reconciler to fold onto infoByID via ApplyPatchInfo.
-// Unlike the raw form it does NOT mirror onto a raw bead — the snapshot fold is
-// the single source of truth for the same-tick downstream readers (which now
-// also read Info), so the two transitional W6 lockstep mirrors are gone.
-func healStateWithRollbackInfo(info sessionpkg.Info, alive bool, sessFront *sessionpkg.Store, clk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) map[string]string {
+// healStateWithRollbackInfo computes and persists an advisory-state heal.
+// Callers may fold the returned patch only when err is nil; an error leaves
+// their current projection authoritative for the rest of the pass.
+func healStateWithRollbackInfo(info sessionpkg.Info, alive bool, sessFront *sessionpkg.Store, clk clock.Clock, startupTimeout time.Duration, rollbackAvailable bool) (map[string]string, error) {
 	// Closed beads are terminal; their advisory state metadata should not move
 	// (matches healStateWithRollback's session.Status == "closed" guard —
 	// Info.Closed is the projected mirror).
 	if info.Closed {
-		return nil
+		return nil, nil
 	}
 	batch := healStatePatchWithRollbackInfo(info, alive, clk, startupTimeout, rollbackAvailable)
 	if len(batch) == 0 {
-		return nil
+		return nil, nil
 	}
 	if err := sessFront.ApplyPatch(info.ID, batch); err != nil {
-		fmt.Fprintf(os.Stderr, "healState: SetMetadataBatch %s: %v\n", info.ID, err) //nolint:errcheck
+		return nil, err
 	}
 	// S19 Stage 3 shadow: record the legacy compared-key writes this heal ACTUALLY
 	// applied (no-op unless the shadow harness is enabled). Colocated with the
 	// ApplyPatch so a pure builder (healStatePatchWithRollbackInfo) invoked only for
 	// inspection never records a write that never happened.
 	recordLegacyCompareWrites(info.ID, "healStateWithRollback", batch)
-	return batch
+	return batch, nil
 }
 
 // clearPendingCreateLeaseInfo is the Info-form counterpart of

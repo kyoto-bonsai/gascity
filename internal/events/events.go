@@ -59,6 +59,33 @@ const (
 	SessionMaxAgeKilled = "session.max_age_killed"
 	SessionSuspended    = "session.suspended"
 	SessionUpdated      = "session.updated"
+	// SessionSlept fires at every genuine transition of a session bead to
+	// state=asleep — the idle-sleep engine's own drain-complete site, the
+	// max-session-age preemptive-restart kill, the idle-timeout kill, and an
+	// explicit `gc session kill`. Before this event, sleep was a silent state
+	// transition: 500 events observed over a 3h window included zero of them
+	// (ga-v8mtlp 3-arm validation, finding F5). Its payload's resolved-policy
+	// fields let a subscriber distinguish an interactive-resume graceful sleep
+	// from a forced kill without re-deriving config, and answer "N asleep"
+	// questions that gc session list's contaminated state=asleep column cannot
+	// (that column conflates engine-slept with killed/runtime-missing/city-stop).
+	SessionSlept = "session.slept"
+	// SessionResumed fires additively alongside session.woke when a start
+	// commits successfully AND the session is continuing a prior provider
+	// conversation (not the bead's first-ever start, not a forced fresh wake,
+	// and a resumable session_key is present) — the same resume/fresh
+	// distinction already used to choose between delivering the full startup
+	// prompt and a short restart nudge (buildPreparedStartWithWorkDirResolver).
+	// session.woke keeps firing unconditionally on every commit exactly as
+	// before (SessionResumed is additive, never a replacement), so existing
+	// session.woke consumers are unaffected. Before this event, session.woke
+	// was the only wake signal and fired identically for a brand-new session's
+	// first-ever start and a genuine resume-from-sleep — three independent
+	// proofs in ga-v8mtlp finding F5 established this conflation (a
+	// start-pending create, a never-slept fresh spawn, and wake events on a
+	// template pinned sleep_after_idle="off" and therefore unable to sleep at
+	// all).
+	SessionResumed = "session.resumed"
 	// SessionDrainAckedWithAssignedWork fires when a session acknowledges
 	// drain (via `gc runtime drain-ack`) while still holding the assignee
 	// on an open or in-progress work bead. Distinguishes a worker that
@@ -132,7 +159,13 @@ const (
 	RequestResultSessionCreate  = "request.result.session.create"
 	RequestResultSessionMessage = "request.result.session.message"
 	RequestResultSessionSubmit  = "request.result.session.submit"
+	RequestResultRigCreate      = "request.result.rig.create"
 	RequestFailed               = "request.failed"
+
+	// RigProvisionProgress reports one provisioning step of a server-side
+	// rig add (clone, beads-init, packs, config, routes). Non-terminal;
+	// the terminal outcome is RequestResultRigCreate or RequestFailed.
+	RigProvisionProgress = "rig.provision.progress"
 
 	// Non-terminal city lifecycle events recorded in the per-city
 	// event log during init/unregister for diagnostics.
@@ -217,10 +250,31 @@ const (
 	// the next episode fires independently. (ADR-0013 A1 M3a)
 	ProviderHealthGateAlert = "provider.health_gate_alert"
 
+	// PoolCreateBudgetGateAlert fires when the reconciler's shared pool
+	// session-create budget (poolplan.CreateBudget, sized by
+	// daemon.max_wakes_per_tick) is exhausted and a fresh pool session create
+	// is deferred. Debounced to at most one alert per cooldown window per
+	// pool template (see pool_create_budget_gate.go) so a sustained
+	// exhaustion does not spam the event log. Before this event existed, the
+	// condition was logged to stderr only — no bead, event, or other
+	// operator-visible signal (ga-stpvzg).
+	PoolCreateBudgetGateAlert = "pool.create_budget_gate_alert"
+
 	// Emergency events are dolt-independent escalation records written to
 	// .gc/emergency and mirrored into the city event log.
 	EmergencySignaled = "emergency.signaled"
 	EmergencyAcked    = "emergency.acked"
+
+	// BeadsConditionalWritesDegraded fires when a store resolved under the
+	// beads.conditional_writes rollout gate at mode=auto is vetoed by runtime
+	// capability (bd lacks --if-revision, a runtime unsupported latch, or a
+	// revision-less read path) and loud-degrades to the legacy write path.
+	// Latched once per store instance by the emitter so log/event storms are
+	// structurally impossible (DESIGN §12.2). The name mirrors the FLAG key
+	// beads.conditional_writes (hence plural beads., unlike the per-bead
+	// lifecycle events under bead.*). Registered in stage 2 (S2-T11);
+	// emission is wired in stage 3 — nothing emits it yet.
+	BeadsConditionalWritesDegraded = "beads.conditional_writes.degraded"
 )
 
 // KnownEventTypes lists every event-type constant this package defines.
@@ -231,6 +285,7 @@ var KnownEventTypes = []string{
 	SessionWoke, SessionStopped, SessionCrashed,
 	SessionDraining, SessionUndrained, SessionQuarantined,
 	SessionIdleKilled, SessionMaxAgeKilled, SessionSuspended, SessionUpdated,
+	SessionSlept, SessionResumed,
 	SessionDrainAckedWithAssignedWork,
 	SessionStranded,
 	SessionUnknownState,
@@ -248,7 +303,8 @@ var KnownEventTypes = []string{
 	CitySuspended, CityResumed,
 	RequestResultCityCreate, RequestResultCityUnregister,
 	RequestResultSessionCreate, RequestResultSessionMessage,
-	RequestResultSessionSubmit, RequestFailed,
+	RequestResultSessionSubmit, RequestResultRigCreate, RequestFailed,
+	RigProvisionProgress,
 	CityCreated, CityUnregisterRequested,
 	OrderFired, OrderCompleted, OrderFailed,
 	ProviderSwapped, WorkerOperation, ProjectIdentityStamped, SupervisorFSPressureSkippedTick,
@@ -264,11 +320,16 @@ var KnownEventTypes = []string{
 	StoreDiskWarn, StoreDiskCritical,
 	PostgresCredentialResolved,
 	EmergencySignaled, EmergencyAcked,
+	BeadsConditionalWritesDegraded,
 	// ProviderHealthGateAlert is intentionally omitted from KnownEventTypes.
 	// The event is emitted by the reconciler but its typed SSE payload is not
 	// yet registered in internal/api (the payload registration lives in a
 	// follow-up that adds the full SSE projection). Until then, subscribers
 	// receive it via the custom-event envelope.
+	//
+	// PoolCreateBudgetGateAlert is intentionally omitted for the same reason:
+	// its typed SSE payload is not yet registered in internal/api. Subscribers
+	// receive it via the custom-event envelope until that follow-up lands.
 }
 
 // Event is a single recorded occurrence in the system.
@@ -305,15 +366,23 @@ type Recorder interface {
 type Provider interface {
 	Recorder
 
-	// List returns events matching the filter.
-	List(filter Filter) ([]Event, error)
+	// List returns events matching the filter. Implementations that scan
+	// (rather than serve from memory) must check ctx periodically so an
+	// abandoned caller's scan actually stops — see ga-tk5mcg.10.
+	List(ctx context.Context, filter Filter) ([]Event, error)
 
 	// LatestSeq returns the highest sequence number, or 0 if empty.
 	LatestSeq() (uint64, error)
 
-	// Watch returns a Watcher that yields events with Seq > afterSeq.
-	// The watcher blocks on Next() until an event arrives or ctx is
-	// canceled. Callers must call Close() when done.
+	// Watch returns a Watcher that yields every RETAINED event with
+	// Seq > afterSeq, in sequence order, exactly once per watcher —
+	// including events recorded before Watch was called and events that
+	// have since rotated into an archive. (Across separate watcher
+	// instances delivery is at-least-once; callers de-dupe by seq.) The
+	// watcher blocks on Next() until an event arrives or ctx is
+	// canceled. afterSeq=0 therefore requests the entire retained
+	// history; pass LatestSeq() to stream only from now. Callers must
+	// call Close() when done.
 	Watch(ctx context.Context, afterSeq uint64) (Watcher, error)
 
 	// Close releases any resources held by the provider.
@@ -323,7 +392,41 @@ type Provider interface {
 // TailProvider is an optional extension for providers that can return the
 // trailing matching events without scanning or materializing the whole history.
 type TailProvider interface {
-	ListTail(filter Filter, limit int) ([]Event, error)
+	ListTail(ctx context.Context, filter Filter, limit int) ([]Event, error)
+}
+
+// InFlightProvider is an optional extension for providers whose plain List can
+// momentarily miss events stranded in an in-flight rotation file. When a
+// file-backed provider rotates, the just-rotated segment lives only in the
+// events.jsonl.rotating-* file until a background goroutine gzips it into the
+// canonical .gz archive; List reads archives + the active file, so during that
+// window it cannot see the segment. ListInFlight folds those events back in,
+// preserving seq order and de-duplicating by seq, so a keyset walk cannot skip
+// a whole seq range mid-rotation. Providers with no such window (in-memory
+// fakes, exec scripts) need not implement it.
+type InFlightProvider interface {
+	ListInFlight(ctx context.Context, filter Filter) ([]Event, error)
+}
+
+// ExhaustiveTailProvider is an optional extension of TailProvider for
+// providers whose ListTail, when it returns fewer than the requested limit,
+// has already walked the entirety of retained history (including archives
+// and any in-flight rotation segment) to do so — the short result is a
+// complete, final answer, not merely "what happened to be nearby" in a
+// recent-only view. fetchEventPageAscending (internal/api) uses this marker
+// to skip an otherwise-redundant full-history fallback scan: without it, a
+// short ListTail result is ambiguous (contrast a provider whose tail view is
+// only the active/recent segment, e.g. a naive TailProvider implementation),
+// so the caller must fall back to a full scan to be sure nothing was missed.
+//
+// Do not implement this via struct embedding of a type that doesn't itself
+// guarantee exhaustiveness (e.g. Fake, whose test wrappers deliberately
+// simulate a narrower ListTail view) — Go promotes embedded methods, so an
+// embedder would silently inherit a guarantee it does not honor. See
+// ga-96zjze.
+type ExhaustiveTailProvider interface {
+	TailProvider
+	ExhaustiveTail()
 }
 
 // Watcher yields events one at a time. Created by [Provider.Watch].

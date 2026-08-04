@@ -124,7 +124,10 @@ func healStateInfo(session *beads.Bead, alive bool, sessFront *sessionpkg.Store,
 	if session == nil {
 		return
 	}
-	batch := healStateWithRollbackInfo(seedSessionInfo(*session), alive, sessFront, clk, 0, true)
+	batch, err := healStateWithRollbackInfo(seedSessionInfo(*session), alive, sessFront, clk, 0, true)
+	if err != nil {
+		panic("healStateInfo: " + err.Error())
+	}
 	if session.Metadata == nil && len(batch) > 0 {
 		session.Metadata = make(map[string]string, len(batch))
 	}
@@ -434,7 +437,7 @@ func TestPendingCreateStartedAtNowSubstitutesCurrentTimeForZeroInput(t *testing.
 	}
 }
 
-func TestWakeReasons_DrainedSleepPoolSessionDoesNotGetWakeConfig(t *testing.T) {
+func TestWakeReasons_DrainedConfigEligibility(t *testing.T) {
 	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
 	clk := &clock.Fake{Time: now}
 
@@ -444,19 +447,53 @@ func TestWakeReasons_DrainedSleepPoolSessionDoesNotGetWakeConfig(t *testing.T) {
 		},
 	}
 
-	session := makeBead("b1", map[string]string{
-		"template":     "worker",
-		"session_name": "test-worker-1",
-		"pool_slot":    "1",
-		"state":        "asleep",
-		"sleep_reason": "drained",
-	})
+	tests := []struct {
+		name       string
+		metadata   map[string]string
+		wantConfig bool
+	}{
+		{
+			name: "always named session",
+			metadata: map[string]string{
+				"template":                  "worker",
+				"session_name":              "always-worker",
+				"configured_named_session":  "true",
+				"configured_named_identity": "always-worker",
+				"configured_named_mode":     "always",
+			},
+			wantConfig: true,
+		},
+		{
+			name: "on demand named session",
+			metadata: map[string]string{
+				"template":                  "worker",
+				"session_name":              "demand-worker",
+				"configured_named_session":  "true",
+				"configured_named_identity": "demand-worker",
+				"configured_named_mode":     "on_demand",
+			},
+		},
+		{
+			name: "pool slot",
+			metadata: map[string]string{
+				"template":     "worker",
+				"session_name": "test-worker-1",
+				"pool_slot":    "1",
+			},
+		},
+	}
 
-	reasons := wakeReasonsForBead(session, cfg, nil, map[string]int{"worker": 3}, nil, nil, clk)
-	for _, reason := range reasons {
-		if reason == WakeConfig {
-			t.Fatalf("drained sleep session should not get WakeConfig, got %v", reasons)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.metadata["state"] = "asleep"
+			tt.metadata["sleep_reason"] = "drained"
+			session := makeBead("b1", tt.metadata)
+
+			reasons := wakeReasonsForBead(session, cfg, nil, map[string]int{"worker": 3}, nil, nil, clk)
+			if got := containsWakeReason(reasons, WakeConfig); got != tt.wantConfig {
+				t.Fatalf("WakeConfig present = %v, want %v; reasons = %v", got, tt.wantConfig, reasons)
+			}
+		})
 	}
 }
 
@@ -1817,6 +1854,50 @@ func TestHealState_StaleCreatingWithoutPendingClaimHealsToAsleep(t *testing.T) {
 	})
 	// Past staleCreatingStateTimeout (60s).
 	session.CreatedAt = clk.Now().Add(-2 * time.Minute)
+
+	healStateInfo(&session, false, sessionFrontDoor(store), clk)
+	if session.Metadata["state"] != "asleep" {
+		t.Fatalf("state = %q, want asleep", session.Metadata["state"])
+	}
+}
+
+// Durability fix 5 (ga-ig880p): mirrors
+// TestHealState_PreservesFreshCreatingWithoutPendingClaim for the
+// start-pending sub-state — a fresh RequestWakePatch must not be aged out
+// before staleStartPendingStateTimeout elapses.
+func TestHealState_PreservesFreshStartPending(t *testing.T) {
+	store := newTestStore()
+	clk := &clock.Fake{Time: time.Date(2026, 3, 29, 4, 0, 0, 0, time.UTC)}
+
+	session := makeBead("b1", map[string]string{
+		"state":                     string(sessionpkg.StateStartPending),
+		"pending_create_started_at": pendingCreateStartedAtNow(clk.Now().Add(-30 * time.Second)),
+	})
+	session.CreatedAt = clk.Now().Add(-30 * time.Second)
+
+	healStateInfo(&session, false, sessionFrontDoor(store), clk)
+	if session.Metadata["state"] != string(sessionpkg.StateStartPending) {
+		t.Fatalf("state = %q, want start-pending", session.Metadata["state"])
+	}
+}
+
+// Durability fix 5 (ga-ig880p): mirrors
+// TestHealState_StaleCreatingWithoutPendingClaimHealsToAsleep for the
+// start-pending sub-state. Before this fix, BaseStateStartPending had no
+// staleness check at all in projectRuntimeProjection and this heal would
+// never fire — a session stuck in start-pending (e.g. the reconciler crashing
+// between RequestWakePatch and the provider Start attempt) stayed
+// start-pending forever, per gc-durability-findings-2026-07-25.md §4.
+func TestHealState_StaleStartPendingHealsToAsleep(t *testing.T) {
+	store := newTestStore()
+	clk := &clock.Fake{Time: time.Date(2026, 3, 29, 4, 0, 0, 0, time.UTC)}
+
+	startedAt := clk.Now().Add(-staleStartPendingStateTimeout - time.Second)
+	session := makeBead("b1", map[string]string{
+		"state":                     string(sessionpkg.StateStartPending),
+		"pending_create_started_at": pendingCreateStartedAtNow(startedAt),
+	})
+	session.CreatedAt = startedAt
 
 	healStateInfo(&session, false, sessionFrontDoor(store), clk)
 	if session.Metadata["state"] != "asleep" {

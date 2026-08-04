@@ -25,6 +25,7 @@ import (
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/pgauth"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
@@ -382,7 +383,18 @@ func gitCmd(t *testing.T, dir string, args ...string) {
 
 func newRepoWithOriginHead(t *testing.T, branch string) string {
 	t.Helper()
-	dir := t.TempDir()
+	return newRepoWithOriginHeadAt(t, t.TempDir(), branch)
+}
+
+// newRepoWithOriginHeadAt git-inits a repo at dir (created if absent) with
+// origin/HEAD pointing at branch. Use it when the repo must live under a
+// specific parent — e.g. inside the city dir, since the API rig-create now
+// contains rig paths to the city root.
+func newRepoWithOriginHeadAt(t *testing.T, dir, branch string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
 	gitCmd(t, dir, "init")
 	gitCmd(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/"+branch)
 	return dir
@@ -851,6 +863,379 @@ func TestDoSlingSuspendedAgentForce(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "suspended") {
 		t.Errorf("--force should suppress warning; stderr = %q", stderr.String())
+	}
+}
+
+// officerOfRecordTestCfg returns a City with [routing] configured (one
+// exempt group naming persona-marcus) — the "gate is opt-in, and this city
+// has opted in" fixture shared by the officer-of-record tests below.
+func officerOfRecordTestCfg() *config.City {
+	return &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		RoutingPolicy: config.RoutingPolicyConfig{
+			RoutingExempt: []config.RoutingExemptGroup{
+				{Name: "officers", Personas: []string{"persona-marcus"}},
+			},
+		},
+	}
+}
+
+func TestDoSlingRefusesMissingOfficerOfRecord(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(officerOfRecordTestCfg(), sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling returned 0, want non-zero (refused for missing officer_of_record)")
+	}
+	if !strings.Contains(stderr.String(), "gc.officer_of_record") {
+		t.Errorf("stderr = %q, want officer_of_record refusal", stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("got %d runner calls, want 0 — should refuse before dispatch", len(runner.calls))
+	}
+}
+
+func TestDoSlingRoutesWithOfficerOfRecord(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(officerOfRecordTestCfg(), sp, runner.run)
+	created, err := deps.Store.Create(beads.Bead{
+		Title: "has officer of record", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding bead: %v", err)
+	}
+	opts := testOpts(a, created.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 — officer_of_record is set: stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, created.ID, "worker")
+}
+
+func TestDoSlingOfficerOfRecordForceDoesNotBypass(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(officerOfRecordTestCfg(), sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	opts.Force = true
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling with --force returned 0, want non-zero — no bypass for officer_of_record (ruling a)")
+	}
+	if !strings.Contains(stderr.String(), "no --force override") {
+		t.Errorf("stderr = %q, want explicit no-force-override message", stderr.String())
+	}
+}
+
+func TestDoSlingOfficerOfRecordExemptTargetRoutesWithoutIt(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "persona-marcus", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(officerOfRecordTestCfg(), sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling to exempt target returned %d, want 0: stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "persona-marcus")
+}
+
+func TestDoSlingOfficerOfRecordNoopWhenPolicyUnconfigured(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	// No RoutingPolicy set at all — the zero-value default every OTHER test
+	// in this file uses. The gate must no-op here: a city (or a test fixture)
+	// that never authored [routing] in city.toml sees unchanged behavior.
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling with unconfigured RoutingPolicy returned %d, want 0 (opt-in gate must no-op): stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "worker")
+}
+
+// liveRoutingConflictTestCfg returns a City with [routing] configured
+// (opt-in, no exempt groups) — the shared fixture for the live-routing-
+// conflict tests below. A dedicated helper (rather than reusing
+// officerOfRecordTestCfg) keeps this file's two gates' fixtures independent
+// if they ever need to diverge.
+func liveRoutingConflictTestCfg() *config.City {
+	return &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		RoutingPolicy: config.RoutingPolicyConfig{
+			OfficerOfRecordValueDomain: []string{"operator"},
+		},
+	}
+}
+
+// seedLiveSession creates a fake session bead — Type=session
+// (session.BeadType), Labels=[gc:session] (session.LabelSession), open, with
+// template=target (matching a.QualifiedName()), session_name=name, and
+// state=state. These are the BARE metadata keys internal/session actually
+// writes (confirmed against manager.go's real session-creation Metadata map),
+// not the beadmeta gc.-prefixed constants this fixture originally used —
+// ga-5m7fir's validation found production read those same wrong constants,
+// so the original fixture agreed with the buggy code by construction rather
+// than with any real session bead. For the live-routing-conflict tests below.
+func seedLiveSession(t *testing.T, store beads.Store, target, name, state string) { //nolint:unparam // target kept explicit at call sites for readability; every current caller happens to route through "worker"
+	t.Helper()
+	_, err := store.Create(beads.Bead{
+		Title:  name,
+		Type:   "session",
+		Status: "open",
+		Labels: []string{"gc:session"},
+		Metadata: map[string]string{
+			"template":     target,
+			"session_name": name,
+			"state":        state,
+		},
+	})
+	if err != nil {
+		t.Fatalf("seeding live session bead: %v", err)
+	}
+}
+
+// seedClaimedBead creates a work bead and transitions it to
+// Status=in_progress with the given assignee. MemStore.Create unconditionally
+// forces Status="open" on every new bead regardless of the input value, so
+// the in_progress transition must go through a separate Update call — a
+// Create alone cannot seed an already-claimed fixture.
+func seedClaimedBead(t *testing.T, store beads.Store, title, assignee string, metadata map[string]string) beads.Bead {
+	t.Helper()
+	created, err := store.Create(beads.Bead{Title: title, Type: "task", Metadata: metadata})
+	if err != nil {
+		t.Fatalf("seeding %q: %v", title, err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(created.ID, beads.UpdateOpts{Status: &inProgress, Assignee: &assignee}); err != nil {
+		t.Fatalf("claiming %q: %v", title, err)
+	}
+	claimed, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("re-reading claimed %q: %v", title, err)
+	}
+	return claimed
+}
+
+// TestDoSlingRefusesLiveRoutingConflict reproduces ga-ktvnh1's fixture 1: a
+// bare-persona-alias sling while that alias's session is alive and
+// in_progress on a different bead (the ga-11quqf two-nils-sessions-build-
+// same-binary incident).
+func TestDoSlingRefusesLiveRoutingConflict(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", string(session.StateActive))
+	claimed := seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
+	target, err := deps.Store.Create(beads.Bead{
+		Title: "new work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding target bead: %v", err)
+	}
+
+	opts := testOpts(a, target.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling returned 0, want non-zero (refused for live routing conflict)")
+	}
+	if !strings.Contains(stderr.String(), "live session") {
+		t.Errorf("stderr = %q, want live-session refusal wording", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), claimed.ID) {
+		t.Errorf("stderr = %q, want it to name the conflicting bead %q", stderr.String(), claimed.ID)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("got %d runner calls, want 0 — should refuse before dispatch", len(runner.calls))
+	}
+}
+
+// TestDoSlingRoutesWhenNoLiveConflict is the negative case: zero session
+// beads exist, so the guard must not false-positive.
+func TestDoSlingRoutesWhenNoLiveConflict(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	created, err := deps.Store.Create(beads.Bead{
+		Title: "new work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding bead: %v", err)
+	}
+
+	opts := testOpts(a, created.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 — no live session exists: stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, created.ID, "worker")
+}
+
+// TestDoSlingLiveRoutingConflictForceBypasses proves --force overrides this
+// guard, unlike the officer-of-record gate — a deliberate design difference
+// (see shouldCheckLiveRoutingConflict's doc comment): this is a live-safety
+// interlock, not a compliance requirement with no exceptions.
+func TestDoSlingLiveRoutingConflictForceBypasses(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", string(session.StateActive))
+	seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
+	target, err := deps.Store.Create(beads.Bead{
+		Title: "new work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding target bead: %v", err)
+	}
+
+	opts := testOpts(a, target.ID)
+	opts.Force = true
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling with --force returned %d, want 0 — force bypasses this guard: stderr=%q", code, stderr.String())
+	}
+}
+
+// TestDoSlingLiveRoutingConflictStaleHeartbeatAllowed proves a stranded
+// session — one the reconciler has already transitioned to StateAsleep, the
+// observed shape of a dead session in this fleet (gc session list shows
+// state=asleep, reason=runtime-missing) — does not block a reclaim.
+//
+// This replaces the original heartbeat-window mechanism (gc.last_heartbeat_at,
+// a field with no live writer on session beads at all — see ga-5m7fir's root
+// cause) with the reconciler's own state field. Deliberate, disclosed scope
+// change versus the original design: a session that is dead but NOT YET
+// reconciled (state still active/awake because the sweep hasn't run) is now
+// treated as a live conflict requiring --force, whereas the original window
+// design would have allowed it through once the window elapsed. Flagging for
+// validator review rather than silently choosing — the reconciler's own
+// signal has no "not yet caught up" analog to safely fall back to.
+func TestDoSlingLiveRoutingConflictStaleHeartbeatAllowed(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-stale-1", string(session.StateAsleep))
+	seedClaimedBead(t, deps.Store, "stranded claim", "worker-stale-1", map[string]string{"gc.officer_of_record": "operator"})
+	target, err := deps.Store.Create(beads.Bead{
+		Title: "reclaim work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding target bead: %v", err)
+	}
+
+	opts := testOpts(a, target.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 — an asleep (reconciled-dead) session must not block a reclaim: stderr=%q", code, stderr.String())
+	}
+}
+
+// TestDoSlingLiveRoutingConflictAwakeStateIsLive proves StateAwake (the
+// reconciler's alias for StateActive, per internal/session/manager.go) is
+// also treated as a live conflict, not just the literal "active" value.
+func TestDoSlingLiveRoutingConflictAwakeStateIsLive(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-awake-1", string(session.StateAwake))
+	claimed := seedClaimedBead(t, deps.Store, "already claimed", "worker-awake-1", map[string]string{"gc.officer_of_record": "operator"})
+	target, err := deps.Store.Create(beads.Bead{
+		Title: "new work", Type: "task",
+		Metadata: map[string]string{"gc.officer_of_record": "operator"},
+	})
+	if err != nil {
+		t.Fatalf("seeding target bead: %v", err)
+	}
+
+	opts := testOpts(a, target.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling returned 0, want non-zero — StateAwake must be treated as a live conflict")
+	}
+	if !strings.Contains(stderr.String(), claimed.ID) {
+		t.Errorf("stderr = %q, want it to name the conflicting bead %q", stderr.String(), claimed.ID)
+	}
+}
+
+// TestDoSlingLiveRoutingConflictNoopWhenPolicyUnconfigured mirrors the
+// officer-of-record gate's own no-op test: a city that has not authored
+// [routing] at all must see unchanged behavior, even with a live conflicting
+// session present.
+func TestDoSlingLiveRoutingConflictNoopWhenPolicyUnconfigured(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", string(session.StateActive))
+	seedClaimedBead(t, deps.Store, "already claimed", "worker-live-1", nil)
+
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling with unconfigured RoutingPolicy returned %d, want 0 (opt-in gate must no-op): stderr=%q", code, stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "worker")
+}
+
+// TestDoSlingLiveRoutingConflictSameBeadIsNotAConflict proves re-slinging the
+// bead a live session already holds is not treated as a conflict — only a
+// DIFFERENT bead triggers the guard.
+func TestDoSlingLiveRoutingConflictSameBeadIsNotAConflict(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	a := config.Agent{Name: "worker", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(liveRoutingConflictTestCfg(), sp, runner.run)
+	created := seedClaimedBead(t, deps.Store, "already mine", "worker-live-1", map[string]string{"gc.officer_of_record": "operator"})
+	seedLiveSession(t, deps.Store, "worker", "worker-live-1", string(session.StateActive))
+
+	opts := testOpts(a, created.ID)
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 — re-slinging the same bead the live session already holds is not a conflict: stderr=%q", code, stderr.String())
 	}
 }
 
@@ -1633,6 +2018,7 @@ dir = "frontend"
 		t.Fatalf("WriteFile(city.toml): %v", err)
 	}
 	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 
 	var stdout, stderr bytes.Buffer
 	code := cmdSling([]string{"frontend/worker", "ship feature"}, false, false, true, "", nil, "", true, false, false, "", false, false, false, "", "", &stdout, &stderr)
@@ -1704,6 +2090,7 @@ mode = "on_demand"
 	}
 	writeBuiltinImportsLock(t, cityDir, "core")
 	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 
 	var stdout, stderr bytes.Buffer
 	code := cmdSling([]string{"worker", "ship feature"}, false, false, true, "", nil, "", true, false, false, "", false, false, false, "", "", &stdout, &stderr)
@@ -1828,6 +2215,7 @@ dir = "frontend"
 		t.Fatalf("WriteFile(city.toml): %v", err)
 	}
 	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 	return cityDir
 }
 
@@ -1948,6 +2336,7 @@ func TestCmdSlingInlineBeadRigScopedBdProvider(t *testing.T) {
 	calls := installCaptureBdRunner(t)
 
 	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 
 	var stdout, stderr bytes.Buffer
 	code := cmdSling([]string{"frontend/worker", "ship feature"}, false, false, true, "", nil, "", true, false, false, "", false, false, false, "", "", &stdout, &stderr)
@@ -1978,10 +2367,11 @@ func TestCmdSlingInlineBeadBareTargetFromRigCwdBdProvider(t *testing.T) {
 	configureIsolatedRuntimeEnv(t)
 	t.Setenv("GC_BEADS", "bd")
 
-	_, rigDir := setupRigScopedBdCity(t)
+	cityDir, rigDir := setupRigScopedBdCity(t)
 	calls := installCaptureBdRunner(t)
 
 	t.Chdir(rigDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 
 	var stdout, stderr bytes.Buffer
 	code := cmdSling([]string{"worker", "ship feature"}, false, false, true, "", nil, "", true, false, false, "", false, false, false, "", "", &stdout, &stderr)
@@ -2349,6 +2739,73 @@ func TestResolveInlineBeadActionMultiDashStoreErrorSurfaces(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "lookup failed") {
 		t.Fatalf("resolveInlineBeadAction error = %q, want lookup failure", err)
+	}
+}
+
+func TestResolveInlineBeadActionMultilineTextErrors(t *testing.T) {
+	// Reproduces ga-thcr5n: a newline-joined list of bead IDs passed as a
+	// single sling argument (e.g. by the always-on deacon script) must not
+	// be silently fabricated into one contentless junk bead. Fail loud.
+	blob := strings.Join([]string{
+		"ga-kn8yy6.1", "ga-zogqc1.2.5", "ga-zogqc1.2.4", "ga-zogqc1.2.3",
+		"ga-a700wu", "ga-rzdqvl", "ga-7sy2ac", "ga-cd1895", "ga-fxudqs",
+		"ga-9feee3", "ga-e3zcqv", "ga-gzmzej", "ga-uslskt",
+	}, "\n")
+
+	create, previewInlineText, err := resolveInlineBeadAction(&config.City{}, blob, false, nil)
+	if err == nil {
+		t.Fatal("resolveInlineBeadAction error = nil, want error for multi-line inline text")
+	}
+	if !strings.Contains(err.Error(), "13") {
+		t.Fatalf("resolveInlineBeadAction error = %q, want line count 13", err)
+	}
+	if create {
+		t.Fatal("create = true, want false for multi-line inline text")
+	}
+	if previewInlineText {
+		t.Fatal("previewInlineText = true, want false for multi-line inline text")
+	}
+}
+
+func TestResolveInlineBeadActionMultilineTextErrorsDuringDryRun(t *testing.T) {
+	// The dry-run path must fail the same way — a dry-run preview of a junk
+	// bead is still a lie about what gc sling would do.
+	blob := "ga-abc12\nga-def34\nga-ghi56"
+
+	create, previewInlineText, err := resolveInlineBeadAction(&config.City{}, blob, true, nil)
+	if err == nil {
+		t.Fatal("resolveInlineBeadAction error = nil, want error for multi-line inline text during dry-run")
+	}
+	if create {
+		t.Fatal("create = true, want false for multi-line inline text during dry-run")
+	}
+	if previewInlineText {
+		t.Fatal("previewInlineText = true, want false — must not preview a junk bead")
+	}
+}
+
+func TestResolveInlineBeadActionSingleLineWithSpacesStillCreates(t *testing.T) {
+	// Regression/over-correction guard: the newline guard must key ONLY on
+	// "\n", not general whitespace. Ordinary space-separated inline text
+	// must still create a bead.
+	create, inlineText := mustResolveInlineBeadAction(t, &config.City{}, "write a README", false, nil)
+	if !create {
+		t.Fatal("create = false, want true for single-line inline text with spaces")
+	}
+	if inlineText {
+		t.Fatal("inlineText = true, want false outside dry-run")
+	}
+}
+
+func TestResolveInlineBeadActionSingleBeadIDNoNewlineDoesNotError(t *testing.T) {
+	// Regression guard: a single bead ID (the common case) must not trip the
+	// newline guard or any other new logic.
+	create, inlineText := mustResolveInlineBeadAction(t, &config.City{}, "ga-abc12", false, nil)
+	if create {
+		t.Fatal("create = true, want false for a single bead ID")
+	}
+	if inlineText {
+		t.Fatal("inlineText = true, want false for a single bead ID")
 	}
 }
 
@@ -2884,6 +3341,7 @@ sling_query = "true"
 		t.Fatalf("WriteFile(city.toml): %v", err)
 	}
 	t.Chdir(cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
 
 	var stdout, stderr bytes.Buffer
 	code := cmdSling(
@@ -4805,6 +5263,123 @@ func TestResolveSlingStoreRootUsesCityRootForHQPrefix(t *testing.T) {
 	got := resolveSlingStoreRoot(cfg, cityPath, "hq-123", config.Agent{Dir: "alpha"})
 	if got != cityPath {
 		t.Fatalf("resolveSlingStoreRoot() = %q, want city root %q", got, cityPath)
+	}
+}
+
+// TestResolveSlingStoreRootHQPrefixUsesBdProviderFromCityRootMetadata
+// reproduces dr-h6ze end to end at the sling layer: an HQ-prefixed bead
+// (e.g. "dr-h6ze") correctly resolves its store root to the city root, but
+// the city's own root is a Dolt-backed HQ store even though [beads]
+// provider declares "file" as the default for rigs. Source validation,
+// gc.routed_to mutation, and convoy/nudge all open the store via this same
+// (storeDir, cityPath) pair, so the provider resolved here is what every
+// downstream sling step actually talks to -- it must be "bd", not the
+// configured file default, or the bead is silently unroutable.
+func TestResolveSlingStoreRootHQPrefixUsesBdProviderFromCityRootMetadata(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "bright-lights"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setScopedBeadsProviderForTest(t, "", "file")
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "bright-lights", Prefix: "hq"},
+		Rigs: []config.Rig{
+			{Name: "alpha", Path: filepath.Join(cityPath, "rigs", "alpha"), Prefix: "al"},
+		},
+	}
+
+	storeDir := resolveSlingStoreRoot(cfg, cityPath, "hq-123", config.Agent{Dir: "alpha"})
+	if storeDir != cityPath {
+		t.Fatalf("resolveSlingStoreRoot() = %q, want city root %q", storeDir, cityPath)
+	}
+	if got := authoritativeBeadsProviderForScope(storeDir, cityPath); got != "bd" {
+		t.Fatalf("authoritativeBeadsProviderForScope(HQ store root) = %q, want bd (on-disk store identity, not ambient GC_BEADS=file)", got)
+	}
+
+	// Regression guard: a normal rig store with no Dolt marker of its own
+	// still resolves through its declared file/bd contract unaffected by
+	// the city-root fix above.
+	rigStoreDir := resolveSlingStoreRoot(cfg, cityPath, "al-1", config.Agent{Dir: "alpha"})
+	wantRigDir := filepath.Join(cityPath, "rigs", "alpha")
+	if rigStoreDir != wantRigDir {
+		t.Fatalf("resolveSlingStoreRoot(rig bead) = %q, want %q", rigStoreDir, wantRigDir)
+	}
+	if got := authoritativeBeadsProviderForScope(rigStoreDir, cityPath); got != "file" {
+		t.Fatalf("authoritativeBeadsProviderForScope(rig store root) = %q, want file (no on-disk marker, city default preserved)", got)
+	}
+}
+
+func TestSlingSourceWorkflowStoreCandidatesUseAuthoritativeProviders(t *testing.T) {
+	setScopedBeadsProviderForTest(t, "", "file")
+
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "rigs", "local")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"local"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{Rigs: []config.Rig{{Name: "local", Path: rigPath}}}
+	providers := make(map[string]string)
+	stores, _, err := openSourceWorkflowStoresWithProvider(cfg, cityPath, "", func(scopeRoot string) string {
+		return authoritativeBeadsProviderForScope(scopeRoot, cityPath)
+	}, func(dir string) (beads.Store, error) {
+		providers[dir] = authoritativeBeadsProviderForScope(dir, cityPath)
+		return beads.NewMemStore(), nil
+	})
+	if err != nil {
+		t.Fatalf("openSourceWorkflowStoresWith: %v", err)
+	}
+	if len(stores) != 2 {
+		t.Fatalf("stores = %d, want city and rig candidates", len(stores))
+	}
+	if got := providers[cityPath]; got != "bd" {
+		t.Fatalf("city candidate provider = %q, want bd despite ambient GC_BEADS=file", got)
+	}
+	if got := providers[rigPath]; got != "bd" {
+		t.Fatalf("rig candidate provider = %q, want bd despite ambient GC_BEADS=file", got)
+	}
+
+	setScopedBeadsProviderForTest(t, "", "")
+	remoteCity := t.TempDir()
+	if err := os.WriteFile(filepath.Join(remoteCity, "city.toml"), []byte(`[workspace]
+name = "remote"
+
+[beads]
+provider = "exec:/tmp/remote-beads"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remoteProviders := make(map[string]string)
+	_, _, err = openSourceWorkflowStoresWith(&config.City{}, remoteCity, "", func(dir string) (beads.Store, error) {
+		remoteProviders[dir] = authoritativeBeadsProviderForScope(dir, remoteCity)
+		return beads.NewMemStore(), nil
+	})
+	if err != nil {
+		t.Fatalf("openSourceWorkflowStoresWith(remote): %v", err)
+	}
+	if got := remoteProviders[remoteCity]; got != "exec:/tmp/remote-beads" {
+		t.Fatalf("remote candidate provider = %q, want custom exec provider unchanged", got)
 	}
 }
 
@@ -8788,5 +9363,199 @@ func TestCmdSlingMultiDefaultTargetsEmptyEntryRejected(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "empty entry") {
 		t.Errorf("stderr = %q, want to mention 'empty entry'", stderr.String())
+	}
+}
+
+// --- Wake-on-dispatch default tests (doctrine R3, ga-ih41e3) ---
+//
+// gc sling previously left a parked/asleep target sitting on newly-routed
+// work until a human or orchestrator noticed and ran `gc session nudge` by
+// hand (the only production caller of the session package's asleep->awake
+// wake transition was, until this fix, gated behind an opt-in --nudge flag
+// nobody passed by default). These tests prove wake-on-dispatch is now the
+// default and --no-nudge is the opt-out, without touching internal/sling's
+// own already-exhaustive SlingOpts.Nudge test coverage.
+
+func TestEffectiveSlingNudge(t *testing.T) {
+	cases := []struct {
+		nudge, noNudge, want bool
+	}{
+		{false, false, true}, // no flags: wake-on-dispatch is the default
+		{true, false, true},  // --nudge: redundant with the default, still true
+		{false, true, false}, // --no-nudge: explicit opt-out
+	}
+	for _, tc := range cases {
+		if got := effectiveSlingNudge(tc.nudge, tc.noNudge); got != tc.want {
+			t.Errorf("effectiveSlingNudge(%v, %v) = %v, want %v", tc.nudge, tc.noNudge, got, tc.want)
+		}
+	}
+}
+
+func TestNoNudgeFlagExists(t *testing.T) {
+	cmd := newSlingCmd(&bytes.Buffer{}, &bytes.Buffer{})
+	if cmd.Flags().Lookup("no-nudge") == nil {
+		t.Fatal("missing --no-nudge flag")
+	}
+}
+
+// Mirrors TestRunReportsMutuallyExclusiveFlagViolations's pattern for the new
+// --nudge/--no-nudge pair.
+func TestNudgeAndNoNudgeMutuallyExclusive(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"sling", "target", "bd-1", "--nudge", "--no-nudge"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("run returned 0; expected non-zero. stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "nudge") || !strings.Contains(stderr.String(), "no-nudge") {
+		t.Fatalf("stderr did not name the conflicting flags; got %q", stderr.String())
+	}
+}
+
+// setupCmdSlingSingleFixedAgentFixture creates a city with one fixed
+// (non-pool) worker agent in the "foundations" rig and pre-seeds the bead
+// fo-1 in the rig store. Mirrors setupCmdSlingMultiDefaultTargetsFixture but
+// with an explicit single target, for tests that sling by name rather than
+// relying on default_sling_targets.
+func setupCmdSlingSingleFixedAgentFixture(t *testing.T) (cityDir, rigDir string) {
+	t.Helper()
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir = t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_CITY_ROOT", "")
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
+	rigDir = filepath.Join(cityDir, "foundations")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(rig): %v", err)
+	}
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatalf("ensureScopedFileStoreLayout: %v", err)
+	}
+	for _, dir := range []string{cityDir, rigDir} {
+		if err := ensurePersistedScopeLocalFileStore(dir); err != nil {
+			t.Fatalf("ensurePersistedScopeLocalFileStore(%s): %v", dir, err)
+		}
+	}
+	writeTestFileStoreBeads(t, rigDir, []beads.Bead{{
+		ID:       "fo-1",
+		Title:    "wake-on-dispatch test bead",
+		Type:     "task",
+		Status:   "open",
+		Metadata: map[string]string{},
+	}})
+
+	cityToml := `[workspace]
+name = "demo"
+
+[[rigs]]
+name = "foundations"
+path = "foundations"
+prefix = "fo"
+
+[[agent]]
+name = "worker-a"
+dir = "foundations"
+max_active_sessions = 1
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Chdir(cityDir)
+	return cityDir, rigDir
+}
+
+// TestCmdSlingDefaultAttemptsNudgeWithoutFlag proves the actual defect this
+// bead (ga-ih41e3, doctrine R3 "wake-on-dispatch") fixes: a plain, flagless
+// `gc sling <target> <bead>` now attempts to wake the target -- the same
+// queued-nudge outcome TestDoSlingNudgeFixedAgent/TestDoSlingNudgeNoSession
+// already prove for an explicit opts.Nudge=true, reached here through no
+// --nudge flag at all.
+func TestCmdSlingDefaultAttemptsNudgeWithoutFlag(t *testing.T) {
+	cityDir, rigDir := setupCmdSlingSingleFixedAgentFixture(t)
+
+	prevPoller := startNudgePoller
+	startNudgePoller = func(_, _, _ string) error { return nil }
+	t.Cleanup(func() { startNudgePoller = prevPoller })
+
+	var stdout, stderr bytes.Buffer
+	noNudgeFlagNotPassed := false
+	nudgeFlagNotPassed := false
+	code := cmdSling(
+		[]string{"foundations/worker-a", "fo-1"},
+		false, effectiveSlingNudge(nudgeFlagNotPassed, noNudgeFlagNotPassed), false,
+		"", nil, "",
+		false, false, false, "",
+		false, false, false,
+		"", "",
+		&stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	rigStore, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	routed, err := rigStore.Get("fo-1")
+	if err != nil {
+		t.Fatalf("rigStore.Get(fo-1): %v", err)
+	}
+	if routed.Metadata["gc.routed_to"] != "foundations/worker-a" {
+		t.Fatalf("gc.routed_to = %q, want foundations/worker-a", routed.Metadata["gc.routed_to"])
+	}
+
+	t.Logf("DIAGNOSTIC stdout=%q stderr=%q", stdout.String(), stderr.String())
+	pending, _, dead, err := listQueuedNudges(cityDir, "foundations/worker-a", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 1 || len(dead) != 0 {
+		t.Fatalf("pending=%d dead=%d, want 1/0 -- default sling should wake the target without --nudge", len(pending), len(dead))
+	}
+}
+
+// TestCmdSlingNoNudgeSuppressesWake proves --no-nudge opts back out of the
+// new default, preserving the old route-only behavior for callers that want
+// it (e.g. a batch caller nudging once at the end itself).
+func TestCmdSlingNoNudgeSuppressesWake(t *testing.T) {
+	cityDir, rigDir := setupCmdSlingSingleFixedAgentFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	noNudgeFlagPassed := true
+	code := cmdSling(
+		[]string{"foundations/worker-a", "fo-1"},
+		false, effectiveSlingNudge(false, noNudgeFlagPassed), false,
+		"", nil, "",
+		false, false, false, "",
+		false, false, false,
+		"", "",
+		&stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	rigStore, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	routed, err := rigStore.Get("fo-1")
+	if err != nil {
+		t.Fatalf("rigStore.Get(fo-1): %v", err)
+	}
+	if routed.Metadata["gc.routed_to"] != "foundations/worker-a" {
+		t.Fatalf("gc.routed_to = %q, want foundations/worker-a (routing must still happen)", routed.Metadata["gc.routed_to"])
+	}
+
+	pending, _, _, err := listQueuedNudges(cityDir, "foundations/worker-a", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending=%d, want 0 -- --no-nudge must suppress the wake attempt", len(pending))
 	}
 }

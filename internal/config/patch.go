@@ -69,6 +69,9 @@ type AgentPatch struct {
 	MaxSessionAge *string `toml:"max_session_age,omitempty"`
 	// MaxSessionAgeJitter overrides the max session age jitter. Duration string (e.g., "15m").
 	MaxSessionAgeJitter *string `toml:"max_session_age_jitter,omitempty"`
+	// AssignedWorkDeferLimit overrides Agent.AssignedWorkDeferLimit (see that
+	// field for semantics).
+	AssignedWorkDeferLimit *int `toml:"assigned_work_defer_limit,omitempty"`
 	// SleepAfterIdle overrides idle sleep policy for this agent. Accepts a
 	// duration string or "off".
 	SleepAfterIdle *string `toml:"sleep_after_idle,omitempty"`
@@ -250,6 +253,10 @@ type ProviderPatch struct {
 	ReadyDelayMs *int `toml:"ready_delay_ms,omitempty" jsonschema:"minimum=0"`
 	// AcceptStartupDialogs overrides startup dialog acceptance behavior.
 	AcceptStartupDialogs *bool `toml:"accept_startup_dialogs,omitempty"`
+	// MaxSeats overrides the provider's concurrent active-session cap
+	// (nil = patch does not touch max_seats; same nil/-1/N semantics as
+	// ProviderSpec.MaxSeats once applied).
+	MaxSeats *int `toml:"max_seats,omitempty"`
 	// Env adds or overrides environment variables.
 	Env map[string]string `toml:"env,omitempty"`
 	// EnvRemove lists env var keys to remove.
@@ -493,6 +500,9 @@ func applyAgentMutation(a *Agent, p *AgentPatch, sleepSource string) {
 	}
 	if p.MaxSessionAgeJitter != nil {
 		a.MaxSessionAgeJitter = *p.MaxSessionAgeJitter
+	}
+	if p.AssignedWorkDeferLimit != nil {
+		a.AssignedWorkDeferLimit = p.AssignedWorkDeferLimit
 	}
 	if p.SleepAfterIdle != nil {
 		a.SleepAfterIdle = NormalizeSleepAfterIdle(*p.SleepAfterIdle)
@@ -772,6 +782,9 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 		if patch.AcceptStartupDialogs != nil {
 			newSpec.AcceptStartupDialogs = cloneBoolPtr(patch.AcceptStartupDialogs)
 		}
+		if patch.MaxSeats != nil {
+			newSpec.MaxSeats = cloneIntPtr(patch.MaxSeats)
+		}
 		if len(patch.Env) > 0 {
 			newSpec.Env = make(map[string]string, len(patch.Env))
 			for k, v := range patch.Env {
@@ -817,6 +830,9 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 	}
 	if patch.AcceptStartupDialogs != nil {
 		spec.AcceptStartupDialogs = cloneBoolPtr(patch.AcceptStartupDialogs)
+	}
+	if patch.MaxSeats != nil {
+		spec.MaxSeats = cloneIntPtr(patch.MaxSeats)
 	}
 	// Env: additive merge.
 	if len(patch.Env) > 0 {

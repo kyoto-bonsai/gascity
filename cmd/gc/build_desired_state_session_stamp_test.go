@@ -238,3 +238,111 @@ func TestStampRunSessionIdentityToleratesLengthMismatchAndNilSnapshot(t *testing
 		t.Errorf("expected no writes on degenerate input, got %d", store.writes)
 	}
 }
+
+// ga-kk6mke: a bead parked on gc.awaiting can legitimately end up Assignee'd
+// to a live session (ga-982pdy R1 — the claim is rightful, gc.awaiting is
+// never a claim-eligibility gate). This reconciler must not then repoint the
+// parked bead's gc.work_dir at that session's own directory, destroying the
+// resume pointer ga-tk5mcg's incremental-persistence discipline depends on.
+func TestStampRunSessionIdentitySkipsWorkDirOnAwaitingParkedBead(t *testing.T) {
+	run := beads.Bead{
+		ID: "ga-parked", Type: "bug", Status: "in_progress", Assignee: "worker-b",
+		Metadata: map[string]string{"gc.awaiting": "validator", "gc.work_dir": "/real-home-of-ga-parked"},
+	}
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{run}, nil)
+	store := &countingStore{Store: mem}
+	sessions := newSessionBeadSnapshot([]beads.Bead{stampTestSession("worker-b", "/worker-b-cwd-elsewhere")})
+
+	stampRunSessionIdentity([]beads.Bead{run}, []beads.Store{store}, sessions, io.Discard)
+
+	got, _ := mem.Get("ga-parked")
+	if got.Metadata["gc.work_dir"] != "/real-home-of-ga-parked" {
+		t.Errorf("gc.work_dir = %q, want unchanged /real-home-of-ga-parked (must not repoint an awaiting-parked bead)", got.Metadata["gc.work_dir"])
+	}
+	// gc.session_name IS still accurate — the assignee genuinely is this
+	// session — and must still be recorded.
+	if got.Metadata["gc.session_name"] != "worker-b" {
+		t.Errorf("gc.session_name = %q, want %q (assignee is genuinely this session)", got.Metadata["gc.session_name"], "worker-b")
+	}
+}
+
+// Adjacent-class control for the test above: same reassignment shape (a
+// differing prior gc.work_dir on an in_progress bead now assigned to a new
+// live session) but with NO gc.awaiting set. This is
+// TestStampRunSessionIdentityReassignmentRestamps in different words — kept
+// here as an explicit discriminating control so the awaiting-parked guard
+// above is proven to trigger on gc.awaiting specifically, not on "prior
+// work_dir differs from the session's."
+func TestStampRunSessionIdentityStillStampsWorkDirWithoutAwaiting(t *testing.T) {
+	run := beads.Bead{
+		ID: "ga-not-parked", Type: "bug", Status: "in_progress", Assignee: "worker-b",
+		Metadata: map[string]string{"gc.work_dir": "/stale"},
+	}
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{run}, nil)
+	store := &countingStore{Store: mem}
+	sessions := newSessionBeadSnapshot([]beads.Bead{stampTestSession("worker-b", "/fresh")})
+
+	stampRunSessionIdentity([]beads.Bead{run}, []beads.Store{store}, sessions, io.Discard)
+
+	got, _ := mem.Get("ga-not-parked")
+	if got.Metadata["gc.work_dir"] != "/fresh" {
+		t.Errorf("gc.work_dir = %q, want /fresh (no gc.awaiting — normal reconciliation must still apply)", got.Metadata["gc.work_dir"])
+	}
+}
+
+// A freshly (incidentally) claimed awaiting-parked bead with no work_dir on
+// record yet must not be backfilled with the claiming session's directory
+// either — an empty value is not "nothing to lose," since a later resumer
+// would otherwise read the incidental claimer's cwd as this bead's home.
+func TestStampRunSessionIdentitySkipsWorkDirOnAwaitingParkedBeadWithNoPriorWorkDir(t *testing.T) {
+	run := beads.Bead{
+		ID: "ga-freshly-parked", Type: "bug", Status: "in_progress", Assignee: "worker-b",
+		Metadata: map[string]string{"gc.awaiting": "close_decision"},
+	}
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{run}, nil)
+	store := &countingStore{Store: mem}
+	sessions := newSessionBeadSnapshot([]beads.Bead{stampTestSession("worker-b", "/incidental-claimer-cwd")})
+
+	stampRunSessionIdentity([]beads.Bead{run}, []beads.Store{store}, sessions, io.Discard)
+
+	got, _ := mem.Get("ga-freshly-parked")
+	if got.Metadata["gc.work_dir"] != "" {
+		t.Errorf("gc.work_dir = %q, want empty (must not backfill an awaiting-parked bead's work_dir from an incidental claimer)", got.Metadata["gc.work_dir"])
+	}
+}
+
+// Root-propagation mirrors the same guard: a workflow root parked on its own
+// gc.awaiting must keep its real work_dir even when a worked step back-fills
+// session identity onto it.
+func TestStampRunSessionIdentityRootPropagationSkipsWorkDirWhenRootAwaitingParked(t *testing.T) {
+	const sn = "worker-b"
+	const wd = "/worker-b-cwd"
+	root := beads.Bead{
+		ID: "gpk-root-parked", Type: "molecule", Status: "in_progress",
+		Metadata: map[string]string{"gc.kind": "workflow", "gc.awaiting": "close_decision", "gc.work_dir": "/real-root-home"},
+	}
+	step := beads.Bead{
+		ID: "gpk-step-parked", Type: "step", Status: "in_progress", Assignee: sn,
+		Metadata: map[string]string{"gc.step_ref": "wf.work", "gc.root_bead_id": "gpk-root-parked"},
+	}
+	mem := beads.NewMemStoreFrom(0, []beads.Bead{root, step}, nil)
+	store := &countingStore{Store: mem}
+	sessions := newSessionBeadSnapshot([]beads.Bead{stampTestSession(sn, wd)})
+
+	stampRunSessionIdentity([]beads.Bead{step}, []beads.Store{store}, sessions, io.Discard)
+
+	gotRoot, _ := mem.Get("gpk-root-parked")
+	if gotRoot.Metadata["gc.work_dir"] != "/real-root-home" {
+		t.Errorf("root gc.work_dir = %q, want unchanged /real-root-home (root is awaiting-parked)", gotRoot.Metadata["gc.work_dir"])
+	}
+	if gotRoot.Metadata["gc.session_name"] != sn {
+		t.Errorf("root gc.session_name = %q, want %q (still propagated)", gotRoot.Metadata["gc.session_name"], sn)
+	}
+	// The step itself carries no gc.awaiting, so its own work_dir still
+	// stamps normally — only the root's independent awaiting status gates
+	// the root's own work_dir.
+	gotStep, _ := mem.Get("gpk-step-parked")
+	if gotStep.Metadata["gc.work_dir"] != wd {
+		t.Errorf("step gc.work_dir = %q, want %q (step itself is not awaiting-parked)", gotStep.Metadata["gc.work_dir"], wd)
+	}
+}

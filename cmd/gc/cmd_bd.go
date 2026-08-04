@@ -116,8 +116,12 @@ auto-export behavior, invoke bd directly.`,
 	return cmd
 }
 
-var bdBeadExists = func(cityPath string, target execStoreTarget, beadID string) bool {
-	store, err := openStoreAtForCity(target.ScopeRoot, cityPath)
+// bdBeadExists reports whether a bead ID resolves in a candidate store. It is
+// called only to decide which store a bd invocation is scoped to, so it takes
+// the city config the caller already loaded: without it, every candidate probe
+// re-loaded the whole city config inside the store open.
+var bdBeadExists = func(cityPath string, cfg *config.City, target execStoreTarget, beadID string) bool {
+	store, err := openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
 	if err != nil {
 		return false
 	}
@@ -219,7 +223,7 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	target, err := resolveBdScopeTarget(cfg, cityPath, rigName, bdArgs, cityName != "")
+	target, err := resolveBdScopeTarget(cfg, cityPath, rigName, bdArgs, cityName != "", stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -229,7 +233,7 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		return doBdReleaseIfCurrent(cityPath, target, id, expectedAssignee, stdout, stderr)
+		return doBdReleaseIfCurrent(cityPath, cfg, target, id, expectedAssignee, stdout, stderr)
 	}
 	if provider := rawBeadsProviderForScope(target.ScopeRoot, cityPath); !providerUsesBdStoreContract(provider) {
 		fmt.Fprintf(stderr, "gc bd: only supported for bd-backed beads providers (resolved %q for %s)\n", provider, target.ScopeRoot) //nolint:errcheck // best-effort stderr
@@ -259,23 +263,36 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	//
 	// Note: gc bd show (read passthrough) does NOT have this guard and still
 	// substring-resolves. That is intentional — reads are non-destructive.
+	//
+	// guardStore/guardBeads capture the store this guard opens and the beads
+	// it reads so the work-record close gate below can reuse them instead of
+	// opening the store and re-fetching the same bead a second time.
+	var (
+		guardStore beads.Store
+		guardBeads map[string]beads.Bead
+	)
 	if writeIDs, writeOK, ambiguous := bdMutationWriteIDs(bdArgs); writeOK {
 		if ambiguous {
 			fmt.Fprintf(stderr, "gc bd: cannot safely verify bead IDs (unrecognized flag in args %v); aborting to prevent substring-resolution mutation of the wrong bead\n", bdArgs) //nolint:errcheck // best-effort stderr
 			return 1
 		}
 		if len(writeIDs) > 0 {
-			store, storeErr := openStoreAtForCity(target.ScopeRoot, cityPath)
+			store, storeErr := openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
 			// Store-unavailable: we cannot verify, but we must not block
 			// legitimate writes. Fall through; bd will error on actual problems.
 			if storeErr == nil {
+				guardStore = store
+				guardBeads = make(map[string]beads.Bead, len(writeIDs))
 				for _, id := range writeIDs {
-					_, getErr := store.Get(id)
+					bead, getErr := store.Get(id)
 					if errors.Is(getErr, beads.ErrIDCollision) {
 						// bd resolved a different bead — block the write to prevent
 						// mutating the wrong bead via substring resolution.
 						fmt.Fprintf(stderr, "gc bd: bead %q resolved to a different bead ID (substring collision); aborting to prevent mutating the wrong bead\n", id) //nolint:errcheck // best-effort stderr
 						return 1
+					}
+					if getErr == nil {
+						guardBeads[id] = bead
 					}
 					// ErrNotFound or any other error: bead may be absent, ephemeral,
 					// or the read seam differs from the write seam — fall through.
@@ -284,11 +301,32 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Already-closed guard (ga-11quqf): bd close on an issue that is already
+	// closed currently succeeds silently and overwrites the prior
+	// close_reason/verdict with no record a conflicting close ever happened --
+	// exactly the shape that let two concurrent same-persona sessions each
+	// successfully close ga-e1y5k8 with different verdicts and never notice
+	// (second caller wins, first caller's verdict vanishes silently). Mirrors
+	// bd's own existing unsatisfied-dependency-gate refusal (refuse by
+	// default, -f/--force to override) rather than inventing a new UX shape.
+	// Deliberately narrow per officer triage (2026-07-15 00:59): a compare-
+	// and-swap on the single already-closed condition, not a general claim-
+	// lock/mutex across all consequential actions -- that question is tracked
+	// separately and left unrouted pending its own ADR (ga-7funca).
+	if ids, ok := bdAlreadyClosedCheckTargets(bdArgs); ok {
+		if closed := bdAlreadyClosedIDs(ids, target.ScopeRoot, cityPath); len(closed) > 0 {
+			fmt.Fprintf(stderr, "gc bd: %s already closed; refusing to re-close (this would silently overwrite the existing close_reason with no record a conflicting close occurred). Pass -f/--force to override.\n", strings.Join(closed, ", ")) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
+
 	// Work-record close gate (ADR-0009): a close routed through the SDK seam
 	// must satisfy the typed work-record contract (gc.work_outcome present;
 	// shipped ⇒ gc.work_commit reachable on gc.work_branch). Warn-only by default;
-	// blocks the close only when GC_WORK_RECORD_ENFORCE is set.
-	if runWorkRecordCloseGate(bdArgs, target.ScopeRoot, cityPath, stderr) {
+	// blocks the close only when GC_WORK_RECORD_ENFORCE is set. Reuses the
+	// store/beads the write-ID guard above already opened and read, and the
+	// config the caller already loaded.
+	if runWorkRecordCloseGate(bdArgs, target.ScopeRoot, cityPath, cfg, guardStore, guardBeads, stderr) {
 		return 1
 	}
 
@@ -357,7 +395,166 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return bdSilentFallbackExitCode
 	}
 
+	// bd has been observed to persist the status transition on `bd close`
+	// while silently dropping a long/multi-paragraph --reason value from
+	// close_reason (ga-ntd4x4). This is a distinct failure from the
+	// managed-Dolt silent-fallback checked above: status itself persists
+	// correctly here, so no stderr marker fires. Root cause is inside the
+	// bd binary, not this passthrough, so there is nothing to fix in the
+	// write path — verify the read-back instead of trusting bd's exit code
+	// for this one field.
+	if ids, ok := bdCloseReasonCheckTargets(bdArgs); ok {
+		verifyBdCloseReasonPersisted(ids, target.ScopeRoot, cityPath, stderr)
+	}
+
 	return 0
+}
+
+// bdCloseReasonCheckTargets reports the bead IDs to verify and whether a
+// non-empty --reason/-r/--reason-file was supplied on a `bd close` command,
+// so the caller can confirm close_reason actually persisted (ga-ntd4x4).
+// Only "close" is checked: "update" does not accept --reason at all — it is
+// absent from bdSubcmdValueFlags("update"), so a --reason on update trips
+// the ambiguous-flag guard above and never reaches bd's write path in the
+// first place (a confusing error, but not a persistence bug).
+func bdCloseReasonCheckTargets(args []string) (ids []string, ok bool) {
+	if len(args) == 0 || args[0] != "close" {
+		return nil, false
+	}
+	writeIDs, writeOK, ambiguous := bdMutationWriteIDs(args)
+	if !writeOK || ambiguous || len(writeIDs) == 0 {
+		return nil, false
+	}
+	if !bdCloseReasonSupplied(args) {
+		return nil, false
+	}
+	return writeIDs, true
+}
+
+// bdCloseReasonSupplied reports whether a `bd close` argument list carries a
+// non-empty -r/--reason/--reason-file value. Callers must have already
+// confirmed (via bdMutationWriteIDs) that every flag in args is a recognized
+// "close" flag, so every "-"-prefixed token here is a known flag from
+// bdSubcmdValueFlags("close") or bdSubcmdBoolFlags("close").
+func bdCloseReasonSupplied(args []string) bool {
+	valueFlags := bdSubcmdValueFlags("close")
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "-r" || arg == "--reason" {
+			return i+1 < len(args) && strings.TrimSpace(args[i+1]) != ""
+		}
+		if rest, isReasonEq := strings.CutPrefix(arg, "--reason="); isReasonEq {
+			return strings.TrimSpace(rest) != ""
+		}
+		if arg == "--reason-file" || strings.HasPrefix(arg, "--reason-file=") {
+			return true
+		}
+		if strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") {
+			flagName := strings.TrimLeft(arg, "-")
+			longForm, shortForm := "--"+flagName, "-"+flagName
+			if valueFlags[longForm] || (len(flagName) == 1 && valueFlags[shortForm]) {
+				i++ // skip this flag's value argument
+			}
+		}
+	}
+	return false
+}
+
+// verifyBdCloseReasonPersisted re-reads each closed bead and warns (does not
+// block — this runs after bd has already exited 0) if a supplied --reason
+// did not end up in close_reason. Store-unavailable or per-id read errors
+// are silently skipped: this is a best-effort audit check, not a gate, and
+// must never turn a healthy close into a false alarm over an unrelated
+// read-path hiccup.
+func verifyBdCloseReasonPersisted(ids []string, scopeRoot, cityPath string, stderr io.Writer) {
+	store, err := openStoreAtForCity(scopeRoot, cityPath)
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		b, err := store.Get(id)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(b.Metadata["close_reason"]) == "" {
+			fmt.Fprintf(stderr, "gc bd: warning: --reason was supplied for %s but close_reason did not persist; verify manually via `gc bd show %s` (see ga-ntd4x4)\n", id, id) //nolint:errcheck // best-effort stderr
+		}
+	}
+}
+
+// bdCloseForceSupplied reports whether a `bd close` argument list carries the
+// -f/--force boolean flag. Callers must have already confirmed (via
+// bdMutationWriteIDs) that every flag in args is a recognized "close" flag,
+// so every "-"-prefixed token here is a known flag from
+// bdSubcmdValueFlags("close") or bdSubcmdBoolFlags("close") -- same
+// precondition as bdCloseReasonSupplied.
+func bdCloseForceSupplied(args []string) bool {
+	valueFlags := bdSubcmdValueFlags("close")
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "-f" || arg == "--force" {
+			return true
+		}
+		if strings.HasPrefix(arg, "-") && !strings.Contains(arg, "=") {
+			flagName := strings.TrimLeft(arg, "-")
+			longForm, shortForm := "--"+flagName, "-"+flagName
+			if valueFlags[longForm] || (len(flagName) == 1 && valueFlags[shortForm]) {
+				i++ // skip this flag's value argument
+			}
+		}
+	}
+	return false
+}
+
+// bdAlreadyClosedCheckTargets reports the bead IDs to verify and whether the
+// already-closed guard should run at all (ga-11quqf): only for a `bd close`
+// invocation that did not supply -f/--force. bd already refuses to close a
+// bead with unresolved dependencies -- this mirrors that same refuse-by-
+// default/--force-to-override shape for the different hazard of re-closing a
+// bead that is already closed, which the dependency gate does not catch
+// (there is no unresolved dependency the second time around; the bead is
+// just already closed).
+func bdAlreadyClosedCheckTargets(args []string) (ids []string, ok bool) {
+	if len(args) == 0 || args[0] != "close" {
+		return nil, false
+	}
+	if bdCloseForceSupplied(args) {
+		return nil, false
+	}
+	writeIDs, writeOK, ambiguous := bdMutationWriteIDs(args)
+	if !writeOK || ambiguous || len(writeIDs) == 0 {
+		return nil, false
+	}
+	return writeIDs, true
+}
+
+// bdAlreadyClosedIDs re-reads each candidate bead and returns the subset that
+// is already closed -- the set doBd must refuse to re-close. Store-
+// unavailable or per-id read errors are treated as "cannot verify, do not
+// block": this guard exists to prevent a KNOWN silent overwrite, not to add a
+// new way for an unrelated read-path hiccup to block a legitimate close.
+func bdAlreadyClosedIDs(ids []string, scopeRoot, cityPath string) []string {
+	store, err := openStoreAtForCity(scopeRoot, cityPath)
+	if err != nil {
+		return nil
+	}
+	var closed []string
+	for _, id := range ids {
+		b, err := store.Get(id)
+		if err != nil {
+			continue
+		}
+		if b.Status == "closed" {
+			closed = append(closed, id)
+		}
+	}
+	return closed
 }
 
 func parseBdReleaseIfCurrentArgs(args []string) (id, expectedAssignee string, ok bool, err error) {
@@ -487,8 +684,8 @@ func bdMutationWriteID(args []string) (string, bool) {
 	return ids[0], true
 }
 
-func doBdReleaseIfCurrent(cityPath string, target execStoreTarget, id, expectedAssignee string, stdout, stderr io.Writer) int {
-	store, err := openStoreAtForCity(target.ScopeRoot, cityPath)
+func doBdReleaseIfCurrent(cityPath string, cfg *config.City, target execStoreTarget, id, expectedAssignee string, stdout, stderr io.Writer) int {
+	store, err := openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd release-if-current: opening store: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -566,9 +763,27 @@ func extractRigFlag(args []string) (string, []string) {
 	return rigName, rest
 }
 
+// extractBdDirectoryFlag returns the -C / --directory value from bd passthrough
+// args, or "" if not present. The flag is left in args so bd itself still sees it.
+func extractBdDirectoryFlag(args []string) string {
+	for i := 0; i < len(args); i++ {
+		switch {
+		case (args[i] == "-C" || args[i] == "--directory") && i+1 < len(args):
+			return args[i+1]
+		case strings.HasPrefix(args[i], "--directory="):
+			return strings.TrimPrefix(args[i], "--directory=")
+		}
+	}
+	return ""
+}
+
 // resolveBdScopeTarget determines the canonical scope root for a bd command.
-// Priority: explicit rig name > explicit city > bead prefix auto-detection > GC_RIG env > enclosing rig > city root.
-func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []string, cityExplicit bool) (execStoreTarget, error) {
+// Priority: explicit rig name > explicit city > bead prefix auto-detection > -C dir rig match > GC_RIG env > enclosing rig > city root.
+//
+// stderr receives a best-effort warning when a set-but-unresolvable GC_RIG is
+// discarded (see the GC_RIG block below); pass io.Discard when the caller does
+// not care.
+func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []string, cityExplicit bool, stderr io.Writer) (execStoreTarget, error) {
 	resolveRigPaths(cityPath, cfg.Rigs)
 	if rigName != "" {
 		rig, ok := rigByName(cfg, rigName)
@@ -598,7 +813,7 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 			if strings.HasPrefix(arg, "-") || beadPrefix(cfg, arg) != cityPrefix {
 				continue
 			}
-			if bdBeadExists(cityPath, cityTarget, arg) {
+			if bdBeadExists(cityPath, cfg, cityTarget, arg) {
 				return cityTarget, nil
 			}
 		}
@@ -617,9 +832,22 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 				continue
 			}
 			target := bdRigScopeTarget(cityPath, rig)
-			if bdBeadExists(cityPath, target, arg) {
+			if bdBeadExists(cityPath, cfg, target, arg) {
 				return target, nil
 			}
+		}
+	}
+
+	// Honor -C / --directory passed to bd: if it names a path inside a
+	// registered rig, use that rig's store. This lets `gc bd create -C
+	// /path/to/packs-rig ...` route to the packs rig even when GC_RIG
+	// or cwd point elsewhere. The flag stays in bdArgs so bd itself still
+	// sees it and changes directory accordingly.
+	if cdDir := extractBdDirectoryFlag(args); cdDir != "" {
+		if rig, ok, err := resolveRigForDir(cfg, cityPath, cdDir); err != nil {
+			return execStoreTarget{}, err
+		} else if ok {
+			return bdRigScopeTarget(cityPath, rig), nil
 		}
 	}
 
@@ -630,23 +858,44 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 	// GC_RIG reliably, while cwd detection fails for polecat worktrees (they
 	// live under .gc/worktrees/, not the configured rig path).
 	// Priority: explicit --rig > bead-prefix detect > GC_RIG env > cwd > city.
+	gcRigDiscarded := ""
 	if gcRig := strings.TrimSpace(os.Getenv("GC_RIG")); gcRig != "" {
 		if rig, ok := rigByName(cfg, gcRig); ok && strings.TrimSpace(rig.Path) != "" {
 			return bdRigScopeTarget(cityPath, rig), nil
 		}
-		// GC_RIG names an unknown or unbound rig — fall through to cwd/city
-		// rather than erroring, so cross-city queries still work from rig agents.
+		// GC_RIG names an unknown or unbound rig. Unlike an explicit --rig
+		// (which exits 1 on the identical value), we do not error: falling
+		// through to cwd/city keeps cross-city queries working from rig agents
+		// whose GC_RIG names a rig this city does not bind. But the discard
+		// must not be silent — a stale or typo'd GC_RIG would otherwise
+		// redirect a query to a different store than the operator intended with
+		// no diagnostic, while the same value via --rig fails loudly. Record it
+		// and warn below, naming the store actually answered.
+		gcRigDiscarded = gcRig
 	}
 
+	target := cityTarget
 	if rig, ok, err := bdRigFromCwd(cfg, cityPath); err != nil {
 		return execStoreTarget{}, err
 	} else if ok {
 		// resolveRigForDir already skips unbound rigs, so rig.Path is
 		// guaranteed non-empty here.
-		return bdRigScopeTarget(cityPath, rig), nil
+		target = bdRigScopeTarget(cityPath, rig)
 	}
 
-	return cityTarget, nil
+	if gcRigDiscarded != "" {
+		fmt.Fprintf(stderr, "gc bd: warning: GC_RIG=%q does not name a bound rig in this city; ignoring it and answering from the %s store instead (the same value via --rig would exit 1)\n", gcRigDiscarded, scopeLabel(target)) //nolint:errcheck // best-effort stderr
+	}
+	return target, nil
+}
+
+// scopeLabel renders a store target for operator-facing diagnostics, e.g.
+// `city` or `rig "packs"`.
+func scopeLabel(t execStoreTarget) string {
+	if t.ScopeKind == "rig" && strings.TrimSpace(t.RigName) != "" {
+		return fmt.Sprintf("rig %q", t.RigName)
+	}
+	return t.ScopeKind
 }
 
 func bdRigForArg(cfg *config.City, arg string) (config.Rig, bool) {

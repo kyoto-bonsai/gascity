@@ -2,6 +2,9 @@ package events
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,7 +63,7 @@ func TestReadFilteredWithInFlightIncludesRotatingFiles(t *testing.T) {
 
 	// Baseline: ReadFiltered lists only .gz archives + active, so it MISSES the
 	// in-flight window (seq 2,3) — the exact drop this guards.
-	base, err := ReadFiltered(path, Filter{})
+	base, err := ReadFiltered(context.Background(), path, Filter{})
 	if err != nil {
 		t.Fatalf("ReadFiltered: %v", err)
 	}
@@ -69,7 +72,7 @@ func TestReadFilteredWithInFlightIncludesRotatingFiles(t *testing.T) {
 	}
 
 	// ReadFilteredWithInFlight folds the rotating window back in, in seq order.
-	all, err := ReadFilteredWithInFlight(path, Filter{})
+	all, err := ReadFilteredWithInFlight(context.Background(), path, Filter{})
 	if err != nil {
 		t.Fatalf("ReadFilteredWithInFlight: %v", err)
 	}
@@ -78,7 +81,7 @@ func TestReadFilteredWithInFlightIncludesRotatingFiles(t *testing.T) {
 	}
 
 	// AfterSeq fully excludes the rotating window (last seq 3 <= 3) without opening it.
-	after, err := ReadFilteredWithInFlight(path, Filter{AfterSeq: 3})
+	after, err := ReadFilteredWithInFlight(context.Background(), path, Filter{AfterSeq: 3})
 	if err != nil {
 		t.Fatalf("ReadFilteredWithInFlight(AfterSeq=3): %v", err)
 	}
@@ -108,12 +111,94 @@ func TestReadFilteredWithInFlightDedupsArchiveRotatingOverlap(t *testing.T) {
 	}
 	writeJSONLEvents(t, path, 4)
 
-	all, err := ReadFilteredWithInFlight(path, Filter{})
+	all, err := ReadFilteredWithInFlight(context.Background(), path, Filter{})
 	if err != nil {
 		t.Fatalf("ReadFilteredWithInFlight: %v", err)
 	}
 	if got := seqsOf(all); !reflect.DeepEqual(got, []uint64{2, 3, 4}) {
 		t.Fatalf("overlap seqs = %v, want [2 3 4] (deduped)", got)
+	}
+}
+
+func TestReadFilteredWithInFlightKeepsLimitForStableArchives(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	firstSource := filepath.Join(dir, "first-archive-source.jsonl")
+	writeJSONLEvents(t, firstSource, 1, 2)
+	firstArchive := filepath.Join(dir, formatArchiveBasename(time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC), 1, 2))
+	if err := gzipAndArchive(firstSource, firstArchive, &stderr); err != nil {
+		t.Fatalf("gzip first archive: %v", err)
+	}
+	secondSource := filepath.Join(dir, "second-archive-source.jsonl")
+	writeJSONLEvents(t, secondSource, 3, 4)
+	secondArchive := filepath.Join(dir, formatArchiveBasename(time.Date(2026, 5, 7, 12, 5, 0, 0, time.UTC), 3, 4))
+	if err := gzipAndArchive(secondSource, secondArchive, &stderr); err != nil {
+		t.Fatalf("gzip second archive: %v", err)
+	}
+	writeJSONLEvents(t, path, 5)
+
+	got, err := ReadFilteredWithInFlight(context.Background(), path, Filter{Limit: 1})
+	if err != nil {
+		t.Fatalf("ReadFilteredWithInFlight: %v", err)
+	}
+	if seqs := seqsOf(got); !reflect.DeepEqual(seqs, []uint64{1}) {
+		t.Fatalf("limited stable-archive seqs = %v, want [1]", seqs)
+	}
+}
+
+func TestReadFilteredWithInFlightSurvivesRotatingPromotion(t *testing.T) {
+	for _, timing := range []string{"between scans", "between list and open"} {
+		t.Run(timing, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "events.jsonl")
+			rotating := filepath.Join(dir, "events.jsonl.rotating-20260507T120500Z-seq-1-2")
+			archive := filepath.Join(dir, formatArchiveBasename(time.Date(2026, 5, 7, 12, 5, 0, 0, time.UTC), 1, 2))
+			writeJSONLEvents(t, rotating, 1, 2)
+			writeJSONLEvents(t, path, 3)
+
+			promoted := false
+			promote := func() {
+				if promoted {
+					return
+				}
+				promoted = true
+				var stderr bytes.Buffer
+				if err := gzipAndArchive(rotating, archive, &stderr); err != nil {
+					t.Fatalf("promote rotating file: %v (stderr %q)", err, stderr.String())
+				}
+			}
+
+			previous := readRotationDir
+			t.Cleanup(func() { readRotationDir = previous })
+			readRotationDir = func(path string) ([]os.DirEntry, error) {
+				switch timing {
+				case "between scans":
+					// ReadFiltered's archive snapshot has already completed. Promote
+					// before the post-active snapshot so that snapshot sees only the
+					// newly-installed archive and no rotating source.
+					promote()
+					return os.ReadDir(path)
+				case "between list and open":
+					// Return the stale rotating entry after promoting it. The reader
+					// must open the derived archive fallback when the source vanishes.
+					entries, err := os.ReadDir(path)
+					promote()
+					return entries, err
+				default:
+					t.Fatalf("unknown promotion timing %q", timing)
+					return nil, nil
+				}
+			}
+
+			got, err := ReadFilteredWithInFlight(context.Background(), path, Filter{})
+			if err != nil {
+				t.Fatalf("ReadFilteredWithInFlight: %v", err)
+			}
+			if seqs := seqsOf(got); !reflect.DeepEqual(seqs, []uint64{1, 2, 3}) {
+				t.Fatalf("promotion-safe seqs = %v, want [1 2 3]", seqs)
+			}
+		})
 	}
 }
 
@@ -155,7 +240,7 @@ func TestReadAllSpansArchivesAndActive(t *testing.T) {
 	dir := seedRecorderWithRotation(t, 4, 3)
 	path := filepath.Join(dir, "events.jsonl")
 
-	got, err := ReadAll(path)
+	got, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +277,7 @@ func TestReadFilteredSkipsNonOverlappingArchives(t *testing.T) {
 	path := filepath.Join(dir, "events.jsonl")
 
 	// AfterSeq=4 → archive (seqs 1..4) is fully excluded; only anchor + post events.
-	got, err := ReadFiltered(path, Filter{AfterSeq: 4})
+	got, err := ReadFiltered(context.Background(), path, Filter{AfterSeq: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +295,7 @@ func TestReadFilteredAcrossArchivesAppliesPredicates(t *testing.T) {
 	dir := seedRecorderWithRotation(t, 4, 3)
 	path := filepath.Join(dir, "events.jsonl")
 
-	got, err := ReadFiltered(path, Filter{Type: BeadCreated})
+	got, err := ReadFiltered(context.Background(), path, Filter{Type: BeadCreated})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +314,7 @@ func TestReadFilteredAcrossArchivesAppliesLimit(t *testing.T) {
 	dir := seedRecorderWithRotation(t, 4, 3)
 	path := filepath.Join(dir, "events.jsonl")
 
-	got, err := ReadFiltered(path, Filter{Limit: 2})
+	got, err := ReadFiltered(context.Background(), path, Filter{Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +385,7 @@ func TestReadAllSurvivesMultipleRotations(t *testing.T) {
 	//   3 rotations × 3 events = 9 batch events
 	//   3 anchors (from rotations 1, 2, 3)
 	//   1 tail = 13 events
-	got, err := ReadAll(path)
+	got, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,11 +403,58 @@ func TestReadAllSurvivesMultipleRotations(t *testing.T) {
 	}
 }
 
+// TestReadFilteredIncludesEventWithinArchiveSubSecondWindow pins the exact
+// silent-drop scenario from #4628: the archive filename records only the
+// whole-second-truncated rotation instant, so the true rotation (and any
+// event legitimately appended just before it) can land anywhere within that
+// truncation second. A Since inside that same second must still surface the
+// event rather than have the archive skip-fast past it ungunzipped. The
+// archive is built directly with a fixed rotation timestamp (not via a real
+// ForceRotate) so the test is deterministic and independent of wall-clock
+// timing.
+func TestReadFilteredIncludesEventWithinArchiveSubSecondWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+
+	// Filename truncates to the whole second; the true rotation instant (and
+	// the event inside the archive) can be anywhere in
+	// [rotationSecond, rotationSecond+1s) — here, 900ms in, mirroring the
+	// bug report's own worked example.
+	rotationSecond := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	eventTs := rotationSecond.Add(500 * time.Millisecond)
+
+	line, err := json.Marshal(Event{Seq: 1, Type: BeadCreated, Ts: eventTs, Actor: "human", Subject: "sub-second"})
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	src := filepath.Join(dir, "archive-source.jsonl")
+	if err := os.WriteFile(src, append(line, '\n'), 0o644); err != nil {
+		t.Fatalf("write archive source: %v", err)
+	}
+	archive := filepath.Join(dir, formatArchiveBasename(rotationSecond, 1, 1))
+	var stderr bytes.Buffer
+	if err := gzipAndArchive(src, archive, &stderr); err != nil {
+		t.Fatalf("gzipAndArchive: %v", err)
+	}
+
+	// Since falls after the filename's floored instant but before the
+	// event's actual sub-second timestamp — exactly the window the old
+	// skip-fast check misjudged.
+	since := rotationSecond.Add(250 * time.Millisecond)
+	got, err := ReadFiltered(context.Background(), path, Filter{Since: since})
+	if err != nil {
+		t.Fatalf("ReadFiltered: %v", err)
+	}
+	if len(got) != 1 || got[0].Seq != 1 {
+		t.Fatalf("ReadFiltered(Since=%v) = %v, want the sub-second event (seq 1)", since, got)
+	}
+}
+
 func TestReadFilteredHandlesMissingArchiveDir(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "no-such-dir", "events.jsonl")
 
-	got, err := ReadFiltered(missing, Filter{})
+	got, err := ReadFiltered(context.Background(), missing, Filter{})
 	if err != nil {
 		t.Errorf("ReadFiltered missing dir: %v", err)
 	}
@@ -343,11 +475,281 @@ func TestReadFilteredIgnoresUnrelatedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := ReadFiltered(path, Filter{})
+	got, err := ReadFiltered(context.Background(), path, Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 6 {
 		t.Fatalf("ReadFiltered returned %d events, want 6 (3 pre + 1 anchor + 2 post)", len(got))
+	}
+}
+
+// TestReadFilteredTailCrossesArchiveBoundary is the reader-level fix for
+// ga-96zjze: a sparse type whose active-file occurrences don't fill the
+// requested tail must extend into archives (newest first), not stop short.
+func TestReadFilteredTailCrossesArchiveBoundary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 20 pre-rotate events; every 4th (i=0,4,8,12,16 -> seq 1,5,9,13,17) is the
+	// sparse type under test, mirroring convoy.closed's low density in the
+	// original repro.
+	for i := 0; i < 20; i++ {
+		typ := BeadClosed
+		if i%4 == 0 {
+			typ = ConvoyClosed
+		}
+		rec.Record(Event{Type: typ, Actor: "human", Subject: fmt.Sprintf("s%d", i)})
+	}
+	res, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	if res.Done != nil {
+		<-res.Done
+	}
+	// Active file after rotation: anchor (seq 21) + 2 more, only one matching.
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "post-0"})   // seq 22
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "post-1"}) // seq 23
+	rec.Close()                                                              //nolint:errcheck // test cleanup
+
+	// Active file alone has exactly 1 match (seq 23) — short of limit=3, so
+	// this must reach into the archive for the newest 2 of its 5 matches
+	// (seq 13, 17), not the oldest 2 (seq 1, 5).
+	got, err := ReadFilteredTail(context.Background(), path, Filter{Type: ConvoyClosed}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seqs := seqsOf(got); !reflect.DeepEqual(seqs, []uint64{13, 17, 23}) {
+		t.Fatalf("tail seqs = %v, want [13 17 23] (newest 3 matches, ascending — not the oldest 3)", seqs)
+	}
+}
+
+// TestReadFilteredTailFewerMatchesThanLimit is the explicit pagination
+// correctness check called for on ga-96zjze: requesting more matches than
+// exist anywhere in retained history (including zero) must return exactly
+// what exists — not panic, truncate wrong, or duplicate — not merely be fast.
+func TestReadFilteredTailFewerMatchesThanLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "c1"}) // seq 1
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "n1"})   // seq 2
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "c2"}) // seq 3
+	res, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	if res.Done != nil {
+		<-res.Done
+	}
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "n2"}) // seq 5, no more matches anywhere
+	rec.Close()                                                        //nolint:errcheck // test cleanup
+
+	// Total ConvoyClosed matches across all retained history = 2. Requesting
+	// 5 must return exactly those 2, in order, not hang and not error.
+	got, err := ReadFilteredTail(context.Background(), path, Filter{Type: ConvoyClosed}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Subject != "c1" || got[1].Subject != "c2" {
+		t.Fatalf("got %+v, want exactly [c1 c2] (exhausted history, fewer than limit)", got)
+	}
+
+	// A type with zero occurrences anywhere: the unavoidable full-history
+	// case. Must terminate cleanly with an empty result, not hang.
+	none, err := ReadFilteredTail(context.Background(), path, Filter{Type: "totally.absent.type"}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("got %d events for a never-emitted type, want 0", len(none))
+	}
+}
+
+// TestReadFilteredTailDoesNotOpenUnneededOlderArchives proves the early-exit
+// is real, not just correct: this is ga-96zjze's actual complaint (a sparse
+// type forcing a full decompress of every archive) rendered as a test that
+// fails loudly if the bound regresses. The oldest archive is replaced with
+// garbage that errors on open; if the newest archive plus the active file
+// already satisfy the request, the corrupted archive must never be touched.
+func TestReadFilteredTailDoesNotOpenUnneededOlderArchives(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Archive 1 (oldest): seq 1..5, all matching — would satisfy the request
+	// on its own, which is exactly why it must never be opened.
+	for i := 0; i < 5; i++ {
+		rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: fmt.Sprintf("old-%d", i)})
+	}
+	res1, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate 1: %v", err)
+	}
+	if res1.Done != nil {
+		<-res1.Done
+	}
+
+	// Archive 2 (newest): seq 6..9 (anchor, match, match, noise).
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "new-0"})
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "new-1"})
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "new-2"})
+	res2, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate 2: %v", err)
+	}
+	if res2.Done != nil {
+		<-res2.Done
+	}
+
+	rec.Record(Event{Type: ConvoyClosed, Actor: "human", Subject: "active"}) // seq 11
+	rec.Close()                                                              //nolint:errcheck // test cleanup
+
+	archives, err := archiveFilesIn(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 2 {
+		t.Fatalf("want 2 archives, got %d", len(archives))
+	}
+	oldest := filepath.Join(dir, archives[0].Basename) // ascending FirstSeq: [0] is the oldest
+	if err := os.WriteFile(oldest, []byte("not a gzip file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Active (1 match) + newest archive's 2 matches satisfy limit=2 without
+	// ever needing the corrupted oldest archive.
+	got, err := ReadFilteredTail(context.Background(), path, Filter{Type: ConvoyClosed}, 2)
+	if err != nil {
+		t.Fatalf("ReadFilteredTail errored — it must not have opened the corrupted older archive: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2", len(got))
+	}
+	if got[0].Subject != "new-1" || got[1].Subject != "active" {
+		t.Fatalf("subjects = [%s %s], want [new-1 active]", got[0].Subject, got[1].Subject)
+	}
+}
+
+// TestReadFilteredTailStopsOnCanceledContext is ga-tk5mcg.10's discriminating
+// test for the ListTail path: an abandoned caller must stop the archive walk,
+// not merely receive a bounded-but-still-executed one (that was ga-96zjze;
+// this is the request's LIFETIME, not its bound). Both archives are corrupted
+// so the test fails loudly — a decompress error, not context.Canceled — if
+// cancellation stops being checked before a corrupted archive is opened.
+// Same technique as TestReadFilteredTailDoesNotOpenUnneededOlderArchives
+// (the older ga-96zjze regression guard for this same file), applied to ctx
+// instead of the early-satisfied-request case.
+func TestReadFilteredTailStopsOnCanceledContext(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: fmt.Sprintf("old-%d", i)})
+	}
+	res1, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate 1: %v", err)
+	}
+	if res1.Done != nil {
+		<-res1.Done
+	}
+	for i := 0; i < 3; i++ {
+		rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: fmt.Sprintf("new-%d", i)})
+	}
+	res2, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate 2: %v", err)
+	}
+	if res2.Done != nil {
+		<-res2.Done
+	}
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "active"})
+	rec.Close() //nolint:errcheck // test cleanup
+
+	archives, err := archiveFilesIn(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 2 {
+		t.Fatalf("want 2 archives, got %d", len(archives))
+	}
+	for _, a := range archives {
+		if err := os.WriteFile(filepath.Join(dir, a.Basename), []byte("not a gzip file"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A type with zero occurrences anywhere: the active file alone can never
+	// satisfy limit=2, so an uncanceled call MUST fall into the archive walk
+	// (matching TestReadFilteredTailFewerMatchesThanLimit's worst case) —
+	// which is exactly why a canceled call must stop before it gets there.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = ReadFilteredTail(ctx, path, Filter{Type: "totally.absent.type"}, 2)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled (a decompress error here means a corrupted archive was opened after cancellation)", err)
+	}
+}
+
+// TestReadFilteredStopsOnCanceledContext is TestReadFilteredTailStopsOnCanceledContext's
+// counterpart for the List/ListInFlight fallback path (readFilteredTracked's
+// own per-archive loop, independent of ListTail's early-exit machinery).
+func TestReadFilteredStopsOnCanceledContext(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+	rec, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "old-0"})
+	res, err := rec.ForceRotate()
+	if err != nil {
+		t.Fatalf("ForceRotate: %v", err)
+	}
+	if res.Done != nil {
+		<-res.Done
+	}
+	rec.Record(Event{Type: BeadClosed, Actor: "human", Subject: "active"})
+	rec.Close() //nolint:errcheck // test cleanup
+
+	archives, err := archiveFilesIn(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 1 {
+		t.Fatalf("want 1 archive, got %d", len(archives))
+	}
+	if err := os.WriteFile(filepath.Join(dir, archives[0].Basename), []byte("not a gzip file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = ReadFiltered(ctx, path, Filter{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled (a decompress error here means the corrupted archive was opened after cancellation)", err)
 	}
 }

@@ -415,3 +415,193 @@ func TestCheckStability_TerminalErrorScreen_MarksTerminalNotCrash(t *testing.T) 
 		t.Errorf("last_woke_at = %q, want cleared after terminal classification", got)
 	}
 }
+
+// ga-5gsyts: quota/credit exhaustion must quarantine-and-retry, NOT mark the
+// session terminal/drainable like TestCheckStability_TerminalErrorScreen_
+// MarksTerminalNotCrash above — this is the actual bug tonight's outage
+// traced back to ("seats died and were mass-replaced" instead of pausing).
+func TestCheckStability_ResourceExhaustionScreen_QuarantinesNotTerminal(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := newTestStore()
+	dt := newDrainTracker()
+
+	session := makeBead("b1", map[string]string{
+		"last_woke_at":        now.Add(-10 * time.Second).Format(time.RFC3339),
+		"wake_attempts":       "3", // a real crash would push us to 4
+		"session_key":         "provider-conversation",
+		"started_config_hash": "config",
+	})
+
+	peek := func(_ int) (string, error) {
+		return "API Error: Your credit balance is too low to access the Claude API.", nil
+	}
+
+	_, stab := checkStability(seedSessionInfo(session), nil, false, dt, sessionFrontDoor(store), clk, peek)
+	syncBeadFromStore(&session, store)
+	if !stab {
+		t.Fatal("checkStability should return true when it records a resource-exhaustion quarantine")
+	}
+	if got := session.Metadata["wake_attempts"]; got != "3" {
+		t.Errorf("wake_attempts = %q, want 3; a resource-exhaustion quarantine must not count as a crash", got)
+	}
+	if got := session.Metadata["state"]; got != "asleep" {
+		t.Errorf("state = %q, want asleep", got)
+	}
+	if got := session.Metadata["sleep_reason"]; got != string(sessionpkg.SleepReasonProviderResourceExhausted) {
+		t.Errorf("sleep_reason = %q, want %q", got, string(sessionpkg.SleepReasonProviderResourceExhausted))
+	}
+	if got := session.Metadata["provider_resource_exhaustion_reason"]; got != "credit_exhausted" {
+		t.Errorf("provider_resource_exhaustion_reason = %q, want credit_exhausted", got)
+	}
+	if got := session.Metadata["quarantined_until"]; got == "" {
+		t.Error("quarantined_until = \"\", want a future timestamp set")
+	}
+	// The whole point of the fix: unlike markProviderTerminalError, this path
+	// must NOT mark the session unhealthy/drainable — a topped-up account is
+	// fully usable again once the quarantine window clears, not permanently
+	// excluded from pool sizing.
+	if got := session.Metadata[sessionHealthStateMetadataKey]; got != "" {
+		t.Errorf("%s = %q, want unset (resource exhaustion is not a terminal error)", sessionHealthStateMetadataKey, got)
+	}
+	if got := session.Metadata[sessionDrainableMetadataKey]; got != "" {
+		t.Errorf("%s = %q, want unset (resource exhaustion is not a terminal error)", sessionDrainableMetadataKey, got)
+	}
+	if got := session.Metadata[sessionProviderTerminalErrorMetadataKey]; got != "" {
+		t.Errorf("%s = %q, want unset (resource exhaustion is not a terminal error)", sessionProviderTerminalErrorMetadataKey, got)
+	}
+	// Conversation identity preserved — a topped-up/reset account should
+	// resume the SAME conversation, not restart from zero (ga-uwptpu's own
+	// failure mode, the incident this whole durability wave traces back to).
+	if got := session.Metadata["session_key"]; got != "provider-conversation" {
+		t.Errorf("session_key = %q, want preserved", got)
+	}
+	if got := session.Metadata["started_config_hash"]; got != "config" {
+		t.Errorf("started_config_hash = %q, want preserved", got)
+	}
+	// Edge-triggered, same as rate-limit/terminal-error: last_woke_at cleared
+	// so this isn't re-evaluated as a fresh crash on the next tick.
+	if got := session.Metadata["last_woke_at"]; got != "" {
+		t.Errorf("last_woke_at = %q, want cleared after quarantine classification", got)
+	}
+}
+
+// Quota-class detection must win over the (now narrower) terminal-error
+// detection when both could theoretically be in view — asserts the ordering
+// in checkRateLimitStability, not just that each detector works in isolation.
+func TestCheckStability_QuotaExceeded_QuarantinesNotTerminal(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := newTestStore()
+	dt := newDrainTracker()
+
+	session := makeBead("b1", map[string]string{
+		"last_woke_at": now.Add(-10 * time.Second).Format(time.RFC3339),
+	})
+
+	peek := func(_ int) (string, error) {
+		return "insufficient_quota: billing required", nil
+	}
+
+	_, stab := checkStability(seedSessionInfo(session), nil, false, dt, sessionFrontDoor(store), clk, peek)
+	syncBeadFromStore(&session, store)
+	if !stab {
+		t.Fatal("checkStability should return true when it records a quota-exhaustion quarantine")
+	}
+	if got := session.Metadata["sleep_reason"]; got != string(sessionpkg.SleepReasonProviderResourceExhausted) {
+		t.Errorf("sleep_reason = %q, want %q", got, string(sessionpkg.SleepReasonProviderResourceExhausted))
+	}
+	if got := session.Metadata["provider_resource_exhaustion_reason"]; got != "quota_exceeded" {
+		t.Errorf("provider_resource_exhaustion_reason = %q, want quota_exceeded", got)
+	}
+	if got := session.Metadata[sessionHealthStateMetadataKey]; got != "" {
+		t.Errorf("%s = %q, want unset", sessionHealthStateMetadataKey, got)
+	}
+}
+
+// ga-5gsyts, operator ruling 2026-07-26: best-effort login-expiry patterns
+// must quarantine-and-retry, not mark terminal, and must preserve
+// conversation identity so a re-authenticated seat resumes instead of
+// restarting from zero (ga-uwptpu's own failure mode).
+func TestCheckStability_LoginExpiredScreen_QuarantinesNotTerminal(t *testing.T) {
+	now := time.Date(2026, 7, 26, 14, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := newTestStore()
+	dt := newDrainTracker()
+
+	session := makeBead("b1", map[string]string{
+		"last_woke_at":        now.Add(-10 * time.Second).Format(time.RFC3339),
+		"wake_attempts":       "3", // a real crash would push us to 4
+		"session_key":         "provider-conversation",
+		"started_config_hash": "config",
+	})
+
+	peek := func(_ int) (string, error) {
+		return "Session expired. Please run /login to continue.", nil
+	}
+
+	_, stab := checkStability(seedSessionInfo(session), nil, false, dt, sessionFrontDoor(store), clk, peek)
+	syncBeadFromStore(&session, store)
+	if !stab {
+		t.Fatal("checkStability should return true when it records a login-expired quarantine")
+	}
+	if got := session.Metadata["wake_attempts"]; got != "3" {
+		t.Errorf("wake_attempts = %q, want 3; a login-expired quarantine must not count as a crash", got)
+	}
+	if got := session.Metadata["state"]; got != "asleep" {
+		t.Errorf("state = %q, want asleep", got)
+	}
+	if got := session.Metadata["sleep_reason"]; got != string(sessionpkg.SleepReasonLoginExpired) {
+		t.Errorf("sleep_reason = %q, want %q", got, string(sessionpkg.SleepReasonLoginExpired))
+	}
+	if got := session.Metadata["quarantined_until"]; got == "" {
+		t.Error("quarantined_until = \"\", want a future timestamp set")
+	}
+	if got := session.Metadata[sessionHealthStateMetadataKey]; got != "" {
+		t.Errorf("%s = %q, want unset (login expiry is not a terminal error)", sessionHealthStateMetadataKey, got)
+	}
+	if got := session.Metadata[sessionDrainableMetadataKey]; got != "" {
+		t.Errorf("%s = %q, want unset (login expiry is not a terminal error)", sessionDrainableMetadataKey, got)
+	}
+	// Conversation identity preserved — the whole point per ga-uwptpu.
+	if got := session.Metadata["session_key"]; got != "provider-conversation" {
+		t.Errorf("session_key = %q, want preserved", got)
+	}
+	if got := session.Metadata["started_config_hash"]; got != "config" {
+		t.Errorf("started_config_hash = %q, want preserved", got)
+	}
+	if got := session.Metadata["last_woke_at"]; got != "" {
+		t.Errorf("last_woke_at = %q, want cleared after quarantine classification", got)
+	}
+}
+
+// Login-expiry detection must win over both the resource-exhaustion and
+// terminal-error detectors when checked in sequence — asserts the actual
+// ordering in checkRateLimitStability, not just that each detector works in
+// isolation.
+func TestCheckStability_LoginExpired_WinsOverOtherClassifiers(t *testing.T) {
+	now := time.Date(2026, 7, 26, 14, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := newTestStore()
+	dt := newDrainTracker()
+
+	session := makeBead("b1", map[string]string{
+		"last_woke_at": now.Add(-10 * time.Second).Format(time.RFC3339),
+	})
+
+	// Pane content that plausibly contains BOTH a login-expiry cue and
+	// unrelated noise, confirming the login-expiry branch is checked first
+	// and short-circuits (matches checkRateLimitStability's source order).
+	peek := func(_ int) (string, error) {
+		return "oauth token refresh failed: invalid_grant\nPlease run /login to continue.", nil
+	}
+
+	_, stab := checkStability(seedSessionInfo(session), nil, false, dt, sessionFrontDoor(store), clk, peek)
+	syncBeadFromStore(&session, store)
+	if !stab {
+		t.Fatal("checkStability should return true")
+	}
+	if got := session.Metadata["sleep_reason"]; got != string(sessionpkg.SleepReasonLoginExpired) {
+		t.Errorf("sleep_reason = %q, want %q", got, string(sessionpkg.SleepReasonLoginExpired))
+	}
+}

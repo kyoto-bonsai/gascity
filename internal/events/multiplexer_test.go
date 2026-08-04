@@ -564,6 +564,14 @@ func TestParseCursorFormatCursor(t *testing.T) {
 			t.Errorf("round-trip: %q = %d, want %d", k, m2[k], v)
 		}
 	}
+
+	malformed := ParseCursor("alpha:nope,beta:7")
+	if _, ok := malformed["alpha"]; ok {
+		t.Fatalf("ParseCursor retained malformed alpha sequence: %v", malformed)
+	}
+	if malformed["beta"] != 7 {
+		t.Fatalf("ParseCursor beta = %d, want 7", malformed["beta"])
+	}
 }
 
 func TestWrapForSSE(t *testing.T) {
@@ -620,8 +628,8 @@ func (p *providerWithoutTail) Record(e Event) {
 	p.fake.Record(e)
 }
 
-func (p *providerWithoutTail) List(filter Filter) ([]Event, error) {
-	return p.fake.List(filter)
+func (p *providerWithoutTail) List(ctx context.Context, filter Filter) ([]Event, error) {
+	return p.fake.List(ctx, filter)
 }
 
 func (p *providerWithoutTail) LatestSeq() (uint64, error) {
@@ -651,12 +659,12 @@ func (p *blockingProvider) release() {
 
 func (p *blockingProvider) Record(Event) {}
 
-func (p *blockingProvider) List(Filter) ([]Event, error) {
+func (p *blockingProvider) List(context.Context, Filter) ([]Event, error) {
 	<-p.unblock
 	return nil, context.Canceled
 }
 
-func (p *blockingProvider) ListTail(Filter, int) ([]Event, error) {
+func (p *blockingProvider) ListTail(context.Context, Filter, int) ([]Event, error) {
 	<-p.unblock
 	return nil, context.Canceled
 }

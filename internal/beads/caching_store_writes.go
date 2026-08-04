@@ -3,6 +3,8 @@ package beads
 import (
 	"errors"
 	"fmt"
+	"maps"
+	"strings"
 	"time"
 )
 
@@ -195,20 +197,49 @@ func (c *CachingStore) Close(id string) error {
 		return err
 	}
 
+	// Adopt the successful refresh read: it carries the post-close revision,
+	// which Get→conditional-write consumers fence against — patching only the
+	// cached entry's status would keep serving the pre-close revision forever.
+	// Status is still forced to closed: the close is proven committed, but
+	// backings with read visibility lag can serve the pre-close row on this
+	// refresh. A lagged revision is self-healing (a fenced write against it
+	// precondition-fails and evicts); a lagged status is not — Get would
+	// report a bead this process just closed as still active.
 	var closed Bead
 	var found bool
+	var refreshed bool
+	var closeReason string
 	if fresh, err := c.backing.Get(id); err == nil {
 		closed = fresh
 		closed.Status = "closed"
+		// The post-close refresh carries close_reason (folded into Metadata by
+		// the store read path); the cached copy below predates the close and
+		// does not. Capture it so the bead.closed notification keeps it even
+		// when the cached copy wins (ga-xvwsdw: events never carried
+		// close_reason, so downstream gate-verdict classification was dead).
+		closeReason = strings.TrimSpace(fresh.Metadata["close_reason"])
 		found = true
+		refreshed = true
 	} else if !errors.Is(err, ErrNotFound) {
 		c.recordProblem("refresh bead after close", fmt.Errorf("%s: %w", id, err))
 	}
 
 	c.mu.Lock()
 	c.noteLocalMutationLocked(id)
-	if b, ok := c.beads[id]; ok {
+	if refreshed {
+		c.absorbFreshLocked(id, closed, time.Now(), absorbOpts{
+			depsMode:   depsKeepCached,
+			seqMode:    seqKeep,
+			clearDirty: true,
+		})
+	} else if b, ok := c.beads[id]; ok {
 		b.Status = "closed"
+		if closeReason != "" && b.Metadata["close_reason"] == "" {
+			meta := make(StringMap, len(b.Metadata)+1)
+			maps.Copy(meta, b.Metadata)
+			meta["close_reason"] = closeReason
+			b.Metadata = meta
+		}
 		c.absorbFreshLocked(id, b, time.Now(), absorbOpts{
 			depsMode:   depsKeepCached,
 			seqMode:    seqKeep,
@@ -216,12 +247,6 @@ func (c *CachingStore) Close(id string) error {
 		})
 		closed = cloneBead(b)
 		found = true
-	} else if found {
-		c.absorbFreshLocked(id, closed, time.Now(), absorbOpts{
-			depsMode:   depsKeepCached,
-			seqMode:    seqKeep,
-			clearDirty: true,
-		})
 	}
 	dependentProjectionCleared := c.clearDependentReadyProjectionsLocked(id)
 	if found || dependentProjectionCleared {
@@ -242,19 +267,29 @@ func (c *CachingStore) Reopen(id string) error {
 		return err
 	}
 
+	// Adopt the successful refresh read with the status written through —
+	// same reasoning as Close.
 	var reopened Bead
 	var found bool
+	var refreshed bool
 	if fresh, err := c.backing.Get(id); err == nil {
 		reopened = fresh
 		reopened.Status = "open"
 		found = true
+		refreshed = true
 	} else if !errors.Is(err, ErrNotFound) {
 		c.recordProblem("refresh bead after reopen", fmt.Errorf("%s: %w", id, err))
 	}
 
 	c.mu.Lock()
 	c.noteLocalMutationLocked(id)
-	if b, ok := c.beads[id]; ok {
+	if refreshed {
+		c.absorbFreshLocked(id, reopened, time.Now(), absorbOpts{
+			depsMode:   depsKeepCached,
+			seqMode:    seqKeep,
+			clearDirty: true,
+		})
+	} else if b, ok := c.beads[id]; ok {
 		b.Status = "open"
 		c.absorbFreshLocked(id, b, time.Now(), absorbOpts{
 			depsMode:   depsKeepCached,
@@ -263,12 +298,6 @@ func (c *CachingStore) Reopen(id string) error {
 		})
 		reopened = cloneBead(b)
 		found = true
-	} else if found {
-		c.absorbFreshLocked(id, reopened, time.Now(), absorbOpts{
-			depsMode:   depsKeepCached,
-			seqMode:    seqKeep,
-			clearDirty: true,
-		})
 	}
 	dependentProjectionCleared := c.clearDependentReadyProjectionsLocked(id)
 	if found || dependentProjectionCleared {
@@ -410,6 +439,13 @@ func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error 
 		return nil
 	}
 	if err := c.backing.SetMetadataBatch(id, kvs); err != nil {
+		// The backing may have rejected, partially committed, or fully committed
+		// the batch before returning an error. Fence the cached pre-write row
+		// until an ordinary read installs backing truth.
+		c.mu.Lock()
+		c.noteMutationLocked(id)
+		c.markDirtyLocked(id)
+		c.mu.Unlock()
 		return err
 	}
 
@@ -450,6 +486,20 @@ func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error 
 		c.notifyChange("bead.updated", updated)
 	}
 	return nil
+}
+
+// SetLocalString delegates directly to the backing store. Clone-local data
+// is never cached or notified: it isn't part of Bead.Metadata, so there is
+// no cached Bead field to keep in sync, and (unlike SetMetadata) writing it
+// never invokes bd's subprocess/hook path, so there is no idempotence check
+// to save a redundant call.
+func (c *CachingStore) SetLocalString(id, key, value string) error {
+	return c.backing.SetLocalString(id, key, value)
+}
+
+// GetLocalString delegates directly to the backing store. See SetLocalString.
+func (c *CachingStore) GetLocalString(id, key string) (string, error) {
+	return c.backing.GetLocalString(id, key)
 }
 
 func (c *CachingStore) refreshBeadAfterWrite(id, op string) (Bead, bool) {

@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
@@ -103,6 +104,27 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 			return result, err
 		}
 	}
+	if shouldCheckOfficerOfRecord(opts) {
+		deriveOfficerOfRecord(opts, deps)
+		if err := checkOfficerOfRecord(opts, deps); err != nil {
+			return result, err
+		}
+	}
+	if shouldCheckLiveRoutingConflict(opts) {
+		if err := checkLiveRoutingConflict(opts, deps); err != nil {
+			return result, err
+		}
+	}
+	if shouldCheckTargetDispatchable(opts) {
+		if err := checkTargetDispatchable(opts, deps); err != nil {
+			return result, err
+		}
+	}
+	if shouldCheckTargetAssigneeConflict(opts) {
+		if err := checkTargetAssigneeConflict(opts, deps); err != nil {
+			return result, err
+		}
+	}
 	if shouldGuardCrossRig(opts) {
 		if err := CrossRigRouteError(opts.BeadOrFormula, a, deps.Cfg); err != nil {
 			return result, err
@@ -135,7 +157,7 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 	// claim filter even after sling sets gc.routed_to: clearing the assignee
 	// alone is not enough because IsReadyCandidate requires status=open. See
 	// gastownhall/gascity#1007 (assignee) and #3231 (status).
-	if opts.Reassign && !opts.DryRun {
+	if shouldReopenForReassign(opts) {
 		if err := reopenForReassign(opts.BeadOrFormula, deps); err != nil {
 			return result, fmt.Errorf("reopening %s for reassign: %w", opts.BeadOrFormula, err)
 		}
@@ -174,7 +196,7 @@ func resolveIdempotentShortCircuit(opts SlingOpts, a config.Agent, deps SlingDep
 		NoConvoy: opts.NoConvoy,
 	})
 	if check.Idempotent {
-		needsAttach, probeErr := onFormulaNeedsAttachment(opts, querier, deps)
+		decision, probeErr := onFormulaNeedsAttachment(opts, querier, deps)
 		switch {
 		case probeErr != nil:
 			// The attachment probe failed, so we cannot prove the routed bead
@@ -184,11 +206,21 @@ func resolveIdempotentShortCircuit(opts SlingOpts, a config.Agent, deps SlingDep
 			result.BeadWarnings = append(result.BeadWarnings, fmt.Sprintf(
 				"could not verify molecule attachment for %s; treating --on as an idempotent no-op: %v",
 				opts.BeadOrFormula, probeErr))
-		case needsAttach:
+		case decision.NeedsAttach:
 			// The bead is routed to the target but carries no molecule — an
 			// earlier plain sling routed it raw. Do not treat --on as an
 			// idempotent no-op; fall through so the formula attaches.
 			check.Idempotent = false
+		case decision.SkippedForClaim:
+			// Another worker already claimed this bead and no molecule is
+			// attached. Idempotency is preserved deliberately (do not re-attach
+			// onto in-progress work), but say so explicitly: without this
+			// warning the CLI prints only the generic "already routed" message,
+			// giving no signal that the requested --on formula was never
+			// attached or that --force would override the skip.
+			result.BeadWarnings = append(result.BeadWarnings, fmt.Sprintf(
+				"bead %s is claimed by %s with no molecule attached; --on %s was skipped to avoid re-attaching onto in-progress work — rerun with --force to attach it anyway",
+				opts.BeadOrFormula, decision.Assignee, opts.OnFormula))
 		}
 	}
 	if !check.Idempotent {
@@ -238,6 +270,19 @@ func usesFormulaBackedRoute(opts SlingOpts) bool {
 	return opts.OnFormula != "" || (!opts.NoFormula && opts.Target.EffectiveDefaultSlingFormula() != "")
 }
 
+// shouldCheckOfficerOfRecord reports whether preflight should enforce the
+// gc.officer_of_record gate for this sling. Mirrors shouldValidateExistingBead's
+// applicability condition (a formula LAUNCH creates a fresh bead that cannot
+// carry pre-existing metadata; a dry-run inline-text preview never resolves a
+// real target bead either — there is nothing to check officer_of_record ON in
+// either case). This governs APPLICABILITY only. Unlike every other preflight
+// check, it is deliberately never additionally gated on !opts.Force: a --force
+// bypass is exactly what rigs/personas/ariadne-plan-persona-standards-2026-07-25.md
+// phase_2_slinggate ruling (a) retires ("no hotfix escape, no exceptions").
+func shouldCheckOfficerOfRecord(opts SlingOpts) bool {
+	return !opts.IsFormula && (!opts.DryRun || !opts.InlineText)
+}
+
 func shouldCheckDepCycle(opts SlingOpts) bool {
 	// Only meaningful for plain-bead slinging where a bead ID is known.
 	// Formula slinging creates new molecules whose deps aren't bead-graph deps.
@@ -253,6 +298,22 @@ func shouldCheckBeadState(opts SlingOpts) bool {
 	return !opts.IsFormula && !opts.Force && (!opts.DryRun || !opts.InlineText)
 }
 
+// attachmentDecision is the result of onFormulaNeedsAttachment: whether an
+// --on formula attach should proceed on an otherwise-idempotent routed bead,
+// and, when it should not, why -- so the caller can distinguish "nothing to
+// do" (a molecule is already attached) from "skipped because another worker
+// owns this bead" (SkippedForClaim), which needs its own warning rather than
+// silently folding into the generic idempotent no-op.
+type attachmentDecision struct {
+	NeedsAttach bool
+	// SkippedForClaim is true when the bead has no molecule but is already
+	// claimed (Assignee set), so the attach was intentionally skipped rather
+	// than performed. Only meaningful when NeedsAttach is false.
+	SkippedForClaim bool
+	// Assignee is the claiming identity when SkippedForClaim is true.
+	Assignee string
+}
+
 // onFormulaNeedsAttachment reports whether this is an --on sling whose target
 // bead the caller has already determined reads Idempotent (gc.routed_to ==
 // target, or pool-labeled) but that has no attached molecule yet. The
@@ -264,33 +325,50 @@ func shouldCheckBeadState(opts SlingOpts) bool {
 // molecule; a stale one is burned).
 //
 // The returned error is non-nil only when the molecule-attachment probe could
-// not complete. In that case the result is (false, err): the caller cannot
-// prove the bead is unmoleculed, so it must preserve the fail-closed idempotent
-// state rather than clear it and risk minting a duplicate attachment.
-func onFormulaNeedsAttachment(opts SlingOpts, querier BeadQuerier, deps SlingDeps) (bool, error) {
+// not complete. In that case the result is (attachmentDecision{}, err): the
+// caller cannot prove the bead is unmoleculed, so it must preserve the
+// fail-closed idempotent state rather than clear it and risk minting a
+// duplicate attachment.
+func onFormulaNeedsAttachment(opts SlingOpts, querier BeadQuerier, deps SlingDeps) (attachmentDecision, error) {
 	if opts.OnFormula == "" {
-		return false, nil
+		return attachmentDecision{}, nil
 	}
 	hasMolecule, err := HasMoleculeChildren(querier, opts.BeadOrFormula, deps.Store)
 	if err != nil {
-		return false, err
+		return attachmentDecision{}, err
 	}
 	if hasMolecule {
-		return false, nil
+		return attachmentDecision{}, nil
 	}
 	// No molecule attached. Only override idempotency for an UNCLAIMED bead — the
 	// routed-raw footgun (gc.routed_to set, no assignee, no molecule). If a worker
 	// has already claimed it (assignee set), leave it idempotent rather than
-	// re-attaching a formula onto work in progress.
+	// re-attaching a formula onto work in progress -- but report the claim so the
+	// caller can warn that the attach was skipped, distinctly from "already done".
 	bead, ok := BeadFromGetters(opts.BeadOrFormula, querier, deps.Store)
 	if !ok {
-		return false, nil
+		return attachmentDecision{}, nil
 	}
-	return strings.TrimSpace(bead.Assignee) == "", nil
+	assignee := strings.TrimSpace(bead.Assignee)
+	if assignee == "" {
+		return attachmentDecision{NeedsAttach: true}, nil
+	}
+	return attachmentDecision{SkippedForClaim: true, Assignee: assignee}, nil
 }
 
 func shouldValidateBuiltInRouteStoreReachable(opts SlingOpts, deps SlingDeps) bool {
 	return deps.Router != nil && !opts.IsFormula && !opts.DryRun
+}
+
+// shouldReopenForReassign reports whether the pre-flight reassign reopen should
+// run. Reassign reopens opts.BeadOrFormula, so it is only meaningful when that
+// value is a real bead ID: a plain-bead route or an --on-formula attach, both
+// !IsFormula. A standalone formula launch sets BeadOrFormula to the formula
+// NAME, so reopening it would clear/reopen an unrelated bead that happens to
+// share the name, or fail the launch on a formula-name store lookup — hence the
+// !IsFormula guard, mirroring the auto-convoy block. Dry-run never mutates.
+func shouldReopenForReassign(opts SlingOpts) bool {
+	return opts.Reassign && !opts.IsFormula && !opts.DryRun
 }
 
 func validateExistingBead(beadID string, deps SlingDeps) error {
@@ -317,6 +395,440 @@ func validateExistingBeadInQuerier(beadID, storeRef string, querier BeadQuerier)
 		return nil
 	}
 	return &MissingBeadError{BeadID: beadID, StoreRef: storeRef}
+}
+
+// deriveOfficerOfRecord stamps gc.officer_of_record on the target bead before
+// checkOfficerOfRecord evaluates it, sourced from RoutingPolicy.ReportsTo
+// (city.toml [routing.reports_to], synced by hand from the department
+// doctrine's Reports-to column — see internal/config/routing.go). This is
+// the "fix at the source" ga-owbb42 asks for: stamping here, inside the same
+// preflight pass that would otherwise refuse the dispatch, removes the need
+// for fleet-lint V8 to catch a miss 24h later or for a human to hand-stamp
+// mid-dispatch (see ga-owbb42's own comment thread for a live repro of the
+// latter, one layer up from the 24h-lag case the bead was originally filed
+// for).
+//
+// Best-effort and silent by design: every no-op path here (policy not
+// configured, target exempt, no ReportsTo entry, bead unresolvable, field
+// already set, or the write itself failing) simply leaves
+// checkOfficerOfRecord — called immediately after, unconditionally — as the
+// fail-closed backstop it already is. This function has no error return: it
+// must never itself change whether a sling is refused, only reduce how often
+// the refusal is reached.
+func deriveOfficerOfRecord(opts SlingOpts, deps SlingDeps) {
+	if deps.Cfg == nil || !deps.Cfg.RoutingPolicy.Configured() || deps.Store == nil {
+		return
+	}
+	a := opts.Target
+	if deps.Cfg.RoutingPolicy.Exempt(a.QualifiedName()) {
+		return
+	}
+	officer, ok := deps.Cfg.RoutingPolicy.DeriveOfficerOfRecord(a.QualifiedName())
+	if !ok {
+		return
+	}
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	if querier == nil {
+		return
+	}
+	b, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		return
+	}
+	if strings.TrimSpace(b.Metadata[beadmeta.OfficerOfRecordMetadataKey]) != "" {
+		return
+	}
+	if err := deps.Store.SetMetadata(opts.BeadOrFormula, beadmeta.OfficerOfRecordMetadataKey, officer); err != nil {
+		depsTracef(deps, "sling-core: deriveOfficerOfRecord: failed to stamp %s=%s on %s: %v",
+			beadmeta.OfficerOfRecordMetadataKey, officer, opts.BeadOrFormula, err)
+	}
+}
+
+// checkOfficerOfRecord enforces the hard officer-of-record gate: routing to
+// any target not in the city's RoutingPolicy exempt set (config.City.RoutingPolicy,
+// authored only in the root city.toml) requires the target bead to already
+// carry gc.officer_of_record metadata. There is NO --force override — see
+// shouldCheckOfficerOfRecord's doc comment.
+//
+// The gate itself is opt-in at the city-config level: if RoutingPolicy.Configured()
+// is false (no [routing] table authored in city.toml at all), this is a no-op.
+// Upgrading the gc binary alone must never silently change sling behavior for
+// a city — including every test fixture in this repo — that has not opted in.
+// "No exceptions" (ruling a) means no PER-DISPATCH bypass once a city has
+// opted in; it does not mean every city is enrolled by default.
+//
+// A bead that does not resolve (beads.ErrNotFound) is NOT refused here:
+// --force's documented "dispatch even if the bead does not resolve in the
+// local store" use case (a bead visible in a remote store not yet synced
+// locally) must keep working, and this check cannot verify metadata on a bead
+// it cannot see — a visibility limit, not a policy exception. A bead that DOES
+// resolve locally is held to the gate unconditionally, regardless of --force.
+// A genuine lookup failure (not not-found) surfaces as the same
+// BeadLookupError the existence check above already uses, rather than being
+// silently swallowed.
+func checkOfficerOfRecord(opts SlingOpts, deps SlingDeps) error {
+	a := opts.Target
+	if deps.Cfg == nil || !deps.Cfg.RoutingPolicy.Configured() {
+		return nil
+	}
+	if deps.Cfg.RoutingPolicy.Exempt(a.QualifiedName()) {
+		return nil
+	}
+	storeRef := strings.TrimSpace(deps.StoreRef)
+	if storeRef == "" {
+		storeRef = "local"
+	}
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	if querier == nil {
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: errors.New("store not configured")}
+	}
+	b, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: err}
+	}
+	if strings.TrimSpace(b.Metadata[beadmeta.OfficerOfRecordMetadataKey]) != "" {
+		return nil
+	}
+	return &MissingOfficerOfRecordError{BeadID: opts.BeadOrFormula, Target: a.QualifiedName()}
+}
+
+// Session beads predate the beadmeta "gc."-namespaced convention and are
+// written by internal/session with bare, unprefixed metadata keys (template,
+// state, session_name, ...) — confirmed against every real writer in
+// internal/session/*.go and empirically against live session beads. They are
+// a different vocabulary from work-bead metadata (gc.routed_to, gc.template
+// in beadmeta is a distinct, correctly-gc.-prefixed concept used elsewhere).
+// Reading a session bead's template or liveness via a beadmeta gc.* constant
+// silently matches nothing — that was ga-ktvnh1's original defect (found by
+// ga-5m7fir validation): the guard's own unit tests passed because their
+// fixtures were hand-built with the same wrong constants, not against a real
+// session bead's shape.
+const (
+	sessionTemplateMetadataKey = "template"
+	sessionStateMetadataKey    = "state"
+)
+
+// shouldCheckLiveRoutingConflict reports whether preflight should enforce the
+// live-routing guard for this sling. Applicability mirrors
+// shouldCheckOfficerOfRecord for the same reasons (a formula LAUNCH creates a
+// fresh bead with no claim history to conflict with; a dry-run inline-text
+// preview never resolves a real target bead). Unlike checkOfficerOfRecord,
+// --force DOES bypass this guard: this is a live-safety interlock against
+// accidental concurrent dispatch (ga-11quqf), not a compliance/paper-trail
+// requirement with "no exceptions" — a deliberate operator override stays
+// available. This governs applicability only.
+func shouldCheckLiveRoutingConflict(opts SlingOpts) bool {
+	return !opts.IsFormula && (!opts.DryRun || !opts.InlineText) && !opts.Force
+}
+
+// checkLiveRoutingConflict enforces the live-routing guard: gc sling refuses
+// to route opts.BeadOrFormula to a.QualifiedName() when that same target
+// already has a live session — a session bead whose template matches the
+// target and whose state is session.StateActive or session.StateAwake (the
+// reconciler's own "this runtime is genuinely running" determination, kept
+// current by internal/session's IsRunning-backed sweep — not a timestamp
+// window, which has no genuinely-maintained equivalent on session beads; see
+// ga-5m7fir) — claimed (Assignee == that session's session_name, Status ==
+// in_progress) on a DIFFERENT bead. Mirrors checkOfficerOfRecord's refusal
+// shape, applied to gc.routed_to/session-liveness instead of officer
+// identity: a Go-side hard block at dispatch time, closing the gap left by
+// Efficiency W1 (ga-k1fe1d, Python-side detect-after-the-fact fleet-lint
+// dedup). Evidence base: ga-11quqf (same-persona concurrent-session races —
+// this reproduces the two-nils-sessions-build-same-binary incident, where one
+// session shipped a disclosed-defective binary while a second believed a hold
+// was in effect).
+//
+// Like checkOfficerOfRecord, this is opt-in at the city-config level (no-op
+// when RoutingPolicy.Configured() is false) and exempt targets (officers, CoS
+// office, independent audit, meta) are never subject to it — those seats are
+// accountable-by-construction and routinely run overlapping sessions as part
+// of normal operation.
+//
+// Every store lookup failure here is fail-open (returns nil, not an error):
+// this guard is an ADDITIONAL safety layer over dispatch paths that already
+// carry their own idempotency/reassign safeguards, not the sole enforcement
+// point for a hard requirement the way checkOfficerOfRecord's BeadLookupError
+// precedent is — a transient session-store read failure must not block every
+// sling in the city.
+func checkLiveRoutingConflict(opts SlingOpts, deps SlingDeps) error {
+	if deps.Cfg == nil || !deps.Cfg.RoutingPolicy.Configured() {
+		return nil
+	}
+	a := opts.Target
+	target := a.QualifiedName()
+	if deps.Cfg.RoutingPolicy.Exempt(target) {
+		return nil
+	}
+	if deps.Store == nil {
+		return nil
+	}
+	sessionBeads, err := session.ListAllSessionBeads(deps.Store, beads.ListQuery{Status: "open"})
+	if err != nil {
+		return nil
+	}
+	for _, sb := range sessionBeads {
+		if sb.Metadata[sessionTemplateMetadataKey] != target {
+			continue
+		}
+		sessionName := strings.TrimSpace(sb.Metadata["session_name"])
+		if sessionName == "" {
+			continue
+		}
+		state := session.State(sb.Metadata[sessionStateMetadataKey])
+		if state != session.StateActive && state != session.StateAwake {
+			continue
+		}
+		claimed, err := deps.Store.List(beads.ListQuery{Assignee: sessionName, Status: "in_progress"})
+		if err != nil {
+			continue
+		}
+		for _, c := range claimed {
+			if c.ID == opts.BeadOrFormula {
+				continue
+			}
+			return &LiveRoutingConflictError{
+				BeadID:            opts.BeadOrFormula,
+				Target:            target,
+				ConflictingBeadID: c.ID,
+				Session:           sessionName,
+			}
+		}
+	}
+	return nil
+}
+
+// shouldCheckTargetDispatchable reports whether preflight should verify
+// opts.BeadOrFormula's status/defer state before stamping gc.routed_to on
+// it. Applicability mirrors shouldValidateExistingBead/shouldCheckOfficerOfRecord
+// (a formula LAUNCH creates a fresh open bead with nothing to check; a
+// dry-run inline-text preview never resolves a real target bead) since this
+// check is only meaningful against a bead that already exists. Unlike
+// shouldCheckLiveRoutingConflict, this does NOT additionally gate on
+// !opts.Force: see checkTargetDispatchable's doc comment for why forcing
+// through is never a legitimate override here.
+func shouldCheckTargetDispatchable(opts SlingOpts) bool {
+	return !opts.IsFormula && (!opts.DryRun || !opts.InlineText)
+}
+
+// checkTargetDispatchable refuses to route opts.BeadOrFormula onto
+// a.QualifiedName() when the target bead's status/defer state would exclude
+// it from Ready()'s pool-demand probe. nativeDoltOpenReadyStatuses
+// (internal/beads/native_dolt_store.go) documents the exact set Ready()
+// queries: only StatusOpen, or StatusDeferred once an expired DeferUntil
+// resurfaces it. beads.IsStatusDispatchable is the shared, store-independent
+// predicate for that same axis; see its doc comment for why this check does
+// not fold in Ready()'s type/label/tier/assignee exclusions too — those are
+// separate, already-understood concerns, not this bug's shape.
+//
+// Confirmed specimen: ga-96zjze was parked deferred with no --until (bd
+// defer's status-based indefinite deferral). A sling still wrote
+// gc.routed_to successfully — the bead's Status/DeferUntil looked identical
+// to an ordinary open bead once collapsed — and it sat invisible to `bd
+// ready` for 21h despite the routing write "succeeding" (ga-tk5mcg.2).
+//
+// There is no --force override. Every other force-bypassable preflight
+// check (checkLiveRoutingConflict, dep-cycle, cross-rig) exists to block an
+// outcome that forcing through can still legitimately produce — an operator
+// who --forces past a live-routing conflict gets a real, if risky, dispatch.
+// Forcing past this check cannot: the target's raw status is what excludes
+// it from Ready(), not gc sling's opinion about it, so writing gc.routed_to
+// anyway reproduces the exact silently-stranded state this check exists to
+// prevent, unconditionally. The fix is always to change the bead's status
+// first, never to override the sling.
+//
+// A bead that does not resolve (beads.ErrNotFound) is NOT refused here, for
+// the same --force-visibility reason checkOfficerOfRecord isn't: a bead
+// visible in a remote store not yet synced locally must keep working, and
+// this check cannot verify status on a bead it cannot see.
+func checkTargetDispatchable(opts SlingOpts, deps SlingDeps) error {
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	if querier == nil {
+		return nil
+	}
+	storeRef := strings.TrimSpace(deps.StoreRef)
+	if storeRef == "" {
+		storeRef = "local"
+	}
+	b, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: err}
+	}
+	now := time.Now().UTC()
+	if beads.IsStatusDispatchable(b, now) {
+		return nil
+	}
+	// Non-dispatchable: beads.IsStatusDispatchable's own conditions exhaust
+	// the possibilities below, so classifying here (for an actionable
+	// message only — the gate decision above already happened) can't drift
+	// out of sync with what actually blocked it.
+	a := opts.Target
+	target := a.QualifiedName()
+	// bd exposes distinct subcommands for each transition — reopen only
+	// clears closed, update --status open only clears a deferred status
+	// (see internal/beads/bdstore.go's "reopen" vs "update" write paths) —
+	// so the two refusal branches below name different fix commands.
+	clearDeferCmd := fmt.Sprintf("bd update %s --status open", opts.BeadOrFormula)
+	switch {
+	case b.Status == "closed":
+		return &NonDispatchableTargetError{
+			BeadID: opts.BeadOrFormula,
+			Target: target,
+			Status: "closed",
+			Fix:    fmt.Sprintf("reopen it first (bd reopen %s)", opts.BeadOrFormula),
+		}
+	case (b.IsDeferredIndefinitely != nil && *b.IsDeferredIndefinitely) || (b.Status == "deferred" && b.DeferUntil == nil):
+		return &NonDispatchableTargetError{
+			BeadID: opts.BeadOrFormula,
+			Target: target,
+			Status: "deferred indefinitely (bd defer with no --until)",
+			Fix:    "clear the defer first (" + clearDeferCmd + ")",
+		}
+	default: // beads.IsDeferred(b, now): a future-dated defer window
+		return &NonDispatchableTargetError{
+			BeadID: opts.BeadOrFormula,
+			Target: target,
+			Status: fmt.Sprintf("deferred until %s", b.DeferUntil.Format(time.RFC3339)),
+			Fix:    "wait for the defer window to pass, or clear it now (" + clearDeferCmd + ")",
+		}
+	}
+}
+
+// shouldCheckTargetAssigneeConflict reports whether preflight should verify
+// opts.BeadOrFormula's assignee before stamping gc.routed_to on it.
+// Applicability mirrors shouldCheckTargetDispatchable for the same
+// formula/dry-run-preview reasons (nothing meaningful to check against a
+// bead that doesn't exist yet or was never resolved to a real target).
+// Unlike shouldCheckTargetDispatchable, this additionally gates on
+// !opts.Reassign: --reassign's own reopenForReassign step (later in this
+// same preflight) clears the assignee and reopens the bead specifically to
+// handle this case, so refusing here first would block the one flag that
+// already fixes it.
+func shouldCheckTargetAssigneeConflict(opts SlingOpts) bool {
+	return !opts.Reassign && !opts.IsFormula && (!opts.DryRun || !opts.InlineText)
+}
+
+// checkTargetAssigneeConflict refuses to route opts.BeadOrFormula onto
+// opts.Target.QualifiedName() when the bead is in_progress with a different
+// assignee already set. checkTargetDispatchable (and the
+// beads.IsStatusDispatchable predicate it calls) correctly treats
+// in_progress as dispatchable in general — a live --reassign target is
+// legitimate and is exactly what SlingOpts.Reassign exists for — so this is
+// deliberately a separate check, not a change to that one; see
+// IsStatusDispatchable's own doc comment ("type/label/tier/assignee
+// exclusions... already-understood concerns, not this bug's shape").
+//
+// Without --reassign, sling only ever writes gc.routed_to. The pool-demand
+// probe gc hook actually runs (bd ready --metadata-field
+// gc.routed_to=<target> --unassigned) excludes any bead with a set
+// Assignee, independent of status — so the write succeeds with a success
+// echo while the bead remains permanently unreachable by the new target:
+// the same silently-stranded state ga-tk5mcg.2 fixed for closed/deferred
+// targets, reached through the assignee axis instead of the status axis
+// (ga-tk5mcg.9).
+//
+// Confirmed specimen (ga-tk5mcg.9): four beads sitting at
+// gc.awaiting=validator had gc.routed_to written to a fresh validator
+// persona each; `bd ready --metadata-field gc.routed_to=<persona>
+// --unassigned` returned zero of them 10-12 minutes later. Every write had
+// succeeded; every bd show displayed the intended validator.
+//
+// A bead with no assignee, or already assigned to the same identity being
+// routed to, is unaffected — both remain pool-reachable. There is no
+// --force override, for the same reason checkTargetDispatchable has none:
+// forcing through cannot produce a working dispatch here, only reproduce
+// the exact stranded state this check exists to prevent.
+func checkTargetAssigneeConflict(opts SlingOpts, deps SlingDeps) error {
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	if querier == nil {
+		return nil
+	}
+	b, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		storeRef := strings.TrimSpace(deps.StoreRef)
+		if storeRef == "" {
+			storeRef = "local"
+		}
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: err}
+	}
+	if b.Status != "in_progress" {
+		return nil
+	}
+	assignee := strings.TrimSpace(b.Assignee)
+	if assignee == "" {
+		return nil
+	}
+	a := opts.Target
+	target := a.QualifiedName()
+	if assignee == target {
+		return nil
+	}
+	if sessionBelongsToTarget(deps, assignee, target) {
+		// assignee is a specific live-or-recorded session instance of the
+		// same target pool/agent (e.g. Assignee "worker-live-1" vs target
+		// "worker") -- not a different owner, just a more specific spelling
+		// of the same one. checkLiveRoutingConflict above already permits
+		// re-slinging a bead onto the pool a live member of that pool
+		// currently holds; refusing it here on a bare string mismatch would
+		// contradict that and break the ordinary idempotent-resling case.
+		return nil
+	}
+	return &NonDispatchableTargetError{
+		BeadID: opts.BeadOrFormula,
+		Target: target,
+		Status: fmt.Sprintf("in_progress, assigned to %s", assignee),
+		Fix: fmt.Sprintf(
+			"pass --reassign to clear the assignee and reopen it (gc sling --reassign %s %s), or route to %s instead",
+			target, opts.BeadOrFormula, assignee,
+		),
+	}
+}
+
+// sessionBelongsToTarget reports whether assignee names a session-tracking
+// bead (labeled gc:session) whose "template" metadata equals target -- i.e.
+// assignee is a specific instance of the target pool/agent being slung to,
+// not a genuinely different owner. Mirrors the session-bead lookup
+// checkLiveRoutingConflict performs above, keyed by assignee name directly
+// instead of scanning for conflicting claims. Deliberately does not filter
+// on session state (active/awake) the way checkLiveRoutingConflict does:
+// this is an identity question (which pool does this name belong to), not a
+// liveness one, and a stale/dead session bead still correctly identifies
+// which pool originally claimed the work.
+func sessionBelongsToTarget(deps SlingDeps, assignee, target string) bool {
+	if deps.Store == nil || assignee == "" {
+		return false
+	}
+	sessionBeads, err := session.ListAllSessionBeads(deps.Store, beads.ListQuery{Status: "open"})
+	if err != nil {
+		return false
+	}
+	for _, sb := range sessionBeads {
+		if strings.TrimSpace(sb.Metadata["session_name"]) != assignee {
+			continue
+		}
+		return sb.Metadata[sessionTemplateMetadataKey] == target
+	}
+	return false
 }
 
 // slingFormula handles the --formula dispatch path.
@@ -378,12 +890,51 @@ func rootOnlyVaporPourHint(formulaName string, recipe *formula.Recipe) string {
 
 // slingOnFormula handles the --on formula attachment path.
 func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
-	return attachFormulaToBead(opts, deps, querier, beadID, opts.OnFormula, "on-formula", "formula", result)
+	result, err := attachFormulaToBead(opts, deps, querier, beadID, opts.OnFormula, "on-formula", "formula", result)
+	if err == nil {
+		if hint := attachedBeadInstructionsDroppedHint(querier, beadID, opts.Vars); hint != "" {
+			result.BeadWarnings = append(result.BeadWarnings, hint)
+		}
+	}
+	return result, err
+}
+
+// attachedBeadInstructionsDroppedHint returns a sling-time diagnostic when
+// --on/default-formula attaches a formula to an existing bead whose own
+// description carries real instructions. The formula wisp root's own
+// description is always the FORMULA's own boilerplate
+// (internal/formula/compile.go rootDesc), never the target bead's text, and
+// no formula var exposes the bead's Description either — so a bead's
+// instructions are otherwise silently invisible to the formula's rendered
+// context, unless the caller explicitly carries them in via
+// context_path/requirements_path (#3681). It changes neither routing nor
+// the materialized wisp.
+func attachedBeadInstructionsDroppedHint(querier BeadQuerier, beadID string, userVars []string) string {
+	if querier == nil || beadID == "" {
+		return ""
+	}
+	for _, v := range userVars {
+		key, _, ok := strings.Cut(v, "=")
+		if ok && (key == "context_path" || key == "requirements_path") {
+			return ""
+		}
+	}
+	bead, err := querier.Get(beadID)
+	if err != nil || strings.TrimSpace(bead.Description) == "" {
+		return ""
+	}
+	return fmt.Sprintf("note: bead %s's description is not carried into the formula's rendered context — pass --var context_path=<dir> or --var requirements_path=<doc> to include your instructions, or the formula's brainstorm will not see them.", beadID)
 }
 
 // slingDefaultFormula handles the default formula attachment path.
 func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
-	return attachFormulaToBead(opts, deps, querier, beadID, opts.Target.EffectiveDefaultSlingFormula(), "default-on-formula", "default formula", result)
+	result, err := attachFormulaToBead(opts, deps, querier, beadID, opts.Target.EffectiveDefaultSlingFormula(), "default-on-formula", "default formula", result)
+	if err == nil {
+		if hint := attachedBeadInstructionsDroppedHint(querier, beadID, opts.Vars); hint != "" {
+			result.BeadWarnings = append(result.BeadWarnings, hint)
+		}
+	}
+	return result, err
 }
 
 // attachFormulaToBead runs the shared formula-attachment pipeline for both the
@@ -409,9 +960,10 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			Title: opts.Title,
 			Vars:  formulaVars,
 		}); err != nil {
+			graphv2.CloseSyntheticInputConvoy(deps.Store, graphInv.InputConvoy, beadID)
 			return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 		}
-		return withGraphV2SourceWorkflowLock(context.Background(), deps, beadID, func() (SlingResult, error) {
+		lockedResult, lockedErr := withGraphV2SourceWorkflowLock(context.Background(), deps, beadID, func() (SlingResult, error) {
 			if err := CheckNoMoleculeChildrenAllowLiveWorkflow(querier, beadID, deps.Store, &result); err != nil {
 				return result, fmt.Errorf("%w", err)
 			}
@@ -439,6 +991,15 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			}
 			return wfResult, wfErr
 		})
+		if lockedErr != nil {
+			// The pour failed after minting its synthetic input convoy
+			// (children-conflict, snapshot, instantiate, or start failure —
+			// the started-workflow path returns nil error). Close the pour's
+			// own artifact so repeated failures do not accumulate open
+			// claim-attracting convoys.
+			graphv2.CloseSyntheticInputConvoy(deps.Store, graphInv.InputConvoy, beadID)
+		}
+		return lockedResult, lockedErr
 	}
 	if err := validateSlingFormulaRuntimeVars(context.Background(), formulaName, searchPaths, molecule.Options{
 		Title: opts.Title,
@@ -523,7 +1084,7 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 		}
 		req := RouteRequest{
 			BeadID:  beadID,
-			Target:  a.QualifiedName(),
+			Target:  agentutil.RoutedToIdentity(&a),
 			WorkDir: rigDir,
 			Env:     slingEnv,
 			Force:   opts.Force,
@@ -694,59 +1255,172 @@ type workflowRestoreState struct {
 func listSourceWorkflowRoots(deps SlingDeps, sourceBeadID string) ([]sourceWorkflowRoot, error) {
 	sourceStoreRef := strings.TrimSpace(deps.StoreRef)
 	if deps.SourceWorkflowStores == nil {
-		roots, err := sourceworkflow.ListLiveRoots(deps.Store, sourceBeadID, sourceStoreRef, sourceStoreRef)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]sourceWorkflowRoot, 0, len(roots))
-		for _, root := range roots {
-			out = append(out, sourceWorkflowRoot{
-				root:     root,
-				store:    deps.Store,
-				storeRef: sourceStoreRef,
-			})
-		}
-		return out, nil
+		return singleStoreSourceWorkflowRoots(deps.Store, sourceBeadID, sourceStoreRef)
 	}
 	stores, err := deps.SourceWorkflowStores()
 	if err != nil {
 		return nil, err
 	}
-	roots := make([]sourceWorkflowRoot, 0)
-	seen := make(map[string]struct{}, len(stores))
+	stores, err = ensureSelectedSourceWorkflowStorePresent(stores, deps.Store, sourceStoreRef)
+	if err != nil {
+		return nil, err
+	}
+	c := &sourceWorkflowRootCollector{
+		deps:           deps,
+		sourceBeadID:   sourceBeadID,
+		sourceStoreRef: sourceStoreRef,
+		seen:           make(map[string]struct{}, len(stores)),
+	}
 	for i, info := range stores {
-		if info.Store == nil {
-			continue
-		}
-		rootStoreRef := strings.TrimSpace(info.StoreRef)
-		matches, err := sourceworkflow.ListLiveRoots(info.Store, sourceBeadID, sourceStoreRef, rootStoreRef)
-		if err != nil {
+		if err := c.scanStore(i, info); err != nil {
 			return nil, err
 		}
-		for _, root := range matches {
-			keyScope := rootStoreRef
-			if keyScope == "" {
-				keyScope = fmt.Sprintf("store#%d", i)
-			}
-			key := keyScope + "\x00" + root.ID
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			roots = append(roots, sourceWorkflowRoot{
-				root:     root,
-				store:    info.Store,
-				storeRef: rootStoreRef,
-			})
-		}
 	}
-	slices.SortFunc(roots, func(a, b sourceWorkflowRoot) int {
+	return c.result()
+}
+
+// singleStoreSourceWorkflowRoots lists live source-workflow roots when the deps
+// expose only one store (no cross-store SourceWorkflowStores enumerator). Every
+// scan failure is fatal here because there is no non-selected store to tolerate.
+func singleStoreSourceWorkflowRoots(store beads.Store, sourceBeadID, sourceStoreRef string) ([]sourceWorkflowRoot, error) {
+	roots, err := sourceworkflow.ListLiveRoots(store, sourceBeadID, sourceStoreRef, sourceStoreRef)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]sourceWorkflowRoot, 0, len(roots))
+	for _, root := range roots {
+		out = append(out, sourceWorkflowRoot{
+			root:     root,
+			store:    store,
+			storeRef: sourceStoreRef,
+		})
+	}
+	return out, nil
+}
+
+// ensureSelectedSourceWorkflowStorePresent guarantees the selected source store
+// is scanned. When a specific source store ref was requested but is absent from
+// the enumerated stores, it prepends the deps store — the selected store is
+// always strict — or fails when no such store is available to scan.
+func ensureSelectedSourceWorkflowStorePresent(stores []SourceWorkflowStore, fallback beads.Store, sourceStoreRef string) ([]SourceWorkflowStore, error) {
+	if sourceStoreRef == "" {
+		return stores, nil
+	}
+	selectedPresent := slices.ContainsFunc(stores, func(info SourceWorkflowStore) bool {
+		return info.Store != nil &&
+			sourceworkflow.NormalizeSourceStoreRef(info.StoreRef) == sourceworkflow.NormalizeSourceStoreRef(sourceStoreRef)
+	})
+	if selectedPresent {
+		return stores, nil
+	}
+	if fallback == nil {
+		return nil, fmt.Errorf("source workflow store %s is unavailable to scan", sourceStoreRef)
+	}
+	return append([]SourceWorkflowStore{{Store: fallback, StoreRef: sourceStoreRef}}, stores...), nil
+}
+
+// sourceWorkflowRootCollector accumulates live source-workflow roots across every
+// candidate store for a running sling. It tolerates unrelated (non-selected)
+// store scan failures — warning through the deps sink — while keeping the
+// selected source store strict, and dedups roots by store scope and root ID.
+type sourceWorkflowRootCollector struct {
+	deps           SlingDeps
+	sourceBeadID   string
+	sourceStoreRef string
+
+	roots        []sourceWorkflowRoot
+	seen         map[string]struct{}
+	scanned      int
+	firstScanErr error
+}
+
+// scanStore scans one candidate store for live source-workflow roots. A nil
+// store is ignored. A tolerated non-selected scan failure warns and returns nil
+// so the walk continues; a selected-store (or otherwise non-tolerable) failure
+// returns the wrapped error to abort.
+func (c *sourceWorkflowRootCollector) scanStore(index int, info SourceWorkflowStore) error {
+	if info.Store == nil {
+		return nil
+	}
+	rootStoreRef := strings.TrimSpace(info.StoreRef)
+	matches, err := sourceworkflow.ListLiveRoots(info.Store, c.sourceBeadID, c.sourceStoreRef, rootStoreRef)
+	if err != nil {
+		return c.recordScanFailure(index, rootStoreRef, err)
+	}
+	c.scanned++
+	c.appendRoots(index, info.Store, rootStoreRef, matches)
+	return nil
+}
+
+// recordScanFailure remembers the first scan error and decides whether the
+// failure may be tolerated. A tolerable failure is warned through the deps sink
+// and returns nil so the store is skipped; every other failure returns the
+// wrapped error so the caller aborts.
+func (c *sourceWorkflowRootCollector) recordScanFailure(index int, rootStoreRef string, scanErr error) error {
+	storeLabel := rootStoreRef
+	if storeLabel == "" {
+		storeLabel = fmt.Sprintf("store#%d", index)
+	}
+	wrapped := fmt.Errorf("listing live workflows in %s: %w", storeLabel, scanErr)
+	if c.firstScanErr == nil {
+		c.firstScanErr = wrapped
+	}
+	if !c.toleratesScanFailure(rootStoreRef) {
+		return wrapped
+	}
+	c.deps.SourceWorkflowStoreScanWarning(rootStoreRef, scanErr)
+	return nil
+}
+
+// toleratesScanFailure reports whether a scan failure on the given store may be
+// skipped instead of aborting the walk. Tolerance requires a configured warning
+// sink, resolved source and store refs, and a store that is not the strict
+// selected source store — so a degraded scan is never silently swallowed.
+func (c *sourceWorkflowRootCollector) toleratesScanFailure(rootStoreRef string) bool {
+	if c.deps.SourceWorkflowStoreScanWarning == nil || c.sourceStoreRef == "" || rootStoreRef == "" {
+		return false
+	}
+	return sourceworkflow.NormalizeSourceStoreRef(rootStoreRef) !=
+		sourceworkflow.NormalizeSourceStoreRef(c.sourceStoreRef)
+}
+
+// appendRoots merges the live roots from one store into the result set, skipping
+// duplicates keyed by store scope and root ID.
+func (c *sourceWorkflowRootCollector) appendRoots(index int, store beads.Store, rootStoreRef string, matches []beads.Bead) {
+	keyScope := rootStoreRef
+	if keyScope == "" {
+		keyScope = fmt.Sprintf("store#%d", index)
+	}
+	for _, root := range matches {
+		key := keyScope + "\x00" + root.ID
+		if _, ok := c.seen[key]; ok {
+			continue
+		}
+		c.seen[key] = struct{}{}
+		c.roots = append(c.roots, sourceWorkflowRoot{
+			root:     root,
+			store:    store,
+			storeRef: rootStoreRef,
+		})
+	}
+}
+
+// result finalizes the sorted root set, applying the fail-closed fallback when
+// no store could be scanned.
+func (c *sourceWorkflowRootCollector) result() ([]sourceWorkflowRoot, error) {
+	if c.scanned == 0 {
+		if c.firstScanErr != nil {
+			return nil, c.firstScanErr
+		}
+		return nil, fmt.Errorf("no source workflow stores were available to scan")
+	}
+	slices.SortFunc(c.roots, func(a, b sourceWorkflowRoot) int {
 		if cmp := strings.Compare(a.storeRef, b.storeRef); cmp != 0 {
 			return cmp
 		}
 		return strings.Compare(a.root.ID, b.root.ID)
 	})
-	return roots, nil
+	return c.roots, nil
 }
 
 func pendingGraphWorkflowLaunch(rootID, sourceBeadID string, a config.Agent, method, formulaName string, deps SlingDeps) pendingSourceWorkflowLaunch {

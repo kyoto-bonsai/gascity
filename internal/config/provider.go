@@ -55,6 +55,15 @@ type ProviderSpec struct {
 	//   ""                - explicit standalone opt-out
 	//   nil               - field absent; no explicit declaration
 	Base *string `toml:"base,omitempty"`
+	// MaxSeats caps the number of concurrent active sessions attributed to
+	// this provider (via each session's template->provider resolution),
+	// enforced by the spawn preflight gate (ga-mpb0xu). Semantics mirror
+	// Agent.MaxActiveSessions: nil = not configured (gate fails open, no
+	// cap enforced), -1 = explicitly unlimited, 0 or positive = literal
+	// seat cap. Distinct from Agent/pool-level MaxActiveSessions, which
+	// caps one template's own session count, not the provider's aggregate
+	// across all templates that resolve to it.
+	MaxSeats *int `toml:"max_seats,omitempty"`
 	// ArgsAppend accumulates extra args after each layer's Args replacement.
 	ArgsAppend []string `toml:"args_append,omitempty"`
 	// OptionsSchemaMerge controls OptionsSchema merge mode across the
@@ -331,7 +340,7 @@ func (rp *ResolvedProvider) ProviderSessionCreateTransport() string {
 		return ""
 	}
 	if family == "mimocode" {
-		// MiMo Code supports explicit ACP sessions, but --never-ask-questions
+		// MiMo Code supports explicit ACP sessions, but --never-ask
 		// — the flag that suppresses the question/plan gates headless runs
 		// require — is not taken by the `mimo acp` subcommand, and ACPArgs
 		// replaces Args, so an ACP default would compose a launch without it.
@@ -386,21 +395,37 @@ func (rp *ResolvedProvider) TitleModelFlagArgs() []string {
 // ResolveDefaultArgs produces CLI flag args from EffectiveDefaults.
 // For each schema option with an effective default, the corresponding
 // FlagArgs are emitted. Options with no effective default (or whose
-// default is "") are skipped.
-// Args are emitted in schema declaration order for deterministic output.
-func (rp *ResolvedProvider) ResolveDefaultArgs() []string {
+// default is "") are skipped. Undeclared values pass through verbatim when
+// the option's flag shape allows it; a value that resolves to no args is a
+// hard error — this is the managed-agent launch path, and silently dropping
+// a configured pin downgraded seats to the fleet default with zero warning
+// (ga-b0flc8). Args are emitted in schema declaration order for
+// deterministic output.
+func (rp *ResolvedProvider) ResolveDefaultArgs() ([]string, error) {
 	var args []string
-	for _, opt := range rp.OptionsSchema {
+	for i := range rp.OptionsSchema {
+		opt := &rp.OptionsSchema[i]
 		value := rp.EffectiveDefaults[opt.Key]
 		if value == "" {
 			continue
 		}
-		choice := findChoice(opt.Choices, value)
-		if choice != nil {
-			args = append(args, choice.FlagArgs...)
+		choiceArgs, err := resolveChoiceFlagArgs(opt, value)
+		if err != nil {
+			return nil, err
 		}
+		args = append(args, choiceArgs...)
 	}
-	return args
+	return args, nil
+}
+
+// BinaryName returns the executable token of a command string, stripping
+// any arguments (everything from the first space onward). Used for PATH
+// detection so a command like "my-agent --flag" checks "my-agent".
+func BinaryName(cmd string) string {
+	if i := strings.IndexByte(cmd, ' '); i > 0 {
+		return cmd[:i]
+	}
+	return cmd
 }
 
 // pathCheckBinary returns the binary name to use for PATH detection.
@@ -409,11 +434,15 @@ func (ps *ProviderSpec) pathCheckBinary() string {
 	if ps.PathCheck != "" {
 		return ps.PathCheck
 	}
-	return ps.Command
+	return BinaryName(ps.Command)
 }
 
 // boolPtr returns a pointer to the given bool for tri-state capability fields.
 func boolPtr(b bool) *bool { return &b }
+
+// intPtr returns a pointer to the given int for tri-state capacity fields
+// (e.g. MaxSeats: nil = unconfigured, pointer value = explicit setting).
+func intPtr(n int) *int { return &n }
 
 // derefBool safely dereferences a *bool, returning false for nil.
 func derefBool(p *bool) bool {
@@ -531,6 +560,14 @@ func cloneStringMap(values map[string]string) map[string]string {
 }
 
 func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneIntPtr(value *int) *int {
 	if value == nil {
 		return nil
 	}

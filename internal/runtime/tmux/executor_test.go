@@ -3,6 +3,9 @@ package tmux
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -44,6 +47,7 @@ func (f *fakeExecutor) executeCtx(_ context.Context, args []string) (string, err
 }
 
 func TestNewSessionWithCommandAndEnvClearsEmptyVars(t *testing.T) {
+	cleanupShellEnvFiles(t, "gc-test-locale-clear")
 	exec := &fakeExecutor{}
 	tm := NewTmux()
 	tm.exec = exec
@@ -62,12 +66,140 @@ func TestNewSessionWithCommandAndEnvClearsEmptyVars(t *testing.T) {
 
 	args := exec.calls[0]
 	joined := strings.Join(args, "\x00")
-	if !strings.Contains(joined, "\x00-e\x00LANG=en_US.UTF-8\x00") {
-		t.Fatalf("new-session args missing LANG -e flag: %v", args)
+	if strings.Contains(joined, "\x00-e\x00") {
+		t.Fatalf("new-session args must not carry -e env flags: %v", args)
 	}
-	if got := args[len(args)-1]; got != "env -u LC_ALL -u LC_CTYPE claude" {
-		t.Fatalf("command = %q, want env -u LC_ALL -u LC_CTYPE claude", got)
+	if strings.Contains(joined, "LANG=en_US.UTF-8") {
+		t.Fatalf("new-session argv leaked env value: %v", args)
 	}
+	if got := args[len(args)-1]; !strings.Contains(got, "__gc_env=") || !strings.Contains(got, "exec claude") {
+		t.Fatalf("command = %q, want shell env source wrapper around claude", got)
+	}
+	if !hasTmuxSourceFileCall(exec.calls) {
+		t.Fatalf("tmux env source-file call missing: %v", exec.calls)
+	}
+
+	shellFile := soleShellEnvFile(t, "gc-test-locale-clear")
+	defer func() { _ = os.Remove(shellFile) }()
+	body, err := os.ReadFile(shellFile)
+	if err != nil {
+		t.Fatalf("read shell env file: %v", err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"export LANG='en_US.UTF-8'",
+		"unset LC_ALL",
+		"unset LC_CTYPE",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("shell env file missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestNewSessionWithCommandAndEnvKeepsSecretsOutOfTmuxArgv(t *testing.T) {
+	cleanupShellEnvFiles(t, "gc-test-secret-argv")
+	exec := &fakeExecutor{}
+	tm := NewTmux()
+	tm.exec = exec
+
+	env := map[string]string{
+		"OPENAI_API_KEY":       "sk-proj-test-secret",
+		"GEMINI_API_KEY":       "gemini-test-secret",
+		"GOOGLE_API_KEY":       "AIzaSy-test-secret",
+		"BEADS_HOLDER_TOKEN":   "holder-test-secret",
+		"GC_INSTANCE_TOKEN":    "instance-test-secret",
+		"VISIBLE_NON_SECRET":   "plain-value",
+		"EMPTY_INHERITED_VAR":  "",
+		"QUOTED_PROVIDER_DATA": "value with spaces and 'quote'",
+	}
+	if err := tm.NewSessionWithCommandAndEnv("gc-test-secret-argv", "", "codex resume", env); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	if len(exec.calls) == 0 {
+		t.Fatal("no tmux calls recorded")
+	}
+
+	for _, call := range exec.calls {
+		joined := strings.Join(call, "\x00")
+		for _, forbidden := range []string{
+			"sk-proj-test-secret",
+			"gemini-test-secret",
+			"AIzaSy-test-secret",
+			"holder-test-secret",
+			"instance-test-secret",
+			"plain-value",
+			"value with spaces",
+			"\x00-e\x00",
+		} {
+			if strings.Contains(joined, forbidden) {
+				t.Fatalf("tmux argv leaked %q in call %v", forbidden, call)
+			}
+		}
+	}
+	if !hasTmuxSourceFileCall(exec.calls) {
+		t.Fatalf("tmux env source-file call missing: %v", exec.calls)
+	}
+
+	shellFile := soleShellEnvFile(t, "gc-test-secret-argv")
+	defer func() { _ = os.Remove(shellFile) }()
+	body, err := os.ReadFile(shellFile)
+	if err != nil {
+		t.Fatalf("read shell env file: %v", err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"export OPENAI_API_KEY='sk-proj-test-secret'",
+		"export GOOGLE_API_KEY='AIzaSy-test-secret'",
+		"unset EMPTY_INHERITED_VAR",
+		"export QUOTED_PROVIDER_DATA='value with spaces and '\\''quote'\\'''",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("shell env file missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func hasTmuxSourceFileCall(calls [][]string) bool {
+	for _, call := range calls {
+		for i, arg := range call {
+			if arg == "source-file" && i+1 < len(call) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func soleShellEnvFile(t *testing.T, sessionName string) string {
+	t.Helper()
+	matches := shellEnvFiles(t, sessionName)
+	if len(matches) != 1 {
+		t.Fatalf("shell env files for %s = %v, want exactly 1", sessionName, matches)
+	}
+	return matches[0]
+}
+
+func cleanupShellEnvFiles(t *testing.T, sessionName string) {
+	t.Helper()
+	for _, path := range shellEnvFiles(t, sessionName) {
+		_ = os.Remove(path)
+	}
+	t.Cleanup(func() {
+		for _, path := range shellEnvFiles(t, sessionName) {
+			_ = os.Remove(path)
+		}
+	})
+}
+
+func shellEnvFiles(t *testing.T, sessionName string) []string {
+	t.Helper()
+	pattern := filepath.Join(os.TempDir(), fmt.Sprintf(".gc-%d", os.Getuid()), "tmux-env", "gc-"+sessionName+"-*.shenv")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("glob shell env file: %v", err)
+	}
+	return matches
 }
 
 type promptFooterExecutor struct {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -149,7 +150,14 @@ func (m *Multiplexer) ListAll(filter Filter) ([]TaggedEvent, error) {
 	var all []TaggedEvent
 	timeout := m.providerOperationTimeout()
 	results, timedOut := collectProviderCallResults(providers, timeout, func(_ string, p Provider) ([]Event, error) {
-		return p.List(providerFilter)
+		// Multiplexer's own cancellation is the timeout below (an abandoned
+		// per-provider goroutine is left running, not aborted) — that gap is
+		// pre-existing and shared with SupervisorMux/ListTail below, not
+		// introduced or fixed here; see ga-96zjze's disclosure. Passing
+		// context.Background() to the child call is honest about that: this
+		// signature now CAN take a real ctx, but ListAll doesn't have one of
+		// its own to offer yet.
+		return p.List(context.Background(), providerFilter)
 	})
 	for _, city := range timedOut {
 		log.Printf("events: list all timed out for city %q after %s", city, timeout)
@@ -189,9 +197,9 @@ func (m *Multiplexer) ListTail(filter Filter, limit int) ([]TaggedEvent, error) 
 		var evts []Event
 		var err error
 		if tail, ok := p.(TailProvider); ok {
-			evts, err = tail.ListTail(providerFilter, limit)
+			evts, err = tail.ListTail(context.Background(), providerFilter, limit) // see ListAll's comment above
 		} else {
-			evts, err = p.List(providerFilter)
+			evts, err = p.List(context.Background(), providerFilter)
 			if limit < len(evts) {
 				evts = evts[len(evts)-limit:]
 			}
@@ -434,8 +442,10 @@ func ParseCursor(s string) map[string]uint64 {
 		if !ok || city == "" {
 			continue
 		}
-		var seq uint64
-		fmt.Sscanf(seqStr, "%d", &seq) //nolint:errcheck // best-effort parse
+		seq, err := strconv.ParseUint(seqStr, 10, 64)
+		if err != nil {
+			continue
+		}
 		m[city] = seq
 	}
 	return m

@@ -110,7 +110,7 @@ func TestBuiltinClaudeCommandString(t *testing.T) {
 		t.Errorf("CommandString() = %q, want %q", cs, "claude")
 	}
 	// Default args should produce the permission flag and effort flag.
-	defaultArgs := rp.ResolveDefaultArgs()
+	defaultArgs := mustDefaultArgs(t, rp)
 	wantArgs := []string{"--dangerously-skip-permissions", "--effort", "max"}
 	if len(defaultArgs) != len(wantArgs) {
 		t.Errorf("ResolveDefaultArgs() = %v, want %v", defaultArgs, wantArgs)
@@ -228,7 +228,7 @@ func TestBuiltinProvidersCursor(t *testing.T) {
 	if got := rp.CommandString(); got != "cursor-agent -f" {
 		t.Errorf("CommandString() = %q, want %q", got, "cursor-agent -f")
 	}
-	if got := rp.ResolveDefaultArgs(); len(got) != 0 {
+	if got := mustDefaultArgs(t, rp); len(got) != 0 {
 		t.Errorf("ResolveDefaultArgs() = %v, want no MCP approval args by default", got)
 	}
 	mcpApproval := findOption(p.OptionsSchema, "mcp_approval")
@@ -243,7 +243,7 @@ func TestBuiltinProvidersCursor(t *testing.T) {
 		t.Fatalf("mcp_approval approve choice = %+v, want --approve-mcps", approve)
 	}
 	rp.EffectiveDefaults = ComputeEffectiveDefaults(p.OptionsSchema, map[string]string{"mcp_approval": "approve"}, nil)
-	if got := rp.ResolveDefaultArgs(); !reflect.DeepEqual(got, []string{"--approve-mcps"}) {
+	if got := mustDefaultArgs(t, rp); !reflect.DeepEqual(got, []string{"--approve-mcps"}) {
 		t.Errorf("ResolveDefaultArgs(opt-in) = %v, want [--approve-mcps]", got)
 	}
 	if p.PromptMode != "arg" {
@@ -435,7 +435,7 @@ func TestBuiltinProvidersCerebrasOpenCodePreset(t *testing.T) {
 	if got := rp.ProviderSessionCreateTransport(); got != "acp" {
 		t.Fatalf("ProviderSessionCreateTransport() = %q, want acp", got)
 	}
-	if got, want := rp.ResolveDefaultArgs(), []string{"--model", "cerebras/gpt-oss-120b"}; !reflect.DeepEqual(got, want) {
+	if got, want := mustDefaultArgs(t, rp), []string{"--model", "cerebras/gpt-oss-120b"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ResolveDefaultArgs() = %v, want %v", got, want)
 	}
 	if got, want := rp.TitleModelFlagArgs(), []string{"--model", "cerebras/gpt-oss-120b"}; !reflect.DeepEqual(got, want) {
@@ -479,7 +479,7 @@ func TestBuiltinProvidersGroqOpenCodePreset(t *testing.T) {
 	if got := rp.ProviderSessionCreateTransport(); got != "acp" {
 		t.Fatalf("ProviderSessionCreateTransport() = %q, want acp", got)
 	}
-	if got, want := rp.ResolveDefaultArgs(), []string{"--model", "groq/openai/gpt-oss-120b"}; !reflect.DeepEqual(got, want) {
+	if got, want := mustDefaultArgs(t, rp), []string{"--model", "groq/openai/gpt-oss-120b"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ResolveDefaultArgs() = %v, want %v", got, want)
 	}
 	if got, want := rp.TitleModelFlagArgs(), []string{"--model", "groq/openai/gpt-oss-20b"}; !reflect.DeepEqual(got, want) {
@@ -535,7 +535,7 @@ func TestBuiltinProvidersGrokPreset(t *testing.T) {
 	if p.OptionDefaults["model"] != "grok-composer-2.5-fast" {
 		t.Errorf("OptionDefaults[model] = %q, want grok-composer-2.5-fast", p.OptionDefaults["model"])
 	}
-	if got, want := rp.ResolveDefaultArgs(), []string{"--permission-mode", "bypassPermissions", "--model", "grok-composer-2.5-fast"}; !reflect.DeepEqual(got, want) {
+	if got, want := mustDefaultArgs(t, rp), []string{"--permission-mode", "bypassPermissions", "--model", "grok-composer-2.5-fast"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ResolveDefaultArgs() = %v, want %v", got, want)
 	}
 	if got, want := rp.TitleModelFlagArgs(), []string{"--model", "grok-composer-2.5-fast"}; !reflect.DeepEqual(got, want) {
@@ -795,7 +795,7 @@ func TestProviderSessionCreateTransportBuiltinMimoCodeStaysOnCLIByDefault(t *tes
 			rp: ResolvedProvider{
 				Name:        "mimocode",
 				Command:     "mimo",
-				Args:        []string{"--never-ask-questions"},
+				Args:        []string{"--never-ask"},
 				SupportsACP: true,
 				ACPArgs:     []string{"acp"},
 			},
@@ -806,7 +806,7 @@ func TestProviderSessionCreateTransportBuiltinMimoCodeStaysOnCLIByDefault(t *tes
 				Name:            "custom-mimocode",
 				BuiltinAncestor: "mimocode",
 				Command:         "mimo",
-				Args:            []string{"--never-ask-questions"},
+				Args:            []string{"--never-ask"},
 				SupportsACP:     true,
 				ACPArgs:         []string{"acp"},
 			},
@@ -825,7 +825,7 @@ func TestProviderSessionCreateTransportBuiltinMimoCodeStaysOnCLIByDefault(t *tes
 			if got := ResolveSessionCreateTransport("acp", &rp); got != "acp" {
 				t.Fatalf("ResolveSessionCreateTransport(acp) = %q, want acp", got)
 			}
-			if got := rp.CommandString(); got != "mimo --never-ask-questions" {
+			if got := rp.CommandString(); got != "mimo --never-ask" {
 				t.Fatalf("CommandString() = %q, want headless MiMo CLI command", got)
 			}
 			if got := rp.ACPCommandString(); got != "mimo acp" {
@@ -874,5 +874,43 @@ func TestResolveSessionCreateTransportFallsBackToProviderCreateTransport(t *test
 	})
 	if got != "acp" {
 		t.Fatalf("ResolveSessionCreateTransport() = %q, want %q", got, "acp")
+	}
+}
+
+func TestPathCheckBinary(t *testing.T) {
+	tests := []struct {
+		name string
+		spec ProviderSpec
+		want string
+	}{
+		{
+			name: "PathCheck set takes precedence",
+			spec: ProviderSpec{PathCheck: "my-binary", Command: "other-binary --flag"},
+			want: "my-binary",
+		},
+		{
+			name: "simple Command without spaces",
+			spec: ProviderSpec{Command: "my-binary"},
+			want: "my-binary",
+		},
+		{
+			name: "Command with arguments returns first token",
+			spec: ProviderSpec{Command: "my-binary --agent coder --yolo"},
+			want: "my-binary",
+		},
+		{
+			name: "empty Command returns empty string",
+			spec: ProviderSpec{Command: ""},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.spec.pathCheckBinary()
+			if got != tt.want {
+				t.Errorf("pathCheckBinary() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

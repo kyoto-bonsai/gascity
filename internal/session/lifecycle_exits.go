@@ -2,6 +2,7 @@ package session
 
 import (
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -203,6 +204,47 @@ func RateLimitQuarantinePatch(until time.Time) MetadataPatch {
 		"state":                     string(StateAsleep),
 		"quarantined_until":         until.UTC().Format(time.RFC3339),
 		"sleep_reason":              string(SleepReasonRateLimit),
+		"last_woke_at":              "",
+		"pending_create_claim":      "",
+		"pending_create_started_at": "",
+	}
+}
+
+// ProviderResourceExhaustionQuarantinePatch backs a session off a detected
+// quota/credit exhaustion condition until the given time, same shape as
+// RateLimitQuarantinePatch (does not count a crash, does not reset
+// conversation metadata — a topped-up/reset account should resume the same
+// conversation, not start fresh). reason is the specific detected condition
+// (quota_exceeded, credit_exhausted — runtime.ProviderResourceExhaustionReason's
+// return value), recorded separately from the broad sleep_reason class label,
+// mirroring how markProviderTerminalError records its own specific reason
+// alongside the generic provider-terminal-error sleep_reason.
+func ProviderResourceExhaustionQuarantinePatch(until time.Time, reason string) MetadataPatch {
+	return MetadataPatch{
+		"state":                               string(StateAsleep),
+		"quarantined_until":                   until.UTC().Format(time.RFC3339),
+		"sleep_reason":                        string(SleepReasonProviderResourceExhausted),
+		"provider_resource_exhaustion_reason": strings.TrimSpace(reason),
+		"last_woke_at":                        "",
+		"pending_create_claim":                "",
+		"pending_create_started_at":           "",
+	}
+}
+
+// LoginExpiredQuarantinePatch backs a session off a detected login/auth-expiry
+// prompt until the given time, same shape as RateLimitQuarantinePatch and
+// ProviderResourceExhaustionQuarantinePatch — not a crash, conversation
+// metadata preserved so a re-authenticated seat resumes the same
+// conversation rather than restarting from zero (the ga-uwptpu incident this
+// whole durability wave traces back to). Kept as its own dedicated function
+// rather than folded into ProviderResourceExhaustionQuarantinePatch: distinct
+// sleep_reason per the operator's ruling on ga-5gsyts (S-metrics need to
+// track login-expiry match quality separately from quota/credit exhaustion).
+func LoginExpiredQuarantinePatch(until time.Time) MetadataPatch {
+	return MetadataPatch{
+		"state":                     string(StateAsleep),
+		"quarantined_until":         until.UTC().Format(time.RFC3339),
+		"sleep_reason":              string(SleepReasonLoginExpired),
 		"last_woke_at":              "",
 		"pending_create_claim":      "",
 		"pending_create_started_at": "",

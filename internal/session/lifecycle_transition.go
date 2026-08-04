@@ -240,7 +240,8 @@ func ClearWakeBlockersPatch(state State, sleepReason string) MetadataPatch {
 	}
 	switch SleepReason(sleepReason) {
 	case SleepReasonUserHold, SleepReasonWaitHold, SleepReasonQuarantine,
-		SleepReasonContextChurn, SleepReasonRateLimit, SleepReasonDrained:
+		SleepReasonContextChurn, SleepReasonRateLimit, SleepReasonDrained,
+		SleepReasonProviderResourceExhausted, SleepReasonLoginExpired:
 		patch["sleep_reason"] = ""
 	}
 	return patch
@@ -267,7 +268,8 @@ func ClearExpiredQuarantinePatch(sleepReason string) MetadataPatch {
 		"churn_count":       "0",
 	}
 	switch SleepReason(sleepReason) {
-	case SleepReasonQuarantine, SleepReasonContextChurn, SleepReasonRateLimit:
+	case SleepReasonQuarantine, SleepReasonContextChurn, SleepReasonRateLimit,
+		SleepReasonProviderResourceExhausted, SleepReasonLoginExpired:
 		patch["sleep_reason"] = ""
 	}
 	return patch
@@ -341,6 +343,7 @@ func CommitStartedPatch(input CommitStartedPatchInput) MetadataPatch {
 		"started_provision_hash":     input.ProvisionHash,
 		"started_launch_hash":        input.LaunchHash,
 		"continuation_reset_pending": "",
+		ResetCommittedAtKey:          "",
 	}
 	if input.CoreBreakdown != "" {
 		patch["core_hash_breakdown"] = input.CoreBreakdown

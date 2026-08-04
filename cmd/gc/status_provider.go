@@ -5,13 +5,21 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 var (
-	statusProviderCallTimeout    = 50 * time.Millisecond
+	// 50ms was tighter than even a healthy round trip (14-72ms observed
+	// directly against the supervisor API, ga-qkcb92) and tighter than the
+	// 750ms budget statusObservationTimeout (cmd_citystatus.go) grants each
+	// target — this probe was swallowing that whole budget and reporting
+	// "partial status" on ordinary latency, not just genuine slow-start/
+	// degradation. 500ms keeps real margin over the healthy case while
+	// staying under the outer per-target ceiling.
+	statusProviderCallTimeout    = 500 * time.Millisecond
 	statusProviderTimeoutWarning = func() {
 		fmt.Fprintln(os.Stderr, "gc status: runtime status probe timed out; using partial status")
 	}
@@ -20,9 +28,25 @@ var (
 type statusProvider struct {
 	base     runtime.Provider
 	warnOnce sync.Once
+	partial  atomic.Bool
 }
 
 var _ runtime.RelaunchProvider = (*statusProvider)(nil)
+
+func statusProviderPartial(sp any) bool {
+	p, ok := sp.(*statusProvider)
+	return ok && p.partial.Load()
+}
+
+func markStatusProviderPartial(sp any) {
+	if p, ok := sp.(*statusProvider); ok {
+		p.partial.Store(true)
+	}
+}
+
+func (p *statusProvider) StatusPartial() bool {
+	return p.partial.Load()
+}
 
 func newBoundedStatusProvider(base runtime.Provider) runtime.Provider {
 	if sp, ok := base.(*statusProvider); ok {
@@ -43,6 +67,7 @@ func boundedStatusCall[T any](p *statusProvider, fallback T, fn func() T) T {
 	case result := <-resultCh:
 		return result
 	case <-time.After(statusProviderCallTimeout):
+		p.partial.Store(true)
 		p.warnOnce.Do(statusProviderTimeoutWarning)
 		return fallback
 	}

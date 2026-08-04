@@ -56,6 +56,11 @@ func TestContainsWorkspaceTrustDialog(t *testing.T) {
 			want:    true,
 		},
 		{
+			name:    "pi trust dialog",
+			content: "Trust project folder?\n/home/user/project\n\nThis allows pi to load .pi settings and resources, install missing project packages, and execute project extensions.\n\n\u2192 Trust\n  Trust parent folder (/home/user)\n  Trust (this session only)\n  Do not trust\n  Do not trust (this session only)",
+			want:    true,
+		},
+		{
 			name:    "normal prompt text",
 			content: "> waiting for input",
 			want:    false,
@@ -112,6 +117,32 @@ func TestAcceptStartupDialogsAcceptsGeminiTrustDialog(t *testing.T) {
 				return "Do you trust the files in this folder?\n● 1. Trust folder (city)\n  2. Trust parent folder\n  3. Don't trust", nil
 			}
 			return "Type your message or @path/to/file", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Enter"}) {
+		t.Fatalf("sent keys = %v, want [Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsAcceptsPiTrustDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			if len(sent) == 0 {
+				return "Trust project folder?\n/home/user/project\n\nThis allows pi to load .pi settings and resources, install missing project packages, and execute project extensions.\n\n\u2192 Trust\n  Trust parent folder (/home/user)\n  Trust (this session only)\n  Do not trust\n  Do not trust (this session only)", nil
+			}
+			return "\u276f ", nil
 		},
 		func(keys ...string) error {
 			sent = append(sent, keys...)
@@ -310,6 +341,47 @@ func TestAcceptStartupDialogsTrustsCodexHookReviewDialog(t *testing.T) {
 	}
 	if got, want := strings.Join(sent, ","), "Down,Enter"; got != want {
 		t.Fatalf("sent keys = %q, want %q", got, want)
+	}
+}
+
+func TestAcceptStartupDialogsTrustsCompactCodexHookReviewDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			if len(sent) == 0 {
+				return "⚠ 8 hooks need review before they can run.\nPress t to trust all; enter to review hooks; esc to skip", nil
+			}
+			return "› Implement {feature}", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs returned error: %v", err)
+	}
+	if got, want := strings.Join(sent, ","), "Down,Enter"; got != want {
+		t.Fatalf("sent keys = %q, want %q", got, want)
+	}
+}
+
+func TestContainsCodexHookReviewDialogRequiresAllCompactSignals(t *testing.T) {
+	for name, content := range map[string]string{
+		"missing title":  "Press t to trust all; enter to review hooks; esc to skip",
+		"missing trust":  "8 hooks need review before they can run; enter to review hooks; esc to skip",
+		"missing review": "8 hooks need review before they can run; press t to trust all; esc to skip",
+		"unrelated":      "trust all configured hooks after entering review mode",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if containsCodexHookReviewDialog(content) {
+				t.Fatalf("containsCodexHookReviewDialog(%q) = true, want false", content)
+			}
+		})
 	}
 }
 
@@ -1362,6 +1434,38 @@ func TestContainsRateLimitDialog(t *testing.T) {
 	}
 }
 
+// spendLimitTokensScatteredScrollback simulates a pane that merely happens to
+// contain the spend-limit modal's three anchor tokens on unrelated, far-apart
+// scrollback lines (e.g. a session paging through these test fixtures). All
+// three tokens are present, but no small window of consecutive lines holds them
+// together, so this must NOT be classified as a rate-limit screen — otherwise a
+// crashed session viewing this content would be wrongly quarantined and its
+// crash masked.
+const spendLimitTokensScatteredScrollback = `$ less internal/runtime/dialog_test.go
+comment: the fixture mentions Usage credit balance in a doc comment here
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+comment: another fixture names Adjust monthly spend limit as a menu option
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+scrollback line unrelated to any modal
+comment: and a third names Wait for limit to reset as the confirm arm`
+
 func TestContainsProviderRateLimitScreen(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1373,6 +1477,9 @@ func TestContainsProviderRateLimitScreen(t *testing.T) {
 		{name: "claude hit limit", content: "You've hit your limit, Pro plan", want: true},
 		{name: "claude rate limit options", content: "/rate-limit-options", want: true},
 		{name: "provider menu shape", content: "Rate limit reached\n1. Keep trying\n2. Stop", want: true},
+		{name: "claude spend limit modal", content: "What do you want to do?\nUsage credit balance: $573.37\n❯ Adjust monthly spend limit: $1503.19\n  Wait for limit to reset      Resets Jul 12 at 11pm (America/Los_Angeles)\nEnter to confirm · Esc to cancel", want: true},
+		{name: "spend limit words without reset option", content: "notes mention Adjust monthly spend limit and Usage credit balance while documenting billing", want: false},
+		{name: "spend limit tokens scattered across unrelated scrollback", content: spendLimitTokensScatteredScrollback, want: false},
 		{name: "generic crash output", content: "worker failed while parsing rate limit config", want: false},
 		{name: "generic lower-case mention", content: "rate limit exceeded", want: false},
 		{name: "normal output", content: "Hello world", want: false},
@@ -1396,15 +1503,83 @@ func TestProviderTerminalErrorReason(t *testing.T) {
 		{name: "codex model not found code", content: "model_not_found: gpt-5.3-codex-spark", want: "model_not_found"},
 		{name: "model not found text", content: "Error: model gpt-x was not found", want: "model_not_found"},
 		{name: "model and not-found on different lines is not terminal", content: "loading model weights\n... file path not found", want: ""},
-		{name: "quota exceeded", content: "Error: quota exceeded", want: "quota_exceeded"},
-		{name: "insufficient quota", content: "insufficient_quota: billing required", want: "quota_exceeded"},
-		{name: "disk quota is not provider quota", content: "disk quota exceeded while writing log", want: ""},
 		{name: "generic rate limit remains transient", content: "Rate limit reached\n1. Keep trying\n2. Stop", want: ""},
+		// quota exceeded / insufficient quota / credit exhaustion are NOT
+		// terminal as of ga-5gsyts — moved to ProviderResourceExhaustionReason
+		// below, since these are retryable resource limits, not a permanent
+		// config problem like a wrong model id. Kept here as explicit negative
+		// cases so a future edit can't silently re-merge the two classes.
+		{name: "quota exceeded is not terminal (moved to resource-exhaustion)", content: "Error: quota exceeded", want: ""},
+		{name: "insufficient quota is not terminal (moved to resource-exhaustion)", content: "insufficient_quota: billing required", want: ""},
+		{name: "credit balance is not terminal", content: "Your credit balance is too low to access the Claude API.", want: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := ProviderTerminalErrorReason(tt.content); got != tt.want {
 				t.Errorf("ProviderTerminalErrorReason(%q) = %q, want %q", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProviderResourceExhaustionReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "quota exceeded", content: "Error: quota exceeded", want: "quota_exceeded"},
+		{name: "insufficient quota", content: "insufficient_quota: billing required", want: "quota_exceeded"},
+		{name: "quota_exceeded code", content: "error.type=quota_exceeded", want: "quota_exceeded"},
+		{name: "disk quota is not provider quota", content: "disk quota exceeded while writing log", want: ""},
+		{
+			name:    "anthropic credit balance too low",
+			content: "API Error: Your credit balance is too low to access the Claude API. Please go to Plans & Billing to upgrade or purchase credits.",
+			want:    "credit_exhausted",
+		},
+		{name: "credit balance match is case-insensitive", content: "CREDIT BALANCE IS TOO LOW", want: "credit_exhausted"},
+		{
+			name:    "spend-limit modal is not credit exhaustion (already routes via rate-limit)",
+			content: "Usage credit balance\nAdjust monthly spend limit\nWait for limit to reset",
+			want:    "",
+		},
+		{name: "model not found is not resource exhaustion", content: "model_not_found: gpt-5.3-codex-spark", want: ""},
+		{name: "generic rate limit is not resource exhaustion", content: "Rate limit reached\n1. Keep trying\n2. Stop", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ProviderResourceExhaustionReason(tt.content); got != tt.want {
+				t.Errorf("ProviderResourceExhaustionReason(%q) = %q, want %q", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestContainsLoginExpiredDialog(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "slash login command", content: "Please run /login to continue", want: true},
+		{name: "session expired", content: "Session expired. Please authenticate again.", want: true},
+		{name: "please log in", content: "Please log in to use Claude Code", want: true},
+		{name: "authentication expired", content: "Error: authentication expired", want: true},
+		{name: "oauth refresh failed", content: "oauth token refresh failed: invalid_grant", want: true},
+		{name: "failed to refresh token", content: "Failed to refresh token, please sign in again", want: true},
+		{name: "case-insensitive match", content: "SESSION EXPIRED", want: true},
+		{name: "normal startup output", content: "Starting Claude Code...\nReady.", want: false},
+		{name: "rate limit is not login expiry", content: "Rate limit reached\n1. Keep trying\n2. Stop", want: false},
+		{name: "quota exceeded is not login expiry", content: "Error: quota exceeded", want: false},
+		{name: "credit balance is not login expiry", content: "Your credit balance is too low to access the Claude API.", want: false},
+		{name: "model not found is not login expiry", content: "model_not_found: gpt-5.3-codex-spark", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ContainsLoginExpiredDialog(tt.content); got != tt.want {
+				t.Errorf("ContainsLoginExpiredDialog(%q) = %v, want %v", tt.content, got, tt.want)
 			}
 		})
 	}

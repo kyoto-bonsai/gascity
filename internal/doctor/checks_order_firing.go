@@ -1,6 +1,8 @@
 package doctor
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -18,7 +20,69 @@ import (
 const (
 	orderFiringCurrentName    = "order-firing-current"
 	orderFiringInspectHintFmt = "Inspect with: gc order check && gc order history %s"
+	orderFiringHistoryTimeout = 15 * time.Second
+	// orderFiringEventTailLimit bounds the order.fired scan to the most
+	// recent N matching events instead of the full history (ga-17ow3v: on a
+	// live city this file plus its rotated archives can exceed 350MB and
+	// 40k+ matching lines, which reliably blew the 15s budget below). The
+	// tail read only ever opens the active file, never the gzip archives.
+	// Any order whose true last-fired time falls outside this window still
+	// gets a correct answer via the c.lastRun fallback in latestOrderFiredAt
+	// — this limit only bounds the fast path, not correctness.
+	orderFiringEventTailLimit = 20000
+	// orderFiringLastRunTimeout bounds each PER-ORDER call to c.lastRun in
+	// latestOrderFiredAt (ga-17ow3v follow-up: the event-tail fix above
+	// shipped and verified bounded, but the check still timed out on this
+	// machine). Root cause is upstream, not this check: c.lastRun resolves
+	// through orders.LastRunAcross -> Store.LastRun, an already well-formed
+	// Limit:1/sorted/label-filtered beads query — the slowness is this
+	// city's Dolt sql-server saturating under normal fleet concurrency
+	// (tracked separately as ga-t2brh8, "schema migration lock unavailable:
+	// timeout"; closed 2026-07-26 with adaptive backoff on a DIFFERENT
+	// codepath — gc's own session/hook work-query polling — so contention
+	// here is mitigated by that fix, not eliminated by it). Direct
+	// measurement on this machine: a single `gc order history <name>` call
+	// for the one order that actually needed this fallback took 92s; a
+	// `gc order check` pass over all ~20 monitored orders took 2m2s. No fixed
+	// WHOLE-check timeout below several minutes could make the old design
+	// (any one order's lastRun call blocks the entire check, discarding every
+	// other order's already-computed result) reliably pass here. Bounding the
+	// call per-order instead means the orders that resolve from the
+	// in-memory event tail are unaffected, and only the order(s) actually
+	// needing the fallback degrade to tail-only data (see
+	// errOrderHistoryLookupTimedOut) rather than blinding the whole check.
+	//
+	// A FIXED per-order bound alone does not bound the AGGREGATE, though:
+	// enough orders needing the fallback at once — this city monitors ~27,
+	// several on multi-hour cooldowns liable to fall outside the event tail
+	// together — can still sum past orderFiringHistoryTimeout and trip the
+	// whole-check timeout in Run, reintroducing the exact symptom this bound
+	// was meant to fix (persona-marcus review on this bead, 2026-07-26).
+	// latestOrderFiredAt now additionally clamps each attempt to whatever
+	// remains of the whole-check deadline (see orderFiringDeadlineReserve),
+	// so no combination of stalled orders can exceed it: once the shared
+	// budget is spent, remaining orders degrade immediately without even
+	// attempting the call.
+	orderFiringLastRunTimeout = 5 * time.Second
+	// orderFiringDeadlineReserve is held back from the whole-check deadline
+	// when computing how much of the remaining budget a per-order lastRun
+	// attempt may use (see latestOrderFiredAt). It covers Run's own
+	// goroutine-dispatch and channel-select overhead so a fully-consumed
+	// per-order budget can't itself tip the whole check past
+	// orderFiringHistoryTimeout. Measured against real wall-clock time
+	// (time.Now/time.Until), never the mockable clock field — the whole-check
+	// budget is a real-process constraint, independent of whatever simulated
+	// "now" business-logic classification uses.
+	orderFiringDeadlineReserve = 1 * time.Second
 )
+
+// errOrderHistoryLookupTimedOut signals that a single order's Dolt/beads
+// fallback lookup (c.lastRun) did not return within the check's configured
+// last-run timeout. Callers should treat this as a soft degradation, not a
+// hard failure: the accompanying time.Time is still the best available
+// (tail-derived) answer, and ga-t2brh8 — not this check — owns fixing the
+// underlying contention.
+var errOrderHistoryLookupTimedOut = errors.New("order-run history lookup timed out")
 
 // OrderFiringCurrentLastRunFunc reports the newest persisted run time for an order.
 type OrderFiringCurrentLastRunFunc func(order orders.Order) (time.Time, error)
@@ -36,23 +100,49 @@ func WithOrderFiringCurrentLastRunFunc(fn OrderFiringCurrentLastRunFunc) OrderFi
 
 // OrderFiringCurrentCheck reports scheduled orders whose last firing is stale.
 type OrderFiringCurrentCheck struct {
-	cfg      *config.City
-	cityPath string
-	clock    func() time.Time
-	lastRun  OrderFiringCurrentLastRunFunc
+	cfg             *config.City
+	cityPath        string
+	clock           func() time.Time
+	lastRun         OrderFiringCurrentLastRunFunc
+	historyTimeout  time.Duration
+	lastRunTimeout  time.Duration
+	deadlineReserve time.Duration
 }
 
 // NewOrderFiringCurrentCheck creates a check for cron and cooldown order freshness.
 func NewOrderFiringCurrentCheck(cfg *config.City, cityPath string, opts ...OrderFiringCurrentOption) *OrderFiringCurrentCheck {
 	check := &OrderFiringCurrentCheck{
-		cfg:      cfg,
-		cityPath: cityPath,
-		clock:    time.Now,
+		cfg:             cfg,
+		cityPath:        cityPath,
+		clock:           time.Now,
+		historyTimeout:  orderFiringHistoryTimeout,
+		lastRunTimeout:  orderFiringLastRunTimeout,
+		deadlineReserve: orderFiringDeadlineReserve,
 	}
 	for _, opt := range opts {
 		opt(check)
 	}
 	return check
+}
+
+// resolvedLastRunTimeout returns the configured per-order lastRun timeout,
+// falling back to orderFiringLastRunTimeout for checks constructed via a bare
+// struct literal (as several tests do) rather than NewOrderFiringCurrentCheck.
+func (c *OrderFiringCurrentCheck) resolvedLastRunTimeout() time.Duration {
+	if c.lastRunTimeout > 0 {
+		return c.lastRunTimeout
+	}
+	return orderFiringLastRunTimeout
+}
+
+// resolvedDeadlineReserve returns the configured deadline reserve, falling
+// back to orderFiringDeadlineReserve for checks constructed via a bare struct
+// literal rather than NewOrderFiringCurrentCheck.
+func (c *OrderFiringCurrentCheck) resolvedDeadlineReserve() time.Duration {
+	if c.deadlineReserve > 0 {
+		return c.deadlineReserve
+	}
+	return orderFiringDeadlineReserve
 }
 
 // Name returns the check identifier shown by gc doctor.
@@ -66,6 +156,41 @@ func (c *OrderFiringCurrentCheck) Fix(_ *CheckContext) error { return nil }
 
 // Run compares each cron or cooldown order with its order.fired history.
 func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
+	timeout := c.historyTimeout
+	if timeout <= 0 {
+		timeout = orderFiringHistoryTimeout
+	}
+	// Shared deadline for the whole check, threaded down to each per-order
+	// lastRun fallback attempt so no combination of stalled orders can sum
+	// past this budget (see orderFiringDeadlineReserve). Measured against
+	// real wall-clock time, not c.clock — the mockable clock field is for
+	// business-logic "now" (order-age classification) and is frozen to a
+	// fixed instant in most tests, which would never let a real-time budget
+	// shrink; the whole-check timeout below is likewise always real-time.
+	deadline := time.Now().Add(timeout)
+
+	// The order-history resolver opens the beads/Dolt store and does not accept
+	// a context. Keep that potentially blocking I/O from wedging the complete
+	// doctor run; the gc process exits after printing this failed check.
+	results := make(chan *CheckResult, 1)
+	go func() {
+		results <- c.run(ctx, deadline)
+	}()
+
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(timeout):
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusError,
+			Message: fmt.Sprintf("order history lookup timed out after %s", timeout),
+			FixHint: "check beads/Dolt connectivity, then rerun gc doctor",
+		}
+	}
+}
+
+func (c *OrderFiringCurrentCheck) run(ctx *CheckContext, deadline time.Time) *CheckResult {
 	result := &CheckResult{Name: c.Name()}
 	if c.cfg == nil {
 		result.Status = StatusOK
@@ -91,7 +216,7 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 
 	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
-	firedEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderFired})
+	firedEvents, err := events.ReadFilteredTail(context.Background(), eventPath, events.Filter{Type: events.OrderFired}, orderFiringEventTailLimit)
 	if err != nil {
 		result.Status = StatusError
 		result.Message = fmt.Sprintf("read order firing events: %v", err)
@@ -116,6 +241,7 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 	// stay visible without converting an advisory error into a blocking gate.
 	var blockingErrors, advisoryErrors int
 	suspendedRigs := orderFiringCurrentSuspendedRigs(c.cfg)
+	zeroMinPools := orderFiringCurrentZeroMinPools(c.cfg)
 
 	for _, order := range allOrders {
 		if order.Trigger != "cron" && order.Trigger != "cooldown" {
@@ -135,8 +261,9 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		lastFired, err := c.latestOrderFiredAt(firedEvents, order, expected, now)
-		if err != nil {
+		lastFired, err := c.latestOrderFiredAt(firedEvents, order, expected, now, deadline)
+		degradedLookup := errors.Is(err, errOrderHistoryLookupTimedOut)
+		if err != nil && !degradedLookup {
 			worst = worseStatus(worst, StatusError)
 			result.Details = append(result.Details, fmt.Sprintf("%s: cannot read order history: %v", orderDisplayName(order), err))
 			if firstNonOK == "" {
@@ -145,7 +272,18 @@ func (c *OrderFiringCurrentCheck) Run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt)
+		poolParked := orderFiringCurrentOrderPoolParked(zeroMinPools, order)
+		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt, poolParked)
+		if degradedLookup {
+			// lastFired is still the tail-derived value classifyOrderFiring
+			// just used (see latestOrderFiredAt) — only the Dolt/beads
+			// confirmation was skipped. Never silently report clean when we
+			// could not actually confirm it (see resolvedLastRunTimeout).
+			detail = fmt.Sprintf("%s — order-run history confirmation timed out after %s (see ga-t2brh8)", detail, c.resolvedLastRunTimeout())
+			if status == StatusOK {
+				status = StatusWarning
+			}
+		}
 		worst = worseStatus(worst, status)
 		result.Details = append(result.Details, detail)
 		if status != StatusOK {
@@ -315,6 +453,65 @@ func orderFiringCurrentOrderSuspended(suspended map[string]bool, order orders.Or
 	// Defensive support for legacy qualified pool values. Bare pool names parse
 	// with an empty rig and intentionally do not imply suspension by themselves.
 	if rigName, _ := config.ParseQualifiedName(order.Pool); rigName != "" && suspended[rigName] {
+		return true
+	}
+	return false
+}
+
+// orderFiringCurrentZeroMinPools returns the set of agent identities
+// (both QualifiedName and bare Name, to tolerate however order.Pool happens
+// to be spelled) whose min_active_sessions is EXPLICITLY zero — i.e. pools
+// deliberately scaled to no standing instances, not pools that simply never
+// configured the field.
+//
+// Deliberately checks a.MinActiveSessions == nil (unset) vs *a.MinActiveSessions
+// == 0 (explicit) directly, rather than EffectiveMinActiveSessions() > 0: that
+// helper treats nil and explicit-0 identically (both scale to zero), which is
+// correct for its own callers (a scaling floor, where "no minimum configured"
+// and "minimum configured to zero" behave the same) but wrong here, where the
+// question isn't "how many standing instances does this pool scale to" but
+// "did an operator assert this pool is parked on purpose." 88 of this city's
+// 92 agents simply never set the field; treating that as an assertion of
+// intent would silently make order-firing-current permanently advisory for
+// the next cron/cooldown order routed to any of them (persona-marcus
+// validation, ga-gfdfdc, 2026-08-02) — the same blindness this check exists
+// to catch, one step later. MinActiveSessions != nil as the intent
+// discriminator matches the existing precedent at session_capacity.go:123.
+func orderFiringCurrentZeroMinPools(cfg *config.City) map[string]bool {
+	out := make(map[string]bool)
+	if cfg == nil {
+		return out
+	}
+	for _, a := range cfg.Agents {
+		if a.MinActiveSessions == nil || *a.MinActiveSessions != 0 {
+			continue
+		}
+		if qn := a.QualifiedName(); qn != "" {
+			out[qn] = true
+		}
+		if a.Name != "" {
+			out[a.Name] = true
+		}
+	}
+	return out
+}
+
+// orderFiringCurrentOrderPoolParked reports whether order's backing pool is a
+// deliberately-scaled-to-zero pool (min_active_sessions=0): a cron/cooldown
+// order routed there has no standing agent to pick it up, so its staleness
+// reflects an intentional scaling policy rather than a detection-worthy
+// outage (ga-gfdfdc). Matches order.Pool the same tolerant way
+// orderFiringCurrentOrderSuspended matches order.Rig: exact string first,
+// then its unqualified name via ParseQualifiedName.
+func orderFiringCurrentOrderPoolParked(zeroMinPools map[string]bool, order orders.Order) bool {
+	pool := strings.TrimSpace(order.Pool)
+	if pool == "" {
+		return false
+	}
+	if zeroMinPools[pool] {
+		return true
+	}
+	if _, name := config.ParseQualifiedName(pool); name != "" && zeroMinPools[name] {
 		return true
 	}
 	return false
@@ -520,7 +717,10 @@ func cronRangeForDoctor(rangePart string, lowerBound, upperBound int) (int, int,
 }
 
 func latestControllerStartedAt(eventPath string) (time.Time, error) {
-	startEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.ControllerStarted})
+	// Only the single newest controller.started event matters here, so a
+	// tail read of 1 is sufficient — see orderFiringEventTailLimit above for
+	// why an unbounded scan of this file is worth avoiding.
+	startEvents, err := events.ReadFilteredTail(context.Background(), eventPath, events.Filter{Type: events.ControllerStarted}, 1)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -533,7 +733,7 @@ func latestControllerStartedAt(eventPath string) (time.Time, error) {
 	return latest, nil
 }
 
-func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order orders.Order, expected time.Duration, now time.Time) (time.Time, error) {
+func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order orders.Order, expected time.Duration, now time.Time, deadline time.Time) (time.Time, error) {
 	latest := latestOrderFiredAt(evts, order.ScopedName())
 	if c.lastRun == nil {
 		return latest, nil
@@ -541,14 +741,54 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 	if !latest.IsZero() && now.Sub(latest) < expected+expected/2 {
 		return latest, nil
 	}
-	runAt, err := c.lastRun(order)
-	if err != nil {
-		return time.Time{}, err
+
+	// c.lastRun opens the beads/Dolt store and does not accept a context (see
+	// the comment on Run for why that call is kept off the main goroutine).
+	// Bound it per-order here too: under known Dolt contention (ga-t2brh8) a
+	// single call can take well over a minute, and letting that block this
+	// whole method serially would once again let one stalled order consume
+	// every other order's time budget (the original ga-17ow3v symptom, just
+	// moved one level down).
+	//
+	// A fixed per-order bound alone still lets enough stalled orders sum past
+	// the whole-check budget (persona-marcus review, 2026-07-26), so clamp
+	// this attempt to whatever remains of the shared deadline first. Once
+	// that shared budget is gone, degrade immediately without even attempting
+	// the call — an attempt that can't complete in time isn't worth the
+	// goroutine/scheduling overhead, and every order after the exhaustion
+	// point still needs to be classified and reported, not discarded.
+	perCallTimeout := c.resolvedLastRunTimeout()
+	if !deadline.IsZero() {
+		if remaining := time.Until(deadline) - c.resolvedDeadlineReserve(); remaining < perCallTimeout {
+			perCallTimeout = remaining
+		}
 	}
-	if runAt.After(latest) {
-		return runAt, nil
+	if perCallTimeout <= 0 {
+		return latest, errOrderHistoryLookupTimedOut
 	}
-	return latest, nil
+
+	type lastRunResult struct {
+		at  time.Time
+		err error
+	}
+	resultCh := make(chan lastRunResult, 1)
+	go func() {
+		at, err := c.lastRun(order)
+		resultCh <- lastRunResult{at, err}
+	}()
+
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			return time.Time{}, res.err
+		}
+		if res.at.After(latest) {
+			return res.at, nil
+		}
+		return latest, nil
+	case <-time.After(perCallTimeout):
+		return latest, errOrderHistoryLookupTimedOut
+	}
 }
 
 func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
@@ -564,20 +804,32 @@ func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
 	return latest
 }
 
-func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
+func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time, poolParked bool) (CheckStatus, CheckSeverity, string) {
 	name := orderDisplayName(order)
+	// A pool deliberately scaled to zero standing instances (min_active_sessions=0)
+	// has no agent to pick up cron/cooldown work; staleness there is the expected,
+	// intended state — not a detection-worthy outage (ga-gfdfdc) — so it stays
+	// advisory rather than gating dispatch/exit codes. Status is left at its normal
+	// (non-OK) value so the condition is still visible, just not blocking.
+	parkedNote := ""
+	blockingUnlessParked := SeverityBlocking
+	if poolParked {
+		parkedNote = " (pool scaled to 0 standing instances: advisory, not blocking)"
+		blockingUnlessParked = SeverityAdvisory
+	}
+
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
 			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
 		if uptime >= expected+expected/2 {
-			// Advisory only for cron: a cron order that has never fired since
-			// controller start may be the cron-scheduler bug (ga-97qngx), not
-			// a real outage. Cooldown never-fired/stale paths remain blocking
-			// because they indicate an execution gap.
-			if order.Trigger == "cron" {
-				return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
+			// Advisory for cron (may be the cron-scheduler bug, ga-97qngx) or for
+			// any order whose pool is deliberately parked. Cooldown never-fired/
+			// stale paths against a live pool remain blocking — they indicate a
+			// real execution gap.
+			if order.Trigger == "cron" || poolParked {
+				return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired since controller start %s ago%s", name, formatOrderFiringDuration(uptime), parkedNote)
 			}
 			return StatusError, SeverityBlocking, fmt.Sprintf("%s: never fired since controller start %s ago", name, formatOrderFiringDuration(uptime))
 		}
@@ -587,9 +839,9 @@ func classifyOrderFiring(order orders.Order, now time.Time, expected time.Durati
 	age := nonNegativeDuration(now.Sub(lastFired))
 	switch {
 	case age >= expected*3:
-		return StatusError, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusError, blockingUnlessParked, fmt.Sprintf("%s: last fired %s ago, expected every %s (CRITICAL: stale)%s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected), parkedNote)
 	case age >= expected+expected/2:
-		return StatusWarning, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s (overdue)", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
+		return StatusWarning, blockingUnlessParked, fmt.Sprintf("%s: last fired %s ago, expected every %s (overdue)%s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected), parkedNote)
 	default:
 		return StatusOK, SeverityBlocking, fmt.Sprintf("%s: last fired %s ago, expected every %s", name, formatOrderFiringDuration(age), formatOrderFiringDuration(expected))
 	}

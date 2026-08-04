@@ -283,6 +283,25 @@ const (
 	// while still re-detecting and re-quarantining during longer windows.
 	defaultRateLimitQuarantineDuration = 30 * time.Minute
 
+	// defaultProviderResourceExhaustionQuarantineDuration is how long to hold
+	// a session when the pane shows a quota/credit exhaustion condition
+	// (runtime.ProviderResourceExhaustionReason). Matches
+	// defaultRateLimitQuarantineDuration's value and reasoning for the same
+	// reason: no incident-derived MTTR data exists yet to justify a different
+	// number, and the mechanism naturally re-quarantines if still exhausted
+	// on the next check rather than needing the first guess to be exact.
+	defaultProviderResourceExhaustionQuarantineDuration = 30 * time.Minute
+
+	// defaultLoginExpiredQuarantineDuration is how long to hold a session when
+	// the pane shows a detected login/auth-expiry prompt
+	// (runtime.ContainsLoginExpiredDialog). Same value and same reasoning as
+	// the other two quarantine classes: this needs a human to actually
+	// re-authenticate (not a self-resolving window like quota/rate-limit), but
+	// absent MTTR data on how long that typically takes, matching the existing
+	// convention re-quarantines on the same cadence rather than guessing a
+	// different number with no evidence behind it either way.
+	defaultLoginExpiredQuarantineDuration = 30 * time.Minute
+
 	// defaultMaxWakeAttempts is how many consecutive wake failures before
 	// quarantine.
 	defaultMaxWakeAttempts = 5

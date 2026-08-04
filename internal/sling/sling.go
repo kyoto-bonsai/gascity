@@ -130,7 +130,11 @@ type SlingDeps struct {
 	// SourceWorkflowStores lists every bead store that may contain workflow
 	// roots for source-workflow singleton checks and recovery.
 	SourceWorkflowStores func() ([]SourceWorkflowStore, error)
-	Tracer               func(format string, args ...any)
+	// SourceWorkflowStoreScanWarning reports a non-source store whose live-root
+	// scan failed and was skipped. When nil, scan failures remain fatal. The
+	// source store identified by StoreRef is always strict and is never skipped.
+	SourceWorkflowStoreScanWarning func(storeRef string, err error)
+	Tracer                         func(format string, args ...any)
 
 	// Narrow interfaces (matches established internal package patterns).
 	Resolver AgentResolver  // agent name resolution
@@ -235,6 +239,11 @@ type RouteOpts struct {
 	Merge    string // "", "direct", "mr", "local"
 	NoConvoy bool
 	Owned    bool
+	// Reassign clears any existing human assignee on the bead before routing,
+	// so a sling can hand a bead claimed via `bd update --claim` to a new
+	// target's pool. Mapped straight to SlingOpts.Reassign; without it neither
+	// RouteBead nor the API sling path can express --reassign. See #1007.
+	Reassign bool
 	Nudge    bool
 	Force    bool
 	DryRun   bool
@@ -250,11 +259,24 @@ type RouteOpts struct {
 
 // FormulaOpts holds options for formula-based operations.
 type FormulaOpts struct {
-	Title     string
-	Vars      []string
-	Merge     string
-	Nudge     bool
-	Force     bool
+	Title string
+	Vars  []string
+	Merge string
+	Nudge bool
+	Force bool
+	// NoConvoy and Owned mirror RouteOpts. Meaningful on AttachFormula (attached
+	// routes are !IsFormula so auto-convoy applies); a no-op on a fresh
+	// LaunchFormula, matching the Reassign precedent below. Kept here so the API
+	// formula paths honor the wire no_convoy/owned fields.
+	NoConvoy bool
+	Owned    bool
+	// Reassign clears any existing human assignee before routing. Meaningful
+	// on AttachFormula (an existing bead may be claimed, and the attach route
+	// is !IsFormula); a guaranteed no-op on a fresh LaunchFormula, whose
+	// IsFormula route is skipped by shouldReopenForReassign so the formula name
+	// is never mistaken for a bead ID. Kept here so the API formula paths honor
+	// the wire reassign field, matching RouteOpts.
+	Reassign  bool
 	DryRun    bool
 	SkipPoke  bool
 	ScopeKind string
@@ -269,11 +291,13 @@ func (s *Sling) RouteBead(_ context.Context, beadID string, target config.Agent,
 		Merge:         opts.Merge,
 		NoConvoy:      opts.NoConvoy,
 		Owned:         opts.Owned,
+		Reassign:      opts.Reassign,
 		Nudge:         opts.Nudge,
 		Force:         opts.Force,
 		SkipPoke:      opts.SkipPoke,
 		DryRun:        opts.DryRun,
 		InlineText:    opts.InlineText,
+		NoFormula:     opts.NoFormula,
 	}, s.deps, s.deps.Store)
 }
 
@@ -286,8 +310,11 @@ func (s *Sling) LaunchFormula(_ context.Context, formulaName string, target conf
 		Title:         opts.Title,
 		Vars:          opts.Vars,
 		Merge:         opts.Merge,
+		NoConvoy:      opts.NoConvoy,
+		Owned:         opts.Owned,
 		Nudge:         opts.Nudge,
 		Force:         opts.Force,
+		Reassign:      opts.Reassign,
 		SkipPoke:      opts.SkipPoke,
 		DryRun:        opts.DryRun,
 		ScopeKind:     opts.ScopeKind,
@@ -304,8 +331,11 @@ func (s *Sling) AttachFormula(_ context.Context, formulaName, beadID string, tar
 		Title:         opts.Title,
 		Vars:          opts.Vars,
 		Merge:         opts.Merge,
+		NoConvoy:      opts.NoConvoy,
+		Owned:         opts.Owned,
 		Nudge:         opts.Nudge,
 		Force:         opts.Force,
+		Reassign:      opts.Reassign,
 		SkipPoke:      opts.SkipPoke,
 		DryRun:        opts.DryRun,
 		ScopeKind:     opts.ScopeKind,
@@ -321,6 +351,7 @@ func (s *Sling) ExpandConvoy(_ context.Context, convoyID string, target config.A
 		Merge:         opts.Merge,
 		NoConvoy:      opts.NoConvoy,
 		Owned:         opts.Owned,
+		Reassign:      opts.Reassign,
 		Nudge:         opts.Nudge,
 		Force:         opts.Force,
 		SkipPoke:      opts.SkipPoke,
@@ -810,6 +841,70 @@ type MissingBeadError struct {
 // Error returns the missing-bead diagnostic.
 func (e *MissingBeadError) Error() string {
 	return fmt.Sprintf("bead %q not found in store %s", e.BeadID, e.StoreRef)
+}
+
+// MissingOfficerOfRecordError reports that a staff-persona routing target's
+// bead lacks required gc.officer_of_record metadata. There is no --force
+// override for this check — rigs/personas/ariadne-plan-persona-standards-2026-07-25.md
+// phase_2_slinggate ruling (a) retires the prior flagged-exception dispatch
+// path entirely; this is the hard gate that replaces it.
+type MissingOfficerOfRecordError struct {
+	BeadID string
+	Target string
+}
+
+// Error returns the officer-of-record diagnostic, including the fix command.
+func (e *MissingOfficerOfRecordError) Error() string {
+	return fmt.Sprintf(
+		"gc sling: refusing %s → %s: missing gc.officer_of_record — "+
+			"set one first (gc bd update %s --set-metadata gc.officer_of_record=<officer>); "+
+			"no --force override for this check",
+		e.BeadID, e.Target, e.BeadID)
+}
+
+// LiveRoutingConflictError reports that a staff-persona routing target
+// already has a live session claimed on a different bead. Unlike
+// MissingOfficerOfRecordError, --force overrides this check — see
+// shouldCheckLiveRoutingConflict's doc comment for why.
+type LiveRoutingConflictError struct {
+	BeadID            string
+	Target            string
+	ConflictingBeadID string
+	Session           string
+}
+
+// Error returns the live-routing-conflict diagnostic, naming the conflicting
+// bead and session so the caller can inspect it before deciding to --force.
+func (e *LiveRoutingConflictError) Error() string {
+	return fmt.Sprintf(
+		"gc sling: refusing %s → %s: target has a live session (%s) already claimed on %s — "+
+			"use --force to override, or wait for %s to release it",
+		e.BeadID, e.Target, e.Session, e.ConflictingBeadID, e.ConflictingBeadID)
+}
+
+// NonDispatchableTargetError reports that opts.BeadOrFormula's status/defer
+// state would keep it invisible to Ready()'s pool-demand probe even after
+// gc.routed_to is stamped onto it — writing the metadata "succeeds" but the
+// bead never surfaces to any session, a silent no-op dispatch (confirmed
+// specimen: ga-96zjze, parked indefinitely deferred, routed via sling,
+// gc.routed_to moved successfully, and invisible to `bd ready` for 21h;
+// ga-tk5mcg.2). There is no --force override: forcing through never
+// produces a working dispatch, only the exact silently-stranded state this
+// check exists to prevent.
+type NonDispatchableTargetError struct {
+	BeadID string
+	Target string
+	Status string // human-readable, e.g. "closed", "deferred indefinitely", "deferred until 2026-08-01T00:00:00Z"
+	Fix    string // the actionable command to resolve it
+}
+
+// Error returns the non-dispatchable-target diagnostic, naming the status
+// and the fix command per ga-tk5mcg.2's acceptance floor.
+func (e *NonDispatchableTargetError) Error() string {
+	return fmt.Sprintf(
+		"gc sling: refusing %s → %s: target bead is %s — invisible to the ready pool, "+
+			"dispatch would silently no-op; %s; no --force override for this check",
+		e.BeadID, e.Target, e.Status, e.Fix)
 }
 
 // BeadLookupError reports an operational failure while checking whether a bead
@@ -1316,7 +1411,7 @@ func InstantiateCompiledSlingFormula(ctx context.Context, recipe *formula.Recipe
 // atomic across processes.
 func materializeCompiledSlingFormula(ctx context.Context, recipe *formula.Recipe, formulaName string, opts molecule.Options, sourceBeadID, scopeKind, scopeRef string, graphWorkflow bool, a config.Agent, deps SlingDeps, forceGraphV2Replace ...bool) (*molecule.Result, error) {
 	graphStore := deps.graphStore()
-	if err := graphroute.ApplyGraphRouting(recipe, &a, a.QualifiedName(), opts.Vars, sourceBeadID, scopeKind, scopeRef, deps.StoreRef, graphStore, deps.CityName, deps.Cfg, deps.graphrouteDeps()); err != nil {
+	if err := graphroute.ApplyGraphRouting(recipe, &a, agentutil.RoutedToIdentity(&a), opts.Vars, sourceBeadID, scopeKind, scopeRef, deps.StoreRef, graphStore, deps.CityName, deps.Cfg, deps.graphrouteDeps()); err != nil {
 		SlingTracef("instantiate decorate-error formula=%s err=%v", formulaName, err)
 		return nil, err
 	}

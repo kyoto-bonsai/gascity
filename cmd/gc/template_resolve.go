@@ -27,7 +27,9 @@ import (
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
+	"github.com/gastownhall/gascity/internal/execenv"
 	"github.com/gastownhall/gascity/internal/materialize"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
@@ -191,8 +193,15 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		command = appendKimiHookConfigArg(command)
 	}
 	// Append schema-derived default args (e.g., --dangerously-skip-permissions
-	// from EffectiveDefaults["permission_mode"] = "unrestricted").
-	if defaultArgs := resolved.ResolveDefaultArgs(); len(defaultArgs) > 0 {
+	// from EffectiveDefaults["permission_mode"] = "unrestricted"). A default
+	// that cannot resolve to args fails the spawn here rather than launching
+	// the seat without the configured flag (ga-b0flc8: a silently dropped
+	// model pin fell back to the fleet default with zero warning).
+	defaultArgs, err := resolved.ResolveDefaultArgs()
+	if err != nil {
+		return TemplateParams{}, fmt.Errorf("agent %q: resolving option defaults: %w", qualifiedName, err)
+	}
+	if len(defaultArgs) > 0 {
 		command = command + " " + shellquote.Join(defaultArgs)
 	}
 	sa, err := ensureClaudeSettingsArgs(p.fs, p.cityPath, providerFamily, p.stderr)
@@ -437,7 +446,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		workspaceEnv = p.workspace.Env
 	}
 	env := mergeEnv(passthroughEnv(), expandEnvMap(workspaceEnv), expandEnvMap(resolved.Env), expandEnvMap(cfgAgent.Env), agentEnv)
-	prependGCBinDirToPATH(env, env["GC_BIN"])
+	processenv.PrependGCBinDirToPATH(env, env["GC_BIN"])
 	env = convergence.ScrubTokenEnv(env)
 
 	// Step 10b: Upstream axis (Phase C). Inject the selected upstream's serving
@@ -492,6 +501,10 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 			env[k] = v
 		}
 	}
+	// Managed agents are Gas City-owned recursive execution environments. Set
+	// the GC-only opt-out after configurable layers so child gc commands cannot
+	// re-enable product metrics; Beads telemetry remains independent.
+	env[execenv.UsageMetricsDisableEnv] = execenv.UsageMetricsDisableValue
 
 	// Step 11: Expand session setup templates.
 	configDir := p.cityPath

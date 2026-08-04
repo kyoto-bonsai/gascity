@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -229,7 +230,7 @@ func TestNewFileRecorderMigratesLegacyArchiveOnOpen(t *testing.T) {
 		t.Errorf("migrated archive content mismatch:\n got=%q\nwant=%q", got, body)
 	}
 
-	all, err := ReadAll(path)
+	all, err := ReadAll(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
 	}

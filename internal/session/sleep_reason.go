@@ -30,10 +30,29 @@ const (
 	SleepReasonRateLimit             SleepReason = "rate_limit"
 	SleepReasonFailedCreate          SleepReason = "failed-create"
 	SleepReasonProviderTerminalError SleepReason = "provider-terminal-error"
+	// SleepReasonProviderResourceExhausted marks a temporary provider resource
+	// limit (API quota or account credit balance) — unlike
+	// SleepReasonProviderTerminalError, this is expected to self-resolve, so
+	// the session quarantines-and-retries (RateLimitQuarantinePatch-shaped
+	// metadata via quarantined_until) instead of being marked
+	// unhealthy/drainable. The specific detected reason (quota_exceeded,
+	// credit_exhausted — see runtime.ProviderResourceExhaustionReason) is
+	// recorded separately, mirroring provider_terminal_error's own
+	// class-label-plus-specific-reason split.
+	SleepReasonProviderResourceExhausted SleepReason = "provider-resource-exhausted"
+	// SleepReasonLoginExpired marks a detected login/auth-expiry prompt
+	// (runtime.ContainsLoginExpiredDialog) — kept distinct from
+	// SleepReasonProviderResourceExhausted (a different failure class: no
+	// credentials, not "the account ran out of quota/credits") specifically so
+	// S-metrics can track match quality/false-positive rate per the operator's
+	// ruling on ga-5gsyts, ahead of a real captured transcript to validate
+	// against. Same quarantine-and-retry shape as the other two.
+	SleepReasonLoginExpired          SleepReason = "login_expired"
 	SleepReasonRuntimeMissing        SleepReason = SleepReason(LifecycleReasonRuntimeMissing)
 	SleepReasonQuarantine            SleepReason = "quarantine"
 	SleepReasonContextChurn          SleepReason = "context-churn"
 	SleepReasonMaxSessionAge         SleepReason = "max-session-age"
+	SleepReasonAssignedWorkExhausted SleepReason = "assigned-work-exhausted"
 )
 
 // IsDeliberateSleepReason reports whether a sleep_reason records an
@@ -53,7 +72,8 @@ func IsDeliberateSleepReason(reason string) bool {
 	case SleepReasonIdle, SleepReasonIdleTimeout, SleepReasonNoWakeReason,
 		SleepReasonConfigDrift, SleepReasonDrained, SleepReasonCityStop,
 		SleepReasonUserHold, SleepReasonWaitHold, SleepReasonRateLimit,
-		SleepReasonFailedCreate, SleepReasonProviderTerminalError:
+		SleepReasonFailedCreate, SleepReasonProviderTerminalError,
+		SleepReasonProviderResourceExhausted, SleepReasonLoginExpired:
 		return true
 	default:
 		return false

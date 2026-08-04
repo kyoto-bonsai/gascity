@@ -133,3 +133,41 @@ func SessionResetStalledPayloadJSON(sessionName, template, resetCommittedAt stri
 	})
 	return b
 }
+
+// SessionSleptPayload is the typed payload for session.slept events. Reason
+// is the sleep_reason value SleepPatch recorded (idle, idle-timeout,
+// max-session-age, killed, ...). PolicyClass/ResolvedTTL/ResolutionSource
+// mirror the session's resolved sleep_after_idle policy
+// (config.ResolvedSessionSleepPolicy: Class/Value/Source) at the moment of
+// this transition — omitted at emission sites where policy resolution is not
+// cheaply available (e.g. a one-shot CLI command with no loaded city config)
+// rather than sent as a misleading zero value. IdleDurationS is the observed
+// idle time (last activity to this transition), omitted when not applicable
+// (e.g. a max-session-age kill of a session that was actively working).
+type SessionSleptPayload struct {
+	SessionName      string `json:"session_name"`
+	Template         string `json:"template"`
+	Reason           string `json:"reason"`
+	IdleDurationS    int    `json:"idle_duration_s,omitempty"`
+	PolicyClass      string `json:"policy_class,omitempty"`
+	ResolvedTTL      string `json:"resolved_ttl,omitempty"`
+	ResolutionSource string `json:"resolution_source,omitempty"`
+}
+
+// IsEventPayload marks SessionSleptPayload as an events.Payload variant.
+func (SessionSleptPayload) IsEventPayload() {}
+
+// SessionSleptPayloadJSON builds the JSON wire form for attachment to an
+// Event.Payload field.
+func SessionSleptPayloadJSON(sessionName, template, reason string, idleDurationSeconds int, policyClass, resolvedTTL, resolutionSource string) json.RawMessage {
+	b, _ := json.Marshal(SessionSleptPayload{
+		SessionName:      sessionName,
+		Template:         template,
+		Reason:           reason,
+		IdleDurationS:    idleDurationSeconds,
+		PolicyClass:      policyClass,
+		ResolvedTTL:      resolvedTTL,
+		ResolutionSource: resolutionSource,
+	})
+	return b
+}

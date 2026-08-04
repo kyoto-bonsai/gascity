@@ -66,7 +66,7 @@ func newStartupDialogConfig(opts []StartupDialogOption) startupDialogConfig {
 // sessions. Handles (in order):
 //  1. Claude resume selector — requires Down+Enter to resume the full session
 //  2. Codex update dialog ("Update available") — requires Down+Enter to skip
-//  3. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?")
+//  3. Workspace trust dialog (Claude "Quick safety check", Codex "Do you trust the contents of this directory?", pi "Trust project folder?")
 //  4. External CLAUDE.md imports dialog (Claude "Allow external CLAUDE.md file imports?") — requires Enter to allow (option 1 pre-selected)
 //  5. MCP trust dialog (Claude "New MCP server found in this project") — requires Down+Enter to trust all project MCP servers
 //  6. Codex hook review dialog — requires Down+Enter to trust hooks
@@ -444,8 +444,9 @@ func containsPostUpdateStartupDialog(content string) bool {
 
 // acceptWorkspaceTrustDialog dismisses workspace trust dialogs for supported
 // agents. Claude shows "Quick safety check"; Codex shows
-// "Do you trust the contents of this directory?". In both cases the safe
-// continue option is pre-selected, so Enter accepts.
+// "Do you trust the contents of this directory?"; pi (>= 0.79) shows
+// "Trust project folder?". In all cases the safe continue option is
+// pre-selected, so Enter accepts.
 func acceptWorkspaceTrustDialog(
 	ctx context.Context,
 	timeout time.Duration,
@@ -508,7 +509,8 @@ func containsWorkspaceTrustDialog(content string) bool {
 	return strings.Contains(content, "trust this folder") ||
 		strings.Contains(content, "Quick safety check") ||
 		strings.Contains(content, "Do you trust the contents of this directory?") ||
-		strings.Contains(content, "Do you trust the files in this folder?")
+		strings.Contains(content, "Do you trust the files in this folder?") ||
+		strings.Contains(content, "Trust project folder?")
 }
 
 func containsPostTrustStartupDialog(content string) bool {
@@ -846,9 +848,12 @@ func acceptCodexHookReviewDialogFromStream(
 }
 
 func containsCodexHookReviewDialog(content string) bool {
-	return strings.Contains(content, "Hooks need review") &&
-		strings.Contains(content, "Trust all and continue") &&
-		strings.Contains(content, "Continue without trusting")
+	return (strings.Contains(content, "Hooks need review") ||
+		strings.Contains(content, "hooks need review")) &&
+		(strings.Contains(content, "Trust all and continue") ||
+			strings.Contains(content, "trust all")) &&
+		(strings.Contains(content, "Continue without trusting") ||
+			strings.Contains(content, "enter to review hooks"))
 }
 
 func containsPostCodexHookReviewStartupDialog(content string) bool {
@@ -1291,13 +1296,48 @@ func ContainsProviderRateLimitScreen(content string) bool {
 		strings.Contains(content, "/rate-limit-options") {
 		return true
 	}
+	if containsClaudeSpendLimitModal(content) {
+		return true
+	}
 	return strings.Contains(strings.ToLower(content), "rate limit") &&
 		strings.Contains(content, "Keep trying") &&
 		strings.Contains(content, "Stop")
 }
 
+// spendLimitModalWindowLines bounds how many consecutive lines the Claude
+// spend-limit modal's anchor tokens may span. The modal renders "Usage credit
+// balance", "Adjust monthly spend limit", and "Wait for limit to reset" on
+// adjacent lines inside one bordered box; a small window tolerates a border or
+// blank line between them while still rejecting the same tokens scattered across
+// unrelated scrollback.
+const spendLimitModalWindowLines = 6
+
+// containsClaudeSpendLimitModal reports whether pane content shows Claude's
+// spend-limit modal (which is a rate-limit, not a crash).
+//
+// It requires the modal's three anchor tokens to co-occur within one on-screen
+// block rather than matching each token anywhere in the buffer. Whole-buffer
+// strings.Contains for each token independently lets the tokens land on
+// unrelated scrollback lines — e.g. a pane displaying billing notes or these
+// very test fixtures — and misclassify a genuinely crashed session as
+// rate-limited. That suppresses the session's SessionCrashed event and, because
+// the rate-limit quarantine re-detects the same scrollback every reconcile
+// cycle, masks the real crash indefinitely with no self-heal. "Wait for limit
+// to reset" is always present in the real modal and is the reliable anchor, so
+// the loose "Resets " arm is dropped as too weak.
+func containsClaudeSpendLimitModal(content string) bool {
+	return linesContainAllWithin(content, spendLimitModalWindowLines,
+		"Usage credit balance",
+		"Adjust monthly spend limit",
+		"Wait for limit to reset")
+}
+
 // ProviderTerminalErrorReason classifies high-confidence provider errors that
-// require operator/config intervention rather than immediate retry.
+// require operator/config intervention rather than immediate retry — a
+// genuinely permanent condition (wrong model id, bad config) that will not
+// self-resolve, unlike a resource-exhaustion condition (see
+// ProviderResourceExhaustionReason) which typically clears on its own once
+// quota/credits refill.
 func ProviderTerminalErrorReason(content string) string {
 	lower := strings.ToLower(content)
 	switch {
@@ -1309,6 +1349,33 @@ func ProviderTerminalErrorReason(content string) string {
 		// landing on unrelated scrollback lines (which would permanently and
 		// wrongly mark the session terminal with no self-heal).
 		return "model_not_found"
+	default:
+		return ""
+	}
+}
+
+// ProviderResourceExhaustionReason classifies provider errors that reflect a
+// temporary resource limit — API quota or account credit balance — rather
+// than a permanent config problem. Unlike ProviderTerminalErrorReason, these
+// are expected to self-resolve (quota window rolls over, credits are topped
+// up) and the caller should quarantine-and-retry rather than mark the session
+// terminal/drainable. Moved here from ProviderTerminalErrorReason 2026-07-26
+// (ga-5gsyts): quota_exceeded was previously misclassified as terminal, which
+// is the root cause the operator traced tonight's "seats died and were
+// mass-replaced" outage back to — a quota/credit condition is not the same
+// class of failure as a wrong model id.
+//
+// creditExhausted matches Anthropic's actual credit-balance API error text
+// ("Your credit balance is too low to access the Claude API...") — distinct
+// from containsClaudeSpendLimitModal's self-imposed monthly spend-limit
+// modal (a configured cap the operator can raise, already routed through the
+// rate-limit retry path); this is the account having no purchased credits
+// left to spend at all.
+func ProviderResourceExhaustionReason(content string) string {
+	lower := strings.ToLower(content)
+	switch {
+	case strings.Contains(lower, "credit balance is too low"):
+		return "credit_exhausted"
 	case strings.Contains(lower, "insufficient_quota"):
 		return "quota_exceeded"
 	case strings.Contains(lower, "quota_exceeded"):
@@ -1320,6 +1387,48 @@ func ProviderTerminalErrorReason(content string) string {
 	}
 }
 
+// loginExpiredDialogPatterns are the known pane-content shapes for a login/
+// auth-expiry prompt. A plain var, not inlined into ContainsLoginExpiredDialog,
+// so it is trivially extended when a real transcript is captured — per the
+// operator's ruling on ga-5gsyts, fix 4's heartbeat + FROZEN tier is expected
+// to surface the next real occurrence; append the exact matched text here
+// then, rather than reworking the detector.
+//
+// Shipped best-effort WITHOUT a captured transcript (operator ruling
+// 2026-07-26, ga-5gsyts) — the forensic search came up empty (the one
+// candidate incident, ga-6ud310, turned out to be an unrelated orphaned bead,
+// not a frozen pane). Safe to ship best-effort because of the failure
+// asymmetry: a false-positive match only pauses a seat into quarantine
+// (resumable, visible on the dashboard, self-clears on the quarantine
+// timer); a false negative is today's status quo (the session dies and its
+// replacement restarts from zero). Neither direction is worse than not
+// shipping this at all.
+var loginExpiredDialogPatterns = []string{
+	"/login",
+	"session expired",
+	"please log in",
+	"please run /login",
+	"authentication expired",
+	"re-authenticate to continue",
+	"oauth token expired",
+	"oauth token refresh failed",
+	"failed to refresh token",
+	"failed to refresh access token",
+}
+
+// ContainsLoginExpiredDialog reports whether pane content shows a login/auth
+// expiry prompt. See loginExpiredDialogPatterns' doc for the best-effort
+// rationale and how to extend it once a real transcript is captured.
+func ContainsLoginExpiredDialog(content string) bool {
+	lower := strings.ToLower(content)
+	for _, pattern := range loginExpiredDialogPatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // lineContainsAll reports whether any single line of content contains every
 // substring in subs. It bounds loose multi-token matches to one line so the
 // tokens must co-occur in the same message rather than anywhere in scrollback.
@@ -1328,6 +1437,33 @@ func lineContainsAll(content string, subs ...string) bool {
 		all := true
 		for _, sub := range subs {
 			if !strings.Contains(line, sub) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+// linesContainAllWithin reports whether some window of at most maxSpan
+// consecutive lines in content jointly contains every substring in subs. Like
+// lineContainsAll it bounds a loose multi-token match to co-occurring text, but
+// across a small block of adjacent lines (e.g. a modal box) rather than a single
+// line, so the tokens cannot smear across unrelated scrollback lines and wrongly
+// classify the pane.
+func linesContainAllWithin(content string, maxSpan int, subs ...string) bool {
+	if maxSpan < 1 || len(subs) == 0 {
+		return false
+	}
+	lines := strings.Split(content, "\n")
+	for start := range lines {
+		window := strings.Join(lines[start:min(start+maxSpan, len(lines))], "\n")
+		all := true
+		for _, sub := range subs {
+			if !strings.Contains(window, sub) {
 				all = false
 				break
 			}

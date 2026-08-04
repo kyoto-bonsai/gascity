@@ -53,7 +53,7 @@ func TestCityInitServiceScaffoldCreatesCityRegistersAndEmitsCreated(t *testing.T
 
 	oldReloadSupervisorNoWaitHook := reloadSupervisorNoWaitHook
 	reloadSupervisorNoWaitHook = func() error {
-		evts, err := events.ReadFiltered(filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityCreated})
+		evts, err := events.ReadFiltered(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityCreated})
 		if err == nil {
 			reloadSawCreated = len(evts)
 		}
@@ -92,7 +92,7 @@ func TestCityInitServiceScaffoldCreatesCityRegistersAndEmitsCreated(t *testing.T
 	}
 	assertSameTestPath(t, entries[0].Path, cityPath)
 
-	evts, err := events.ReadFiltered(filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityCreated})
+	evts, err := events.ReadFiltered(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityCreated})
 	if err != nil {
 		t.Fatalf("ReadFiltered city.created: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestCityInitServiceScaffoldDoesNotEmitCreatedWhenRegisterFails(t *testing.T
 		t.Fatalf("cityPath stat after failed registration = %v, want not exists", statErr)
 	}
 
-	evts, readErr := events.ReadFiltered(filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityCreated})
+	evts, readErr := events.ReadFiltered(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityCreated})
 	if readErr != nil && !os.IsNotExist(readErr) {
 		t.Fatalf("ReadFiltered city.created: %v", readErr)
 	}
@@ -317,7 +317,7 @@ func TestCityInitServiceUnregisterRemovesRegistryAndEmitsEvent(t *testing.T) {
 		t.Fatalf("registry entries after unregister = %+v, want empty", entries)
 	}
 
-	evts, err := events.ReadFiltered(filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityUnregisterRequested})
+	evts, err := events.ReadFiltered(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityUnregisterRequested})
 	if err != nil {
 		t.Fatalf("ReadFiltered: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestCityInitServiceUnregisterDoesNotEmitEventWhenRegistryWriteFails(t *test
 		t.Fatalf("Unregister error = %v, want registry removal failure", err)
 	}
 
-	evts, readErr := events.ReadFiltered(filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityUnregisterRequested})
+	evts, readErr := events.ReadFiltered(context.Background(), filepath.Join(cityPath, ".gc", "events.jsonl"), events.Filter{Type: events.CityUnregisterRequested})
 	if readErr != nil && !os.IsNotExist(readErr) {
 		t.Fatalf("ReadFiltered city.unregister_requested: %v", readErr)
 	}
