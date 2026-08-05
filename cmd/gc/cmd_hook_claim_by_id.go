@@ -20,11 +20,22 @@ import (
 // This wraps the single fetched bead as a one-element candidate slice and
 // hands it to the exact same, already-tested pool-worker functions —
 // hookClaimExistingAssignment, claimFirstReadyHookAssignment,
-// claimFirstEligibleHookCandidate — unmodified. The claim primitive, the
-// existing/ready-assignment adoption rules, and the bead.claim_rejected audit
-// event are all inherited from that code, not reimplemented here. This does
-// NOT touch claim eligibility: an awaiting-parked bead is still claimable per
-// ratified ruling ga-982pdy R1, exactly as on the pool path.
+// claimFirstEligibleHookCandidate, reportHookClaimRejected — unmodified. The
+// claim primitive, the existing/ready-assignment adoption rules, and the
+// bead.claim_rejected audit event (ADR-0009) are all inherited from that
+// code, not reimplemented here. This does NOT touch claim eligibility: an
+// awaiting-parked bead is still claimable per ratified ruling ga-982pdy R1,
+// exactly as on the pool path.
+//
+// One by-ID-specific addition: when the initial read already shows the bead
+// held by someone else, claimFirstEligibleHookCandidate's own
+// hookCandidateClaimable pre-filter would skip it without ever attempting a
+// claim, so its reportHookClaimRejected call would never run — silently
+// missing the audit event for what is actually the dominant real-world
+// collision shape on this path (a sibling discovers the bead sometime after
+// another already claimed it). This calls reportHookClaimRejected directly
+// for that known-already-held case, mutually exclusive with the
+// claimFirstEligibleHookCandidate branch so it cannot double-report.
 //
 // Only the caller's own store (dir) is checked — no cross-store federation
 // like claimHookWork's stores list — matching how the caller already
@@ -58,17 +69,43 @@ func doHookClaimByID(id, dir string, opts hookClaimOptions, ops hookClaimOps, st
 	if readyResult := claimFirstReadyHookAssignment(candidates, opts, ops, dir, stdout, stderr); readyResult.terminal {
 		return readyResult.code
 	}
-	if claimResult := claimFirstEligibleHookCandidate(candidates, opts, ops, dir, stdout, stderr); claimResult.terminal {
-		return claimResult.code
+
+	claimsErrored := false
+	if hookCandidateClaimable(bead, opts.RouteTargets) {
+		claimResult := claimFirstEligibleHookCandidate(candidates, opts, ops, dir, stdout, stderr)
+		if claimResult.terminal {
+			return claimResult.code
+		}
+		claimsErrored = claimResult.claimsErrored
+	} else if strings.TrimSpace(bead.Assignee) != "" {
+		// Already held by someone else at the moment of our initial read, so
+		// claimFirstEligibleHookCandidate's own hookCandidateClaimable pre-filter
+		// (assignee must be empty) would skip this single candidate without ever
+		// attempting ops.Claim — meaning its reportHookClaimRejected call would never
+		// run and the bead.claim_rejected audit event (ADR-0009) would silently not
+		// fire for this loser, even though the event is advertised as inherited from
+		// that same code path. This is not a rare timing edge: it is the DOMINANT
+		// real-world shape of a collision on this path (a sibling discovers the
+		// routed bead via search/mail/handoff-watchdog sometime after a different
+		// sibling already claimed it, not at the exact instant of the winning
+		// write) — the narrow simultaneous-read window is the only case that still
+		// reaches claimFirstEligibleHookCandidate's own reporting. Report the
+		// rejection directly for this known-already-held case, once, before falling
+		// through to the refusal writer, so every loser is audited the same way
+		// regardless of which side of that window it landed on. Mutually exclusive
+		// with the branch above, so this cannot double-report a race that
+		// claimFirstEligibleHookCandidate already did.
+		reportHookClaimRejected(bead, bead, opts, ops)
 	}
 
-	return writeHookClaimByIDRefused(store, bead, opts, stdout, stderr)
+	return writeHookClaimByIDRefused(store, bead, opts, claimsErrored, stdout, stderr)
 }
 
 // writeHookClaimByIDRefused reports that the single targeted bead could not
 // be claimed: every step in doHookClaimByID fell through, meaning it was
 // neither an existing/ready assignment nor won by a fresh claim attempt (not
-// currently open, not routed to this session, or the claim raced and lost).
+// currently open, not routed to this session, the claim raced and lost, or
+// the claim mutation itself errored — see claimsErrored).
 //
 // Unlike the pool-worker path — which silently tries the next candidate, or
 // reports the shared "no_work" drain when none are left — an explicit single
@@ -80,18 +117,31 @@ func doHookClaimByID(id, dir string, opts hookClaimOptions, ops hookClaimOps, st
 // ga-64l8t8 asks for, using the same identity-set matching that would have
 // caught the numbered-alias near-miss documented there (see
 // resolveLiveSessionAssignment's own doc comment).
-func writeHookClaimByIDRefused(store beads.Store, bead beads.Bead, opts hookClaimOptions, stdout, stderr io.Writer) int {
+//
+// claimsErrored distinguishes a genuine lost race from an operational claim
+// mutation failure (transient store/write error) on the by-ID path's single
+// candidate — mirroring the pool path's no_work vs. claims_errored split
+// (writeHookClaimNoWork) instead of reporting both as the same
+// "claim_conflict" reason, which a machine JSON consumer could not tell
+// apart (ga-64l8t8 validation V6). The underlying error itself is already
+// logged by claimFirstEligibleHookCandidate's own "skipping ...: err" line;
+// this only makes the terminal result reflect it too.
+func writeHookClaimByIDRefused(store beads.Store, bead beads.Bead, opts hookClaimOptions, claimsErrored bool, stdout, stderr io.Writer) int {
 	current := bead
 	if fresh, err := store.Get(bead.ID); err == nil {
 		current = fresh
 	}
 	holder := strings.TrimSpace(current.Assignee)
+	reason := "claim_conflict"
+	if claimsErrored {
+		reason = hookClaimReasonClaimsErrored
+	}
 	result := hookClaimJSONResult{
 		SchemaVersion: "1",
 		OK:            false,
 		Command:       hookClaimCommandName,
 		Action:        "drain",
-		Reason:        "claim_conflict",
+		Reason:        reason,
 		BeadID:        current.ID,
 		Assignee:      holder,
 		Route:         hookClaimRoute(current),
@@ -104,6 +154,10 @@ func writeHookClaimByIDRefused(store beads.Store, bead beads.Bead, opts hookClai
 		return 1
 	}
 	if holder == "" {
+		if claimsErrored {
+			fmt.Fprintf(stderr, "gc hook --claim --id: could not claim %s: the claim mutation errored (transient store/write failure, see prior log line) — not a conflict\n", current.ID) //nolint:errcheck
+			return 1
+		}
 		fmt.Fprintf(stderr, "gc hook --claim --id: could not claim %s (not open, or not routed to this session)\n", current.ID) //nolint:errcheck
 		return 1
 	}

@@ -21,6 +21,20 @@ import (
 // internal/storage/issueops/claim.go — verified by direct source read for
 // ga-64l8t8, not assumed).
 //
+// On conflict it returns the current populated bead (not a zero-value one) —
+// matching production's actual ops.Claim, hookClaimWithBdStore, which
+// re-reads and returns the current bead on a lost race so the caller can
+// name the winner in the bead.claim_rejected event (ADR-0009). An earlier
+// version of this mock returned beads.Bead{} on conflict, silently mirroring
+// the vendored bd tool's own lower-level BdStore.Claim instead of the
+// production wrapper actually wired as ops.Claim — ga-64l8t8 validation V2
+// caught that every test built on it therefore drove reportHookClaimRejected
+// down its existing == "" early-return branch, leaving the claim_rejected
+// emission unexercised by any test despite being advertised three times
+// (commit message, bead comment, doc comment). See
+// TestDoHookClaimByID_ConcurrentRace_LosersReportRejectionWithWinner, added
+// alongside this fix, for the coverage that was missing.
+//
 // The mutex stands in for that SQL transaction boundary so a test built on
 // this is a genuine concurrency exercise of doHookClaimByID's OWN
 // orchestration code (candidate wrapping, existing/ready/fresh-claim
@@ -38,7 +52,7 @@ func newMutexClaimFunc(store beads.Store) hookClaimFunc {
 		}
 		assignee := strings.TrimSpace(current.Assignee)
 		if assignee != "" && assignee != actor {
-			return beads.Bead{}, false, nil
+			return current, false, nil
 		}
 		status := "in_progress"
 		if err := store.Update(beadID, beads.UpdateOpts{Assignee: &actor, Status: &status}); err != nil {
@@ -59,6 +73,37 @@ func testHookClaimOpsFor(store beads.Store, claim hookClaimFunc) hookClaimOps {
 		EmitClaimRejected: func(string, string, string) {},
 		ResolveWorkBranch: func(string) string { return "" },
 	}
+}
+
+// claimRejectedRecorder captures bead.claim_rejected calls (hookEmitClaimRejectedFunc's
+// beadID, existingClaimant, attemptedClaimant) so a test can assert on them
+// instead of wiring the usual no-op stub. Safe for concurrent use: it is
+// exercised by every goroutine in a deliberate multi-sibling race.
+type claimRejectedRecorder struct {
+	mu    sync.Mutex
+	calls []claimRejectedCall
+}
+
+type claimRejectedCall struct {
+	beadID, existing, attempted string
+}
+
+func newClaimRejectedRecorder() *claimRejectedRecorder {
+	return &claimRejectedRecorder{}
+}
+
+func (r *claimRejectedRecorder) record(beadID, existingClaimant, attemptedClaimant string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, claimRejectedCall{beadID: beadID, existing: existingClaimant, attempted: attemptedClaimant})
+}
+
+func (r *claimRejectedRecorder) snapshot() []claimRejectedCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]claimRejectedCall, len(r.calls))
+	copy(out, r.calls)
+	return out
 }
 
 func TestDoHookClaimByID_ClaimsUnassignedRoutedBead(t *testing.T) {
@@ -224,7 +269,17 @@ func TestDoHookClaimByID_RefusalFallsBackToRawAssignee(t *testing.T) {
 // the design doc's §5 asks for: construct the race deliberately with real
 // goroutines sharing one atomic claim primitive, and show exactly one wins
 // while every other caller receives a deterministic refusal — never a silent
-// no-op, and never a second successful claim.
+// no-op, and never a second successful claim. It also asserts the
+// bead.claim_rejected audit event (ADR-0009) fires for every loser and names
+// the true winner — the commit message, the bead comment, and this func's own
+// doc comment all advertise that event as "inherited, not reimplemented" from
+// the pool-worker path, but until ga-64l8t8 validation V2, no test exercised
+// it: newMutexClaimFunc used to return a zero-value Bead on conflict (mirroring
+// the vendored bd tool's own lower-level BdStore.Claim instead of the
+// production wrapper actually wired as ops.Claim, hookClaimWithBdStore, which
+// re-reads and returns the populated current bead — see that func's doc
+// comment), so reportHookClaimRejected always saw an empty existing claimant
+// and took its early return without ever calling EmitClaimRejected.
 func TestDoHookClaimByID_ConcurrentRace_ExactlyOneWinner(t *testing.T) {
 	store := beads.NewMemStore()
 	target, err := store.Create(beads.Bead{
@@ -235,6 +290,7 @@ func TestDoHookClaimByID_ConcurrentRace_ExactlyOneWinner(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	claim := newMutexClaimFunc(store)
+	rejections := newClaimRejectedRecorder()
 
 	const n = 8
 	codes := make([]int, n)
@@ -249,6 +305,7 @@ func TestDoHookClaimByID_ConcurrentRace_ExactlyOneWinner(t *testing.T) {
 			defer wg.Done()
 			<-start // maximize actual concurrent overlap across goroutines
 			ops := testHookClaimOpsFor(store, claim)
+			ops.EmitClaimRejected = rejections.record
 			opts := hookClaimOptions{
 				Assignee:     assignees[i],
 				RouteTargets: []string{"persona-nils"},
@@ -282,6 +339,34 @@ func TestDoHookClaimByID_ConcurrentRace_ExactlyOneWinner(t *testing.T) {
 	if wins != 1 {
 		t.Fatalf("wins = %d, want exactly 1 (losses=%d, codes=%v)", wins, losses, codes)
 	}
+
+	// Every loser must have generated exactly one claim_rejected event naming
+	// the true winner — not zero (the pre-fix gap), not a stale intermediate
+	// claimant (there should be none, since newMutexClaimFunc re-reads under
+	// the same mutex that performs the write), and not duplicated.
+	calls := rejections.snapshot()
+	if len(calls) != n-1 {
+		t.Fatalf("EmitClaimRejected fired %d times, want %d (one per loser); calls=%+v", len(calls), n-1, calls)
+	}
+	seenAttempted := make(map[string]int, n-1)
+	for _, c := range calls {
+		if c.beadID != target.ID {
+			t.Errorf("claim_rejected beadID = %q, want %q", c.beadID, target.ID)
+		}
+		if c.existing != winnerIdentity {
+			t.Errorf("claim_rejected existing claimant = %q, want the true winner %q", c.existing, winnerIdentity)
+		}
+		seenAttempted[c.attempted]++
+	}
+	for i, assignee := range assignees {
+		if assignee == winnerIdentity {
+			continue
+		}
+		if seenAttempted[assignee] != 1 {
+			t.Errorf("sibling %d (%s): claim_rejected fired %d times for it, want exactly 1", i, assignee, seenAttempted[assignee])
+		}
+	}
+
 	if losses != n-1 {
 		t.Fatalf("losses = %d, want %d", losses, n-1)
 	}
@@ -326,5 +411,63 @@ func TestDoHookClaimByID_NotRoutedToThisSession(t *testing.T) {
 	}
 	if got.Assignee != "" {
 		t.Fatalf("assignee after refused claim = %q, want still unassigned", got.Assignee)
+	}
+}
+
+// erroringClaimFunc returns a hookClaimFunc whose Claim always fails with err
+// and ok=false — an operational claim-mutation failure (a transient
+// store/write error), not a lost race. Used to distinguish that shape from a
+// genuine conflict, which newMutexClaimFunc produces instead.
+func erroringClaimFunc(err error) hookClaimFunc {
+	return func(_ context.Context, _ string, _ []string, _, _ string) (beads.Bead, bool, error) {
+		return beads.Bead{}, false, err
+	}
+}
+
+// TestDoHookClaimByID_ClaimMutationErrorReportsClaimsErrored covers
+// ga-64l8t8 validation V6: when the single candidate's claim mutation itself
+// errors (store contention, a controller-socket flap in the read→write
+// window — not a lost race), the terminal JSON result must report
+// claims_errored, not claim_conflict, so a machine consumer of `gc hook
+// --claim --id --json` can tell "a live sibling holds it" apart from "the
+// write failed" — mirroring the pool path's existing no_work/claims_errored
+// split (writeHookClaimNoWork) instead of collapsing both refusal shapes
+// into one reason on the by-ID path.
+func TestDoHookClaimByID_ClaimMutationErrorReportsClaimsErrored(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{
+		Title:    "routed work, claim mutation will error",
+		Metadata: map[string]string{"gc.routed_to": "persona-nils"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	wantErr := fmt.Errorf("transient store write failure")
+	ops := testHookClaimOpsFor(store, erroringClaimFunc(wantErr))
+	opts := hookClaimOptions{
+		Assignee:     "persona-nils-ga-me",
+		RouteTargets: []string{"persona-nils"},
+		JSON:         true,
+	}
+	var stdout, stderr bytes.Buffer
+	code := doHookClaimByID(target.ID, "/work", opts, ops, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doHookClaimByID() = 0, want non-zero on a claim mutation error; stdout=%s", stdout.String())
+	}
+	var result hookClaimJSONResult
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &result); jsonErr != nil {
+		t.Fatalf("stdout not JSON: %v; raw=%s", jsonErr, stdout.String())
+	}
+	if result.Reason != hookClaimReasonClaimsErrored {
+		t.Errorf("Reason = %q, want %q (a claim mutation error must not be reported as claim_conflict)", result.Reason, hookClaimReasonClaimsErrored)
+	}
+	if result.OK {
+		t.Errorf("OK = true, want false on a claim mutation error")
+	}
+	// The underlying error is still surfaced on stderr by
+	// claimFirstEligibleHookCandidate's own "skipping ...: err" line — this
+	// test only adds the terminal JSON result distinguishing the reason.
+	if !strings.Contains(stderr.String(), wantErr.Error()) {
+		t.Errorf("stderr = %q, want it to surface the underlying error %q", stderr.String(), wantErr.Error())
 	}
 }
