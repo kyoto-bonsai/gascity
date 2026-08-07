@@ -28,6 +28,12 @@ const (
 	hookClaimReasonNoWork        = "no_work"
 	hookClaimReasonClaimsErrored = "claims_errored"
 	hookClaimReasonStaleSession  = "stale_session"
+	// hookClaimReasonNotClaimable reports a by-ID refusal where this session
+	// was never eligible to claim the bead in the first place — route
+	// mismatch, or a closed bead retaining its old assignee — as opposed to
+	// a genuine lost race against a live sibling (ga-64l8t8 validation F1-F3;
+	// see hookClaimAlreadyHeldCollision).
+	hookClaimReasonNotClaimable = "not_claimable"
 )
 
 var hookClaimMutationTimeout = 10 * time.Second
@@ -394,6 +400,29 @@ func hookCandidateClaimable(candidate beads.Bead, routeTargets []string) bool {
 	return strings.TrimSpace(candidate.ID) != "" &&
 		strings.TrimSpace(candidate.Assignee) == "" &&
 		hookClaimMatchesRoute(candidate, routeTargets)
+}
+
+// hookClaimAlreadyHeldCollision reports whether bead represents a genuine
+// already-held collision from this session's own perspective, as opposed to
+// a bead that merely has a non-empty assignee for an unrelated reason. All
+// three must hold: the bead is currently assigned to someone else, that
+// someone is exactly who this session would have contended with (the bead's
+// route matches one of this session's own route targets), and the bead is
+// in a status a fresh claim could plausibly have won (not closed — a closed
+// bead retains its assignee as its normal post-close shape, not as a live
+// claim to contend with).
+//
+// ga-64l8t8 validation F1/F2 found assignee-non-empty alone insufficient: a
+// route-mismatched bead held by an unrelated persona family, or a closed
+// bead that still carries its old assignee, was reported as a lost race to
+// a session that was never eligible to claim it in the first place. Reused
+// for both the bead.claim_rejected audit-event gate (doHookClaimByID) and
+// the hookClaimReasonNotClaimable JSON reason (writeHookClaimByIDRefused),
+// so the two stay in agreement about what counts as a real collision.
+func hookClaimAlreadyHeldCollision(bead beads.Bead, routeTargets []string) bool {
+	return strings.TrimSpace(bead.Assignee) != "" &&
+		hookClaimMatchesRoute(bead, routeTargets) &&
+		!strings.EqualFold(strings.TrimSpace(bead.Status), "closed")
 }
 
 // prioritizeHookClaimCandidatesByWorkDir stably reorders candidates so that

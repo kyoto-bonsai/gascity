@@ -77,7 +77,7 @@ func doHookClaimByID(id, dir string, opts hookClaimOptions, ops hookClaimOps, st
 			return claimResult.code
 		}
 		claimsErrored = claimResult.claimsErrored
-	} else if strings.TrimSpace(bead.Assignee) != "" {
+	} else if hookClaimAlreadyHeldCollision(bead, opts.RouteTargets) {
 		// Already held by someone else at the moment of our initial read, so
 		// claimFirstEligibleHookCandidate's own hookCandidateClaimable pre-filter
 		// (assignee must be empty) would skip this single candidate without ever
@@ -95,6 +95,14 @@ func doHookClaimByID(id, dir string, opts hookClaimOptions, ops hookClaimOps, st
 		// regardless of which side of that window it landed on. Mutually exclusive
 		// with the branch above, so this cannot double-report a race that
 		// claimFirstEligibleHookCandidate already did.
+		//
+		// Gated on hookClaimAlreadyHeldCollision, not bare assignee-non-empty
+		// (ga-64l8t8 validation F1/F2): a route-mismatched bead held by an
+		// unrelated persona family, or a closed bead that still carries its old
+		// assignee, is not a collision this session could have contended for —
+		// reporting claim_rejected for those cases inflated the very collision
+		// count (ga-64l8t8's own "3 collisions in 4 days") this event exists to
+		// measure.
 		reportHookClaimRejected(bead, bead, opts, ops)
 	}
 
@@ -126,15 +134,29 @@ func doHookClaimByID(id, dir string, opts hookClaimOptions, ops hookClaimOps, st
 // apart (ga-64l8t8 validation V6). The underlying error itself is already
 // logged by claimFirstEligibleHookCandidate's own "skipping ...: err" line;
 // this only makes the terminal result reflect it too.
+//
+// The remaining refusal reason is itself split in two, using the freshly
+// re-read current bead so the answer reflects the latest truth rather than
+// the (possibly now-stale) initial read: hookClaimAlreadyHeldCollision true
+// means a live sibling genuinely beat this session to a bead it was
+// eligible to claim ("claim_conflict"); false means this bead was never
+// this session's to claim at all — route mismatch, still-unassigned-but-
+// unrouted, or closed — reported as hookClaimReasonNotClaimable instead
+// (ga-64l8t8 validation F1/F2/F3). Collapsing both into "claim_conflict", as
+// before, made every non-conflict refusal count toward the same collision
+// rate this event exists to measure.
 func writeHookClaimByIDRefused(store beads.Store, bead beads.Bead, opts hookClaimOptions, claimsErrored bool, stdout, stderr io.Writer) int {
 	current := bead
 	if fresh, err := store.Get(bead.ID); err == nil {
 		current = fresh
 	}
 	holder := strings.TrimSpace(current.Assignee)
-	reason := "claim_conflict"
-	if claimsErrored {
+	reason := hookClaimReasonNotClaimable
+	switch {
+	case claimsErrored:
 		reason = hookClaimReasonClaimsErrored
+	case hookClaimAlreadyHeldCollision(current, opts.RouteTargets):
+		reason = "claim_conflict"
 	}
 	result := hookClaimJSONResult{
 		SchemaVersion: "1",

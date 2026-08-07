@@ -1833,6 +1833,17 @@ Finds routed work using the agent's work_query config.
 Without --inject: prints normalized ready-only output, exits 0 if work exists, 1 if empty.
 With --inject: silent legacy Stop-hook compatibility; skips the work query and always exits 0.
 With --claim: runs the standard startup claim protocol for one work item.
+With --claim --id &lt;bead-id&gt;: atomically claims that SPECIFIC bead instead of
+auto-selecting from the routed candidate pool — for a session that has
+already discovered a gc.routed_to-addressed bead by search/read (officer-style
+dispatch) rather than via the pool-worker hook-claim flow, and needs a
+claim-on-start step before acting so a live sibling of the same persona family
+is refused loudly instead of silently overwritten (ga-64l8t8). Uses the exact
+same atomic claim primitive and bead.claim_rejected audit event as the
+pool-worker path; a lost race names the live session that holds the bead when
+one can be resolved. Only the current agent's primary store is checked (no
+cross-store federation), matching how the bead was discovered in the first
+place.
 
 		The agent is determined from $GC_AGENT or a positional argument.
 
@@ -1844,6 +1855,7 @@ gc hook [agent] [flags]
 |------|------|---------|-------------|
 | `--claim` | bool |  | atomically claim one routed work item for the current session |
 | `--drain-ack` | bool |  | with --claim, acknowledge runtime drain when no work is available |
+| `--id` | string |  | with --claim, claim this specific bead id instead of auto-selecting one |
 | `--inject` | bool |  | silent legacy Stop-hook compatibility; skip work query and exit 0 |
 | `--json` | bool |  | with --claim, emit a JSON protocol result |
 
