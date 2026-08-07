@@ -32,8 +32,11 @@ import (
 // down its existing == "" early-return branch, leaving the claim_rejected
 // emission unexercised by any test despite being advertised three times
 // (commit message, bead comment, doc comment). See
-// TestDoHookClaimByID_ConcurrentRace_LosersReportRejectionWithWinner, added
-// alongside this fix, for the coverage that was missing.
+// TestDoHookClaimByID_ConcurrentRace_ExactlyOneWinner, which asserts the
+// event directly, for the coverage that was missing (ga-64l8t8 validation
+// F5: this comment previously cited a test name,
+// TestDoHookClaimByID_ConcurrentRace_LosersReportRejectionWithWinner, that
+// was never added — the coverage always lived in _ExactlyOneWinner).
 //
 // The mutex stands in for that SQL transaction boundary so a test built on
 // this is a genuine concurrency exercise of doHookClaimByID's OWN
@@ -185,6 +188,16 @@ func TestDoHookClaimByID_IdempotentResume(t *testing.T) {
 // when the bead is already held by a DIFFERENT live session, the refusal
 // names that session (via resolveLiveSessionAssignment) instead of silently
 // letting the caller overwrite it or reporting an unattributed failure.
+//
+// It also pins C2 of ga-64l8t8 validation F4: this already-held path shares
+// one aggregate assertion (len(calls) != n-1) with the fresh-claim path in
+// TestDoHookClaimByID_ConcurrentRace_ExactlyOneWinner, so a regression that
+// deletes the already-held branch's own reportHookClaimRejected call can
+// still pass that shared assertion whenever the race's nondeterministic
+// read/write split happens to route every loser through the other path
+// (vega's ablation measured this at 16% escape over 50 runs). Wiring the
+// recorder here, deterministically, rather than the no-op stub every other
+// non-F4 test in this file uses, closes that gap for this path specifically.
 func TestDoHookClaimByID_RefusalNamesLiveSibling(t *testing.T) {
 	store := beads.NewMemStore()
 	holderIdentity := "persona-nils-ga-livesibling"
@@ -208,7 +221,9 @@ func TestDoHookClaimByID_RefusalNamesLiveSibling(t *testing.T) {
 		t.Fatalf("seed existing assignment: %v", err)
 	}
 
+	rec := newClaimRejectedRecorder()
 	ops := testHookClaimOpsFor(store, newMutexClaimFunc(store))
+	ops.EmitClaimRejected = rec.record
 	opts := hookClaimOptions{
 		Assignee:     "persona-nils-ga-me",
 		RouteTargets: []string{"persona-nils"},
@@ -232,12 +247,25 @@ func TestDoHookClaimByID_RefusalNamesLiveSibling(t *testing.T) {
 	if got.Assignee != holderIdentity {
 		t.Fatalf("assignee after refused claim = %q, want unchanged %q", got.Assignee, holderIdentity)
 	}
+	calls := rec.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("EmitClaimRejected fired %d times, want exactly 1; calls=%+v", len(calls), calls)
+	}
+	if calls[0].existing != holderIdentity || calls[0].attempted != opts.Assignee {
+		t.Errorf("claim_rejected = %+v, want existing=%q attempted=%q", calls[0], holderIdentity, opts.Assignee)
+	}
 }
 
 // TestDoHookClaimByID_RefusalFallsBackToRawAssignee covers the case where the
 // current holder cannot be resolved to any live session bead (a hand-set or
 // stale value) — the refusal must still fire, falling back to the raw string
 // rather than silently succeeding or panicking.
+//
+// Also pins C2 of ga-64l8t8 validation F4, same reasoning as the sibling
+// case in TestDoHookClaimByID_RefusalNamesLiveSibling above: this path
+// shares the concurrent-race test's aggregate event count, so it needs its
+// own deterministic assertion to guard against a regression the shared
+// count could silently absorb.
 func TestDoHookClaimByID_RefusalFallsBackToRawAssignee(t *testing.T) {
 	store := beads.NewMemStore()
 	staleHolder := "persona-marcus" // bare persona-type string, no session ever claimed it
@@ -250,7 +278,9 @@ func TestDoHookClaimByID_RefusalFallsBackToRawAssignee(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
+	rec := newClaimRejectedRecorder()
 	ops := testHookClaimOpsFor(store, newMutexClaimFunc(store))
+	ops.EmitClaimRejected = rec.record
 	opts := hookClaimOptions{
 		Assignee:     "persona-marcus-ga-me",
 		RouteTargets: []string{"persona-marcus"},
@@ -262,6 +292,13 @@ func TestDoHookClaimByID_RefusalFallsBackToRawAssignee(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), staleHolder) {
 		t.Errorf("stderr = %q, want it to fall back to the raw holder string %q", stderr.String(), staleHolder)
+	}
+	calls := rec.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("EmitClaimRejected fired %d times, want exactly 1; calls=%+v", len(calls), calls)
+	}
+	if calls[0].existing != staleHolder || calls[0].attempted != opts.Assignee {
+		t.Errorf("claim_rejected = %+v, want existing=%q attempted=%q", calls[0], staleHolder, opts.Assignee)
 	}
 }
 
@@ -386,6 +423,12 @@ func TestDoHookClaimByID_ConcurrentRace_ExactlyOneWinner(t *testing.T) {
 // TestDoHookClaimByID_NotRoutedToThisSession covers an unassigned bead whose
 // gc.routed_to does not match the caller's route targets: it must be
 // refused, not silently claimed outside the caller's own routing.
+//
+// Also covers the third shape of ga-64l8t8 validation F3: an unassigned,
+// route-mismatched bead is not a claim conflict (nothing to contend for),
+// so the JSON reason must be hookClaimReasonNotClaimable, not
+// "claim_conflict" — before the fix, this shape and a genuine lost race
+// were indistinguishable to a machine consumer of `--json`.
 func TestDoHookClaimByID_NotRoutedToThisSession(t *testing.T) {
 	store := beads.NewMemStore()
 	target, err := store.Create(beads.Bead{
@@ -399,6 +442,7 @@ func TestDoHookClaimByID_NotRoutedToThisSession(t *testing.T) {
 	opts := hookClaimOptions{
 		Assignee:     "persona-nils-ga-me",
 		RouteTargets: []string{"persona-nils"},
+		JSON:         true,
 	}
 	var stdout, stderr bytes.Buffer
 	code := doHookClaimByID(target.ID, "/work", opts, ops, &stdout, &stderr)
@@ -411,6 +455,110 @@ func TestDoHookClaimByID_NotRoutedToThisSession(t *testing.T) {
 	}
 	if got.Assignee != "" {
 		t.Fatalf("assignee after refused claim = %q, want still unassigned", got.Assignee)
+	}
+	var result hookClaimJSONResult
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &result); jsonErr != nil {
+		t.Fatalf("stdout not JSON: %v; raw=%s", jsonErr, stdout.String())
+	}
+	if result.Reason != hookClaimReasonNotClaimable {
+		t.Errorf("Reason = %q, want %q (an unassigned, unrouted bead is not a claim conflict)", result.Reason, hookClaimReasonNotClaimable)
+	}
+}
+
+// TestDoHookClaimByID_RouteMismatchHeldBeadRefusesWithoutClaimRejected covers
+// ga-64l8t8 validation F1: a bead held by someone else, but routed to a
+// DIFFERENT persona family than this session's own route targets, is not a
+// collision this session could have contended for. Before the fix, the
+// already-held branch gated on bare assignee-non-empty and reported
+// bead.claim_rejected for this session anyway — inflating the audit event's
+// collision count with attempts that were never eligible in the first
+// place. The refusal must still fire (this session still cannot claim the
+// bead), but it must not emit claim_rejected, and the JSON reason must be
+// hookClaimReasonNotClaimable rather than "claim_conflict".
+func TestDoHookClaimByID_RouteMismatchHeldBeadRefusesWithoutClaimRejected(t *testing.T) {
+	store := beads.NewMemStore()
+	holder := "persona-marcus-ga-holder"
+	target, err := store.Create(beads.Bead{
+		Title:    "held by marcus, routed to marcus, caller is nils",
+		Metadata: map[string]string{"gc.routed_to": "persona-marcus"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	status := "in_progress"
+	if err := store.Update(target.ID, beads.UpdateOpts{Assignee: &holder, Status: &status}); err != nil {
+		t.Fatalf("seed existing assignment: %v", err)
+	}
+
+	rec := newClaimRejectedRecorder()
+	ops := testHookClaimOpsFor(store, newMutexClaimFunc(store))
+	ops.EmitClaimRejected = rec.record
+	opts := hookClaimOptions{
+		Assignee:     "persona-nils-ga-me",
+		RouteTargets: []string{"persona-nils"},
+		JSON:         true,
+	}
+	var stdout, stderr bytes.Buffer
+	code := doHookClaimByID(target.ID, "/work", opts, ops, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doHookClaimByID() = 0, want non-zero (bead is routed to a different persona family); stdout=%s", stdout.String())
+	}
+	if calls := rec.snapshot(); len(calls) != 0 {
+		t.Errorf("EmitClaimRejected fired %d times, want 0 (this session was never eligible to claim a route-mismatched bead); calls=%+v", len(calls), calls)
+	}
+	var result hookClaimJSONResult
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &result); jsonErr != nil {
+		t.Fatalf("stdout not JSON: %v; raw=%s", jsonErr, stdout.String())
+	}
+	if result.Reason != hookClaimReasonNotClaimable {
+		t.Errorf("Reason = %q, want %q (a route-mismatched bead is not a claim conflict)", result.Reason, hookClaimReasonNotClaimable)
+	}
+}
+
+// TestDoHookClaimByID_ClosedBeadRefusesWithoutClaimRejected covers ga-64l8t8
+// validation F2: a closed bead retains its assignee as its normal
+// post-close shape, which officer-style dispatch (search / mail /
+// handoff-watchdog) routinely surfaces as a stale pointer. No race
+// occurred, so — same as the route-mismatch shape in F1 — the refusal must
+// fire without a claim_rejected event, and with reason
+// hookClaimReasonNotClaimable rather than "claim_conflict".
+func TestDoHookClaimByID_ClosedBeadRefusesWithoutClaimRejected(t *testing.T) {
+	store := beads.NewMemStore()
+	holder := "persona-nils-ga-whoever"
+	target, err := store.Create(beads.Bead{
+		Title:    "closed, still carrying its old assignee",
+		Metadata: map[string]string{"gc.routed_to": "persona-nils"},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	status := "closed"
+	if err := store.Update(target.ID, beads.UpdateOpts{Assignee: &holder, Status: &status}); err != nil {
+		t.Fatalf("seed closed assignment: %v", err)
+	}
+
+	rec := newClaimRejectedRecorder()
+	ops := testHookClaimOpsFor(store, newMutexClaimFunc(store))
+	ops.EmitClaimRejected = rec.record
+	opts := hookClaimOptions{
+		Assignee:     "persona-nils-ga-me",
+		RouteTargets: []string{"persona-nils"},
+		JSON:         true,
+	}
+	var stdout, stderr bytes.Buffer
+	code := doHookClaimByID(target.ID, "/work", opts, ops, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doHookClaimByID() = 0, want non-zero (bead is closed); stdout=%s", stdout.String())
+	}
+	if calls := rec.snapshot(); len(calls) != 0 {
+		t.Errorf("EmitClaimRejected fired %d times, want 0 (a closed bead is not a live race); calls=%+v", len(calls), calls)
+	}
+	var result hookClaimJSONResult
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &result); jsonErr != nil {
+		t.Fatalf("stdout not JSON: %v; raw=%s", jsonErr, stdout.String())
+	}
+	if result.Reason != hookClaimReasonNotClaimable {
+		t.Errorf("Reason = %q, want %q (a closed bead is not a claim conflict)", result.Reason, hookClaimReasonNotClaimable)
 	}
 }
 
