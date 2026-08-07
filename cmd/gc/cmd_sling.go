@@ -323,7 +323,7 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 	// rig-scoped implicit agents (e.g., "hello-world/claude").
 	resolveRigPaths(cityPath, cfg.Rigs)
 
-	a, ok := resolveAgentIdentity(cfg, target, currentRigContext(cfg))
+	a, ok := resolveAgentIdentity(cfg, target, slingTargetRigContext(cfg, sourceBead))
 	if !ok {
 		if jsonOutput {
 			return writeJSONError(stdout, stderr, "target_resolve_failed", agentNotFoundMsg("gc sling", target, cfg), 1)
@@ -582,6 +582,25 @@ func slingSourceStoreRootForCandidate(cfg *config.City, cityPath, beadID string)
 		return "", "", false
 	}
 	return resolveStoreScopeRoot(cityPath, rig.Path), bp, true
+}
+
+func slingTargetRigContext(cfg *config.City, source existingSlingSourceBead) string {
+	if source.exists {
+		return rigContextForSlingSourcePrefix(cfg, source.prefix)
+	}
+	return currentRigContext(cfg)
+}
+
+func rigContextForSlingSourcePrefix(cfg *config.City, prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" || sling.IsHQPrefix(cfg, prefix) {
+		return ""
+	}
+	rig, found := findRigByPrefix(cfg, prefix)
+	if !found {
+		return ""
+	}
+	return rig.Name
 }
 
 func canInferSlingDefaultTargetFromBead(cfg *config.City, beadOrFormula string) bool {

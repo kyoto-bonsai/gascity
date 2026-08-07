@@ -2470,6 +2470,85 @@ dir = "orders"
 	}
 }
 
+func TestCmdSlingBareTargetUsesExistingSourceBeadRigContext(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_CITY_ROOT", "")
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
+	contentDir := filepath.Join(cityDir, "content-production")
+	if err := os.MkdirAll(contentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(content-production): %v", err)
+	}
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatalf("ensureScopedFileStoreLayout: %v", err)
+	}
+	for _, dir := range []string{cityDir, contentDir} {
+		if err := ensurePersistedScopeLocalFileStore(dir); err != nil {
+			t.Fatalf("ensurePersistedScopeLocalFileStore(%s): %v", dir, err)
+		}
+	}
+	writeTestFileStoreBeads(t, contentDir, []beads.Bead{{
+		ID:       "CP-abcde",
+		Title:    "existing content work",
+		Type:     "task",
+		Status:   "open",
+		Metadata: map[string]string{},
+	}})
+	cityToml := `[workspace]
+name = "demo"
+
+[[rigs]]
+name = "content-production"
+path = "content-production"
+prefix = "CP"
+
+[[agent]]
+name = "research-builder"
+
+[[agent]]
+name = "research-builder"
+scope = "rig"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Chdir(cityDir)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling(
+		[]string{"research-builder", "CP-abcde"},
+		false, false, false,
+		"", nil, "",
+		true, false, false, "",
+		true, false, false,
+		"", "",
+		&stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("cmdSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "refusing cross-store route") {
+		t.Fatalf("unexpected cross-store refusal: %s", stderr.String())
+	}
+
+	contentStore, err := openStoreAtForCity(contentDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(content-production): %v", err)
+	}
+	routed, err := contentStore.Get("CP-abcde")
+	if err != nil {
+		t.Fatalf("contentStore.Get(CP-abcde): %v", err)
+	}
+	if got := routed.Metadata["gc.routed_to"]; got != "content-production/research-builder" {
+		t.Fatalf("gc.routed_to = %q, want content-production/research-builder", got)
+	}
+}
+
 // TestCmdSlingHyphenatedRigPrefixExistingBeadDoesNotOrphan verifies
 // that an existing bead in a rig whose configured prefix contains a
 // hyphen ("agent-diagnostics-hnn" in rig "agent-diagnostics") routes
