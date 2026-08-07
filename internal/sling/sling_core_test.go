@@ -1,9 +1,11 @@
 package sling
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -87,4 +89,51 @@ func TestAttachFormulaToBeadEntryShapes(t *testing.T) {
 			t.Errorf("error = %q, want prefix %q", err.Error(), want)
 		}
 	})
+}
+
+func TestCheckPersonaTargetRefusesUnmappedTarget(t *testing.T) {
+	deps, beadID := personaTargetGateDeps(t)
+	target := config.Agent{Dir: "content-production", Name: "claude", MaxActiveSessions: intPtr(1)}
+
+	_, err := DoSling(SlingOpts{Target: target, BeadOrFormula: beadID}, deps, deps.Store)
+	var targetErr *NonPersonaTargetError
+	if !errors.As(err, &targetErr) {
+		t.Fatalf("DoSling err = %v (%T), want *NonPersonaTargetError", err, err)
+	}
+	if !strings.Contains(err.Error(), "gc sling: refusing") {
+		t.Fatalf("error = %q, want gc sling refusal", err.Error())
+	}
+}
+
+func TestCheckPersonaTargetAllowsRigScopedReportsToTarget(t *testing.T) {
+	deps, beadID := personaTargetGateDeps(t)
+	target := config.Agent{Dir: "content-production", Name: "research-builder", MaxActiveSessions: intPtr(1)}
+
+	if _, err := DoSling(SlingOpts{Target: target, BeadOrFormula: beadID}, deps, deps.Store); err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	bead, err := deps.Store.Get(beadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bead.Metadata[beadmeta.OfficerOfRecordMetadataKey]; got != "persona-cmo" {
+		t.Fatalf("officer_of_record = %q, want persona-cmo", got)
+	}
+}
+
+func personaTargetGateDeps(t *testing.T) (SlingDeps, string) {
+	t.Helper()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		RoutingPolicy: config.RoutingPolicyConfig{
+			RoutingExempt: []config.RoutingExemptGroup{{Name: "officers", Personas: []string{"persona-cmo"}}},
+			ReportsTo:     map[string]string{"research-builder": "persona-cmo"},
+		},
+	}
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	bead, err := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Status: "open", Metadata: map[string]string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deps, bead.ID
 }

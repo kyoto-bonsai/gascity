@@ -43,6 +43,7 @@ City is the top-level configuration for a Gas City instance.
 | `service` | []Service |  |  | Services declares workspace-owned HTTP services mounted on the controller edge under /svc/&#123;name&#125;. |
 | `webhook` | []Webhook |  |  | Webhooks declares inbound HTTP receivers mounted on the supervisor edge under /hook/&#123;name&#125;. Composed like Services (pack concatenation + SourceDir provenance + the default-closed public pack-guard). |
 | `webhooks` | WebhookPolicyConfig |  |  | WebhookPolicy holds city-level webhook governance (the [webhooks] table, notably allow_public grants). Authored only in the root city.toml; never merged from packs or fragments so a pack cannot grant itself exposure. |
+| `routing` | RoutingPolicyConfig |  |  | RoutingPolicy holds city-level staff-routing governance (the [routing] table: exempt targets plus reports_to map). Authored only in the root city.toml; never merged from packs or fragments so a pack cannot grant itself a routing exemption. |
 | `github` | GitHubConfig |  |  | GitHub configures GitHub-facing repository monitors. |
 | `extmsg` | ExtMsgConfig |  |  | ExtMsg configures the external-messaging fabric (default routes for inbound conversations with no binding). |
 | `agent_defaults` | AgentDefaults |  |  | AgentDefaults provides root city defaults for agents that don't override them (canonical TOML key: agent_defaults). Pack-local defaults use the same table shape in pack.toml. The runtime currently applies provider, default_sling_formula, and append_fragments; the attachment-list fields remain tombstones, and the other fields are parsed/composed but not yet inherited automatically. |
@@ -742,6 +743,25 @@ RigPatch modifies an existing rig identified by Name.
 | `suspended` | boolean |  |  | Suspended is the deprecated, pre-runtime-state suspension override. Parsed for backwards compatibility; `gc doctor` surfaces it as a warning and recommends the rename to SuspendedOnStart. No behavioral code path reads it. |
 | `suspended_on_start` | boolean |  |  | SuspendedOnStart overrides the rig's desired suspension state at city start. Mirrors Rig.SuspendedOnStart. |
 | `formula_vars` | map[string]string |  |  | FormulaVars adds or overrides rig-scoped formula var defaults. Additive merge: patch keys win over existing rig keys, unspecified keys are preserved. |
+
+## RoutingExemptGroup
+
+RoutingExemptGroup names one category of routing-exempt personas.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | string | **yes** |  |  |
+| `personas` | []string |  |  |  |
+
+## RoutingPolicyConfig
+
+RoutingPolicyConfig holds city-level staff-routing governance authored in root city.toml under [routing].
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `routing_exempt` | []RoutingExemptGroup |  |  |  |
+| `officer_of_record_value_domain` | []string |  |  |  |
+| `reports_to` | map[string]string |  |  |  |
 
 ## Service
 

@@ -830,6 +830,37 @@ func (e *BeadLookupError) Unwrap() error {
 	return e.Err
 }
 
+// NonPersonaTargetError reports that the requested sling target is not a
+// configured persona routing target for a city that opted in to [routing].
+type NonPersonaTargetError struct {
+	BeadID string
+	Target string
+}
+
+// Error returns the target-domain refusal diagnostic.
+func (e *NonPersonaTargetError) Error() string {
+	return fmt.Sprintf(
+		"gc sling: refusing %s → %s: target is not a configured persona routing target; "+
+			"add it to [routing.reports_to] or [routing.routing_exempt] before dispatch",
+		e.BeadID, e.Target)
+}
+
+// MissingOfficerOfRecordError reports that a configured staff-persona target's
+// bead lacks required gc.officer_of_record metadata.
+type MissingOfficerOfRecordError struct {
+	BeadID string
+	Target string
+}
+
+// Error returns the officer-of-record diagnostic.
+func (e *MissingOfficerOfRecordError) Error() string {
+	return fmt.Sprintf(
+		"gc sling: refusing %s → %s: missing gc.officer_of_record — "+
+			"set one first (gc bd update %s --set-metadata gc.officer_of_record=<officer>); "+
+			"no --force override for this check",
+		e.BeadID, e.Target, e.BeadID)
+}
+
 func normalizeSlingQuery(query string) string {
 	return strings.Join(strings.Fields(query), " ")
 }

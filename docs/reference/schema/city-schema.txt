@@ -1205,6 +1205,10 @@
           "$ref": "#/$defs/WebhookPolicyConfig",
           "description": "WebhookPolicy holds city-level webhook governance (the [webhooks] table,\nnotably allow_public grants). Authored only in the root city.toml; never\nmerged from packs or fragments so a pack cannot grant itself exposure."
         },
+        "routing": {
+          "$ref": "#/$defs/RoutingPolicyConfig",
+          "description": "RoutingPolicy holds city-level staff-routing governance (the [routing]\ntable: exempt targets plus reports_to map). Authored only in the root\ncity.toml; never merged from packs or fragments so a pack cannot grant\nitself a routing exemption."
+        },
         "github": {
           "$ref": "#/$defs/GitHubConfig",
           "description": "GitHub configures GitHub-facing repository monitors."
@@ -2606,6 +2610,50 @@
         "name"
       ],
       "description": "RigPatch modifies an existing rig identified by Name."
+    },
+    "RoutingExemptGroup": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "personas": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "description": "RoutingExemptGroup names one category of routing-exempt personas."
+    },
+    "RoutingPolicyConfig": {
+      "properties": {
+        "routing_exempt": {
+          "items": {
+            "$ref": "#/$defs/RoutingExemptGroup"
+          },
+          "type": "array"
+        },
+        "officer_of_record_value_domain": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reports_to": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RoutingPolicyConfig holds city-level staff-routing governance authored in root city.toml under [routing]."
     },
     "Service": {
       "properties": {

@@ -100,6 +100,37 @@ func TestSlingWithBead(t *testing.T) {
 	}
 }
 
+func TestSlingAPIRefusesNonPersonaTarget(t *testing.T) {
+	h, state := newSlingTestServer(t)
+	state.cfg.RoutingPolicy = config.RoutingPolicyConfig{
+		RoutingExempt: []config.RoutingExemptGroup{{Name: "officers", Personas: []string{"persona-cmo"}}},
+		ReportsTo:     map[string]string{"persona-seo-author": "persona-cmo"},
+	}
+	store := state.stores["myrig"]
+	b, err := store.Create(beads.Bead{Title: "test task", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"target":"myrig/worker","bead":"` + b.ID + `"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/sling"), strings.NewReader(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "gc sling: refusing") {
+		t.Fatalf("body = %s, want gc sling refusal", rec.Body.String())
+	}
+	updated, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("Get(%q): %v", b.ID, err)
+	}
+	if got := updated.Metadata["gc.routed_to"]; got != "" {
+		t.Fatalf("gc.routed_to = %q, want unset after refusal", got)
+	}
+}
+
 func TestSlingRefusesCityStoreBeadToRigTarget(t *testing.T) {
 	h, state := newSlingTestServer(t)
 	state.cfg.Workspace.Prefix = "gc"

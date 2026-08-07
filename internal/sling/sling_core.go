@@ -103,6 +103,11 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 			return result, err
 		}
 	}
+	if shouldCheckPersonaTarget(opts) {
+		if err := checkPersonaTarget(opts, deps); err != nil {
+			return result, err
+		}
+	}
 	if shouldGuardCrossRig(opts) {
 		if err := CrossRigRouteError(opts.BeadOrFormula, a, deps.Cfg); err != nil {
 			return result, err
@@ -238,6 +243,10 @@ func usesFormulaBackedRoute(opts SlingOpts) bool {
 	return opts.OnFormula != "" || (!opts.NoFormula && opts.Target.EffectiveDefaultSlingFormula() != "")
 }
 
+func shouldCheckPersonaTarget(opts SlingOpts) bool {
+	return !opts.IsFormula && (!opts.DryRun || !opts.InlineText)
+}
+
 func shouldCheckDepCycle(opts SlingOpts) bool {
 	// Only meaningful for plain-bead slinging where a bead ID is known.
 	// Formula slinging creates new molecules whose deps aren't bead-graph deps.
@@ -317,6 +326,63 @@ func validateExistingBeadInQuerier(beadID, storeRef string, querier BeadQuerier)
 		return nil
 	}
 	return &MissingBeadError{BeadID: beadID, StoreRef: storeRef}
+}
+
+func checkPersonaTarget(opts SlingOpts, deps SlingDeps) error {
+	if deps.Cfg == nil || !deps.Cfg.RoutingPolicy.Configured() {
+		return nil
+	}
+	policy := deps.Cfg.RoutingPolicy
+	target := opts.Target.QualifiedName()
+	if policy.Exempt(target) {
+		return nil
+	}
+	officer, ok := policy.DeriveOfficerOfRecord(target)
+	if !ok {
+		officer, ok = policy.DeriveOfficerOfRecord(unqualifiedRoutingTarget(target))
+	}
+	if !ok {
+		return &NonPersonaTargetError{BeadID: opts.BeadOrFormula, Target: target}
+	}
+	return ensureOfficerOfRecord(opts, deps, target, officer)
+}
+
+func unqualifiedRoutingTarget(target string) string {
+	target = strings.TrimSpace(target)
+	if i := strings.LastIndex(target, "/"); i >= 0 {
+		return target[i+1:]
+	}
+	return target
+}
+
+func ensureOfficerOfRecord(opts SlingOpts, deps SlingDeps, target, officer string) error {
+	querier := deps.ValidationQuerier
+	if querier == nil {
+		querier = deps.Store
+	}
+	storeRef := strings.TrimSpace(deps.StoreRef)
+	if storeRef == "" {
+		storeRef = "local"
+	}
+	if querier == nil {
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: errors.New("store not configured")}
+	}
+	bead, err := querier.Get(opts.BeadOrFormula)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return nil
+		}
+		return &BeadLookupError{BeadID: opts.BeadOrFormula, StoreRef: storeRef, Err: err}
+	}
+	if strings.TrimSpace(bead.Metadata[beadmeta.OfficerOfRecordMetadataKey]) != "" {
+		return nil
+	}
+	if deps.Store != nil && strings.TrimSpace(officer) != "" {
+		if err := deps.Store.SetMetadata(opts.BeadOrFormula, beadmeta.OfficerOfRecordMetadataKey, officer); err == nil {
+			return nil
+		}
+	}
+	return &MissingOfficerOfRecordError{BeadID: opts.BeadOrFormula, Target: target}
 }
 
 // slingFormula handles the --formula dispatch path.

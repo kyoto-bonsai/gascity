@@ -132,6 +132,7 @@ const (
 	MissingRootBeadIDMetadataKey         = "gc.missing_root_bead_id"
 	ModelMetadataKey                     = "gc.model"
 	NextAttemptMetadataKey               = "gc.next_attempt"
+	OfficerOfRecordMetadataKey           = "gc.officer_of_record"
 	OnExhaustedMetadataKey               = "gc.on_exhausted"
 	OnFailMetadataKey                    = "gc.on_fail"
 	OriginalKindMetadataKey              = "gc.original_kind"
@@ -374,6 +375,7 @@ var KnownMetadataKeys = []string{
 	MissingRootBeadIDMetadataKey,
 	ModelMetadataKey,
 	NextAttemptMetadataKey,
+	OfficerOfRecordMetadataKey,
 	OnExhaustedMetadataKey,
 	OnFailMetadataKey,
 	OriginalKindMetadataKey,
