@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"strings"
 
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -262,7 +263,32 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 		open := "open"
 		update.Status = &open
 	}
-	return store.Update(item.ID, update)
+	if runTargetFallback != "" &&
+		strings.TrimSpace(item.Metadata[beadmeta.RunTargetMetadataKey]) == "" &&
+		strings.TrimSpace(item.Metadata[beadmeta.RoutedToMetadataKey]) == "" {
+		update.Metadata[beadmeta.RunTargetMetadataKey] = runTargetFallback
+	}
+	err = store.Update(item.ID, update)
+	// ga-7vv3pb observability: ReleaseWorkBead is the SILENT chokepoint every
+	// non-orphan claim-release funnels through (retired/closed/stranded session
+	// detach). Unlike releaseOrphanedPoolAssignments — which emits
+	// bead.dead_assignee_reopened — this path emitted no signal, so a claim that
+	// evaporated under a demonstrably-live seat could not be attributed to the
+	// writer: the audit-trail gap (ga-7vv3pb F-4) that kept this defect
+	// unattributed across sessions and made the reconcile RE-EMISSION
+	// (actor=cache-reconcile) look like the writer. Naming the immediate caller
+	// makes the exact detach path (repairStrandedPoolWorkerBead /
+	// releaseWorkFromClosedSessionBead / unclaimWorkAssignedToRetiredSession*)
+	// identifiable the next time a live seat's claim is cleared.
+	caller := "unknown"
+	if pc, _, _, ok := runtime.Caller(1); ok {
+		if fn := runtime.FuncForPC(pc); fn != nil {
+			caller = fn.Name()
+		}
+	}
+	log.Printf("ReleaseWorkBead: released work %s (prior assignee=%q status=%q) via %s fallbackRoute=%q err=%v",
+		item.ID, strings.TrimSpace(item.Assignee), strings.TrimSpace(item.Status), caller, runTargetFallback, err)
+	return err
 }
 
 // releaseWorkAssignmentIfCurrent attempts the store's atomic conditional
