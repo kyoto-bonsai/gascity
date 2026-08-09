@@ -2287,7 +2287,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							fmt.Fprintf(stderr, "session reconciler: checking assigned work for drain-acked %s: %v\n", name, assignedErr) //nolint:errcheck
 							hasAssignedWork = true
 						}
-						if alive && hasAssignedWork &&
+						if !seatPositivelyIdle(name, alive, sp, clk) && hasAssignedWork &&
 							(cancelSessionDrainForAssignedWorkInfo(infoByID[id], sp, dt) || cancelRecoveredDrainForAssignedWorkInfo(infoByID[id], sp, name)) {
 							_ = dops.clearDrain(name)
 							if trace != nil {
@@ -3736,7 +3736,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// keep the same bead so later wake/restart happens in place instead
 		// of minting a fresh canonical owner.
 		hasAssignedWork := false
-		poolFreeable := !shouldWake && !target.alive && isPoolSessionSlotFreeableInfo(info) && isPoolManagedSessionInfo(info)
+		poolFreeable := !shouldWake && !target.alive && isPoolSessionSlotFreeableInfo(info) && isPoolManagedSessionInfo(info) && seatPositivelyIdle(name, target.alive, sp, clk)
 		if poolFreeable {
 			var assignedErr error
 			hasAssignedWork, assignedErr = sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, info)
@@ -3963,6 +3963,84 @@ func sessionHasInProgressAssignedWorkForConfig(store beads.Store, rigStores map[
 	return sessionHasAssignedWorkInStoresForStatuses(store, rigStores, sessionAssignmentIdentifiersForConfigInfo(info, cfg), []string{"in_progress"})
 }
 
+// errUnresolvedSessionIdentity is returned by the *ForReachableStore assigned-
+// work probes below when info carries no resolved assignee-form identity to
+// check work under (SessionNameMetadata and ConfiguredNamedIdentity both
+// empty/deferred/unstamped). The pool claim path writes assignee=session_name,
+// so info.ID alone can never match a real claim; every caller of these probes
+// already fail-safes on a non-nil error by treating the session as having
+// assigned work (see :1950/:2285's `if assignedErr != nil { hasAssignedWork =
+// true }`, :3247's identical pattern, and :3742's), so this sentinel rides
+// that existing rail rather than letting an unresolved identity produce a
+// false "no assigned work" verdict on a destructive drain/close/release path.
+// SPEC: ga-7vv3pb-claim-evaporation-findings/SPEC-fail-closed-release-path-2026-08-09.md §1/§4 R1 (ga-sot51w).
+var errUnresolvedSessionIdentity = errors.New("session identity unresolved for assigned-work check")
+
+// sessionIdentityResolvedForWorkCheck reports whether identifiers (as returned
+// by sessionAssignmentIdentifiersForConfigInfo) carries an assignee-form
+// identity beyond the bare session-bead ID. info.ID is always present and
+// never counts alone: only SessionNameMetadata, ConfiguredNamedIdentity, or a
+// derived named-session identity (all forms the claim path can actually write
+// as assignee) make the identity set usable for a match. Takes the
+// already-computed identifiers slice rather than re-deriving it, so it stays
+// correct if the derivation logic changes without needing a matching update
+// here.
+func sessionIdentityResolvedForWorkCheck(identifiers []string, info sessionpkg.Info) bool {
+	trimmedID := strings.TrimSpace(info.ID)
+	for _, id := range identifiers {
+		if id != "" && id != trimmedID {
+			return true
+		}
+	}
+	return false
+}
+
+// positiveIdleGrace is the minimum GetLastActivity staleness before a
+// runtime-unobserved seat (observeRuntimeProviderLiveness returned !alive) is
+// treated as POSITIVELY idle rather than merely unobserved-by-a-signal-known-
+// to-false-negative on adhoc/wisp/pool seats. Set equal to
+// strandedRepairConfirmGrace (session_beads.go) so a seat can never be
+// declared idle for drain/free purposes faster than the stranded-repair path
+// itself would separately act on it.
+// SPEC: ga-7vv3pb-claim-evaporation-findings/SPEC-fail-closed-release-path-2026-08-09.md §4 R2 (ga-7vv3pb).
+const positiveIdleGrace = strandedRepairConfirmGrace
+
+// seatPositivelyIdle reports whether a seat may be treated as confirmed idle
+// for a drain/free/release decision: runtime-unobserved (alive=false, passed
+// in by the caller rather than re-probed here — observeRuntimeProviderLiveness
+// is expensive and already computed once per tick) AND positively stale by
+// GetLastActivity, rather than merely "not seen alive" — the exact false
+// signal (S1 in the SPEC) that let a token-advancing live seat get drained.
+//
+// Deviates from the SPEC's literal "zero/error" suggestion in one place: a
+// GetLastActivity ERROR returns false (cannot positively confirm idle), not
+// true. This codebase's own GetLastActivity contract normalizes "unknown
+// session" and malformed data to a zero time with a NIL error (see
+// TestGetLastActivityUnknownSessionIsZero and TestGetLastActivity_malformed
+// in the runtime package) — so a real error here is a genuine transient
+// read failure, not "session doesn't exist". The governing invariant (SPEC
+// §0/§3: unresolved input takes the query-error path, no action) is more
+// authoritative than the shorthand suggestion, and failing closed on a real
+// GetLastActivity error is strictly more conservative than the SPEC's own
+// literal text, never less safe.
+func seatPositivelyIdle(name string, alive bool, sp runtime.Provider, clk clock.Clock) bool {
+	if alive {
+		return false
+	}
+	name = strings.TrimSpace(name)
+	if sp == nil || name == "" {
+		return false
+	}
+	lastActivity, err := sp.GetLastActivity(name)
+	if err != nil {
+		return false
+	}
+	if lastActivity.IsZero() {
+		return true
+	}
+	return clk.Now().Sub(lastActivity) >= positiveIdleGrace
+}
+
 // sessionHasOpenAssignedWorkForReachableStore reports whether any open or
 // in-progress work bead is assigned to the given session in the store its
 // configured agent can query and claim from.
@@ -3974,6 +4052,9 @@ func sessionHasOpenAssignedWorkForReachableStore(
 	info sessionpkg.Info,
 ) (bool, error) {
 	identifiers := sessionAssignmentIdentifiersForConfigInfo(info, cfg)
+	if !sessionIdentityResolvedForWorkCheck(identifiers, info) {
+		return false, errUnresolvedSessionIdentity
+	}
 	stores, err := reachableStoresForSessionInfo(cityPath, cfg, store, rigStores, info)
 	if err != nil {
 		return false, err
@@ -3997,6 +4078,9 @@ func sessionHasAwakeAssignedWorkForReachableStore(
 	info sessionpkg.Info,
 ) (bool, error) {
 	identifiers := sessionAssignmentIdentifiersForConfigInfo(info, cfg)
+	if !sessionIdentityResolvedForWorkCheck(identifiers, info) {
+		return false, errUnresolvedSessionIdentity
+	}
 	stores, err := reachableStoresForSessionInfo(cityPath, cfg, store, rigStores, info)
 	if err != nil {
 		return false, err
@@ -4079,6 +4163,9 @@ func firstOpenAssignedWorkBeadForReachableStore(
 	info sessionpkg.Info,
 ) (beads.Bead, bool, error) {
 	identifiers := sessionAssignmentIdentifiersForConfigInfo(info, cfg)
+	if !sessionIdentityResolvedForWorkCheck(identifiers, info) {
+		return beads.Bead{}, false, errUnresolvedSessionIdentity
+	}
 	stores, err := reachableStoresForSessionInfo(cityPath, cfg, store, rigStores, info)
 	if err != nil {
 		return beads.Bead{}, false, err
