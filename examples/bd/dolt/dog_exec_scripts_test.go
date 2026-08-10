@@ -255,6 +255,16 @@ func replaceCompactMarkerField(t *testing.T, markerPath, key, value string) {
 	}
 }
 
+// resetCompactFixtureHead rewinds the fake server to a pre-flatten HEAD so a
+// follow-up run models the NEXT scheduled compaction cycle instead of re-reading
+// the previous run's post-flatten state.
+func resetCompactFixtureHead(t *testing.T, fixture compactScriptFixture) {
+	t.Helper()
+	if err := os.WriteFile(fixture.stateFile, []byte("headcommit\n"), 0o644); err != nil {
+		t.Fatalf("rewind fake dolt head state: %v", err)
+	}
+}
+
 func compactMarkerValue(t *testing.T, markerPath, key string) string {
 	t.Helper()
 	data, err := os.ReadFile(markerPath)
@@ -384,7 +394,7 @@ func assertCompactBeadsQuarantineAlert(t *testing.T, fixture compactScriptFixtur
 	if len(mailLines) != 1 {
 		t.Fatalf("compact quarantine should send exactly one operator mail, got %d\nlog:\n%s", len(mailLines), log)
 	}
-	eventLines := compactGCLogLinesWithPrefix(log, "gc event emit dolt.compact.quarantine")
+	eventLines := compactGCLogLinesWithPrefix(log, "gc event emit dolt.compact.quarantine ")
 	if len(eventLines) != 1 {
 		t.Fatalf("compact quarantine should emit exactly one dolt.compact.quarantine event, got %d\nlog:\n%s", len(eventLines), log)
 	}
@@ -749,6 +759,28 @@ case "$query" in
     exit 0
     ;;
   *"DOLT_HASHOF_DB"*)
+    # continuous_writer_*: the production hq shape. A writer is landing
+    # continuously, so the WORKING root differs on every probe and the per-table
+    # pass is always bracketed by a moving working set — while HEAD and the
+    # committed root never move, so a HEAD-only bracket sees nothing at all.
+    if [ "$mode" = "continuous_writer_same_count_drift" ] || [ "$mode" = "continuous_writer_planted_corruption" ]; then
+      case "$query" in
+        *"DOLT_HASHOF_DB('WORKING')"*)
+          calls_file="$state_file.working-hash-calls"
+          calls=0
+          if [ -f "$calls_file" ]; then
+            calls="$(cat "$calls_file")"
+          fi
+          calls=$((calls + 1))
+          printf '%%s\n' "$calls" > "$calls_file"
+          print_cell "hash-working-$calls"
+          ;;
+        *)
+          print_cell "$(current_hash)"
+          ;;
+      esac
+      exit 0
+    fi
     if [ "$mode" = "absorbed_ws_db_hash_drift" ] || [ "$mode" = "absorbed_ws_db_hash_drift_system_table" ]; then
       # Standing uncommitted working-set state absorbed by the flatten's -Am:
       # the committed root legitimately differs across the flatten while HEAD
@@ -797,7 +829,10 @@ case "$query" in
       print_cell ""
       exit 0
     fi
-    if { [ "$mode" = "writer_race_after_postverify_before_db_hash" ] || [ "$mode" = "writer_race_db_hash_empty_pre_probe" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+    # Scoped to the committed-root probe (db_value_hash): these modes model a
+    # writer landing during THAT probe. The WORKING probes that bracket the
+    # per-table pass run earlier and must not trip the writer.
+    if { [ "$mode" = "writer_race_after_postverify_before_db_hash" ] || [ "$mode" = "writer_race_db_hash_empty_pre_probe" ]; } && [ "$(current_head)" = "compactcommit" ] && [[ "$query" == *"DOLT_HASHOF_DB('HEAD')"* ]]; then
       set_head writercommit
       set_hash hash-after-writer
       print_cell hash-after-writer
@@ -823,6 +858,12 @@ case "$query" in
       exit 0
     fi
     if [ "$mode" = "same_row_count_writer" ] && [ "$(current_head)" = "compactcommit" ]; then
+      print_cell hash-beads-after-writer
+      exit 0
+    fi
+    if { [ "$mode" = "continuous_writer_same_count_drift" ] || [ "$mode" = "continuous_writer_planted_corruption" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+      # Same row count, drifted value hash: DOLT_HASHOF_TABLE reads the working
+      # root, so the writer's UPDATE shows up here with no row-count change.
       print_cell hash-beads-after-writer
       exit 0
     fi
@@ -923,6 +964,36 @@ case "$query" in
       exit 0
     fi
     print_cell beads
+    exit 0
+    ;;
+  *"AS OF"*)
+    # Fixed-commit fallback row counts. Both endpoints are immutable commits, so
+    # unlike every live probe above these do not move under the writer.
+    # continuous_writer_planted_corruption loses a row between them — damage the
+    # ongoing legitimate writes cannot account for.
+    if [ "$mode" = "continuous_writer_planted_corruption" ]; then
+      case "$query" in
+        *"AS OF 'compactcommit'"*)
+          print_cell 9
+          ;;
+        *)
+          print_cell 10
+          ;;
+      esac
+      exit 0
+    fi
+    print_cell 10
+    exit 0
+    ;;
+  *"DOLT_DIFF("*)
+    # Rows that are NOT purely additive between two commits — used by both the
+    # additive-only preservation proof and the fixed-commit fallback.
+    if [ "$mode" = "continuous_writer_same_count_drift" ] || [ "$mode" = "continuous_writer_planted_corruption" ]; then
+      print_cell 0
+      exit 0
+    fi
+    # Every other mode asserts the additive-only proof does NOT hold.
+    print_cell 1
     exit 0
     ;;
   *"SELECT COUNT(*) FROM"*"blocked_issues"*)
@@ -1841,7 +1912,7 @@ func TestCompactScriptBlocksStalePendingPushRetryBeforeForcePush(t *testing.T) {
 	}
 }
 
-func TestCompactScriptStalePendingPushMarkerAlertsDefaultMayorBeforeManualReview(t *testing.T) {
+func TestCompactScriptStalePendingPushMarkerAlertsDefaultHumanBeforeManualReview(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	firstOut, err := fixture.run(t, "remote_push_failure", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
 	if err != nil {
@@ -1859,7 +1930,7 @@ func TestCompactScriptStalePendingPushMarkerAlertsDefaultMayorBeforeManualReview
 		!strings.Contains(secondOut, "manual review required") {
 		t.Fatalf("retry missing stale-marker manual-review explanation:\n%s", secondOut)
 	}
-	assertCompactBeadsQuarantineAlert(t, fixture, "mayor", pendingPush, "compact-pending-push", "pending_push marker is stale")
+	assertCompactBeadsQuarantineAlert(t, fixture, "human", pendingPush, "compact-pending-push", "pending_push marker is stale")
 }
 
 func TestCompactScriptDryRunReportsStalePendingPushMarker(t *testing.T) {
@@ -3376,7 +3447,7 @@ func TestCompactScriptExistingQuarantineMarkerAlertsOnceAcrossRepeatedCycles(t *
 	if len(mailLines) != 1 {
 		t.Fatalf("three compact runs over an unchanged quarantine condition should send exactly one operator mail, got %d\nlog:\n%s", len(mailLines), log)
 	}
-	eventLines := compactGCLogLinesWithPrefix(log, "gc event emit dolt.compact.quarantine")
+	eventLines := compactGCLogLinesWithPrefix(log, "gc event emit dolt.compact.quarantine ")
 	if len(eventLines) != 3 {
 		t.Fatalf("each compact cycle should still emit a dolt.compact.quarantine event even when the mail is suppressed, got %d\nlog:\n%s", len(eventLines), log)
 	}
@@ -3489,7 +3560,7 @@ func TestCompactScriptUnreadableQuarantineMarkerIsNotClobbered(t *testing.T) {
 	}
 }
 
-func TestCompactScriptFreshQuarantineMarkerAlertsDefaultMayor(t *testing.T) {
+func TestCompactScriptFreshQuarantineMarkerAlertsDefaultHuman(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	out, err := fixture.run(t, "row_count_decreases", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
 	if err == nil {
@@ -3499,10 +3570,10 @@ func TestCompactScriptFreshQuarantineMarkerAlertsDefaultMayor(t *testing.T) {
 	if reason := compactMarkerValue(t, marker, "reason"); reason != "post-flatten row count decreased" {
 		t.Fatalf("fresh quarantine marker reason = %q, want row-count decrease", reason)
 	}
-	assertCompactBeadsQuarantineAlert(t, fixture, "mayor", marker, "compact-quarantine", "post-flatten row count decreased")
+	assertCompactBeadsQuarantineAlert(t, fixture, "human", marker, "compact-quarantine", "post-flatten row count decreased")
 }
 
-func TestCompactScriptExistingQuarantineMarkerAlertsDefaultMayorBeforeFlattenAndBareGC(t *testing.T) {
+func TestCompactScriptExistingQuarantineMarkerAlertsDefaultHumanBeforeFlattenAndBareGC(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		extraEnv []string
@@ -3529,7 +3600,7 @@ func TestCompactScriptExistingQuarantineMarkerAlertsDefaultMayorBeforeFlattenAnd
 			if !strings.Contains(out, marker) || !strings.Contains(out, "reason="+reason) {
 				t.Fatalf("%s output missing quarantine marker details:\n%s", tc.name, out)
 			}
-			assertCompactBeadsQuarantineAlert(t, fixture, "mayor", marker, "compact-quarantine", reason)
+			assertCompactBeadsQuarantineAlert(t, fixture, "human", marker, "compact-quarantine", reason)
 		})
 	}
 }
@@ -5165,6 +5236,242 @@ func TestCompactScriptStillQuarantinesRowDecreaseWithStableHead(t *testing.T) {
 	}
 	if strings.Contains(string(data), "DOLT_GC") {
 		t.Fatalf("stable-HEAD row-decrease must block full GC:\n%s", string(data))
+	}
+}
+
+// Per-table writer-race gate. Production incident: hq — the fleet's own beads
+// store, written every few minutes all day — sat quarantined for 68 days on the
+// same reason string ("post-flatten table value hash changed without row-count
+// increase", seen_count=49). verify_counts reads DOLT_HASHOF_TABLE, which Dolt
+// hard-codes to the WORKING root and cannot pin to a ref, so a live UPDATE
+// during the per-table pass drifts the hash with no row-count change and no HEAD
+// movement. The database-level check was hardened against exactly this; the
+// per-table pass had no equivalent bracket.
+
+// The immediate false positive: same-count hash drift under a live writer must
+// defer, not quarantine. Note HEAD never moves here — post_verify_HEAD equals
+// flatten_HEAD — so this is caught purely by the WORKING-root bracket. A
+// HEAD-only bracket would have quarantined it, which is the 68-day bug.
+func TestCompactScriptDefersSameCountHashDriftUnderContinuousWriter(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("live-writer hash drift must defer, not fail: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "table=beads value hash changed after flatten without row-count increase") {
+		t.Fatalf("output missing the same-count drift signal the gate downgrades:\n%s", out)
+	}
+	if !strings.Contains(out, "writer race detected during per-table verification") {
+		t.Fatalf("output missing per-table writer-race defer message:\n%s", out)
+	}
+	if !strings.Contains(out, "flatten_HEAD=compactcommit post_verify_HEAD=compactcommit") {
+		t.Fatalf("this case must be proven by the WORKING bracket while HEAD is stable:\n%s", out)
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
+		t.Fatalf("live-writer hash drift must NOT quarantine; stat=%v", statErr)
+	}
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if reason := compactMarkerValue(t, pendingGC, "reason"); reason != "writer race during flatten deferred full GC" {
+		t.Fatalf("per-table race defer should record pending-GC retry marker, got reason %q", reason)
+	}
+	raceDefer := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-race-defer", "beads")
+	if _, statErr := os.Stat(raceDefer); statErr != nil {
+		t.Fatalf("per-table race defer must open a deferral chain marker: %v", statErr)
+	}
+}
+
+// Starvation guard. A store whose writes never stop races on every attempt, so
+// an unbounded defer would relocate the failure rather than fix it: the check
+// would never render a verdict and a real corruption would never be caught.
+// Once the deferral chain outlives the bound, the run must reach a terminal
+// state instead of deferring again.
+func TestCompactScriptBoundedRaceDeferTerminatesUnderContinuousWriter(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	raceDefer := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-race-defer", "beads")
+
+	firstOut, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("first run should defer, not fail: %v\n%s", err, firstOut)
+	}
+
+	// The next scheduled run drains the deferred GC and clears the pending-GC
+	// marker. The deferral chain must survive that, or the bound can never be
+	// reached and the defer is unbounded in practice.
+	secondOut, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("pending-GC retry should succeed: %v\n%s", err, secondOut)
+	}
+	if _, statErr := os.Stat(pendingGC); !os.IsNotExist(statErr) {
+		t.Fatalf("pending-GC retry should clear its marker; stat=%v", statErr)
+	}
+	if _, statErr := os.Stat(raceDefer); statErr != nil {
+		t.Fatalf("deferral chain must outlive the pending-GC retry: %v", statErr)
+	}
+
+	// The writer still has not stopped. Age the chain past the bound.
+	replaceCompactMarkerCreatedAt(t, raceDefer, "1970-01-01T00:00:00Z")
+	resetCompactFixtureHead(t, fixture)
+	thirdOut, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("bounded fallback should resolve clean, not fail: %v\n%s", err, thirdOut)
+	}
+	if !strings.Contains(thirdOut, "deciding from immutable commits headcommit..compactcommit") {
+		t.Fatalf("run past the bound must stop deferring and use the fixed-commit fallback:\n%s", thirdOut)
+	}
+	if strings.Contains(thirdOut, "will retry next run") {
+		t.Fatalf("run past the bound must not defer again:\n%s", thirdOut)
+	}
+	if _, statErr := os.Stat(pendingGC); !os.IsNotExist(statErr) {
+		t.Fatalf("terminal run must not open a new deferral; stat=%v", statErr)
+	}
+	if _, statErr := os.Stat(raceDefer); !os.IsNotExist(statErr) {
+		t.Fatalf("a rendered verdict must close the deferral chain; stat=%v", statErr)
+	}
+}
+
+// The false positive this gate exists to fix: with no real damage, the bounded
+// fallback resolves clean and lets GC finalize — no quarantine, ever.
+func TestCompactScriptBoundedFallbackResolvesCleanUnderContinuousWriter(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	raceDefer := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-race-defer", "beads")
+
+	firstOut, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("first run should defer: %v\n%s", err, firstOut)
+	}
+	if err := os.Remove(filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")); err != nil {
+		t.Fatalf("drain deferred GC: %v", err)
+	}
+	replaceCompactMarkerCreatedAt(t, raceDefer, "1970-01-01T00:00:00Z")
+	resetCompactFixtureHead(t, fixture)
+
+	out, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("clean fixed-commit verification must not fail compaction: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "fixed-commit verification found no drift across headcommit..compactcommit") {
+		t.Fatalf("output missing the clean fixed-commit verdict:\n%s", out)
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
+		t.Fatalf("a proven-clean fallback must NOT quarantine; stat=%v", statErr)
+	}
+	logData, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "AS OF 'headcommit'") || !strings.Contains(log, "AS OF 'compactcommit'") {
+		t.Fatalf("fallback must read both immutable commit endpoints:\n%s", log)
+	}
+	if !strings.Contains(log, "DOLT_GC") {
+		t.Fatalf("a proven-clean fallback must let GC finalize:\n%s", log)
+	}
+}
+
+// No false negative. Same never-stopping writer, but real damage is planted:
+// a row is missing between the two immutable commits, which the ongoing
+// legitimate writes cannot explain. The bounded fallback must still catch it.
+func TestCompactScriptBoundedFallbackStillQuarantinesPlantedCorruption(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	raceDefer := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-race-defer", "beads")
+
+	firstOut, err := fixture.run(t, "continuous_writer_planted_corruption", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("first run should defer: %v\n%s", err, firstOut)
+	}
+	if err := os.Remove(filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")); err != nil {
+		t.Fatalf("drain deferred GC: %v", err)
+	}
+	replaceCompactMarkerCreatedAt(t, raceDefer, "1970-01-01T00:00:00Z")
+	resetCompactFixtureHead(t, fixture)
+	if err := os.WriteFile(fixture.doltLog, nil, 0o644); err != nil {
+		t.Fatalf("reset dolt log: %v", err)
+	}
+
+	out, err := fixture.run(t, "continuous_writer_planted_corruption", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("planted corruption must still fail the run:\n%s", out)
+	}
+	if !strings.Contains(out, "fixed-commit verification table=beads lost rows before=10 after=9") {
+		t.Fatalf("output missing the fixed-commit row-loss evidence:\n%s", out)
+	}
+	if !strings.Contains(out, "fixed-commit verification confirms drift") {
+		t.Fatalf("output missing the confirmed-drift verdict:\n%s", out)
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(quarantine); statErr != nil {
+		t.Fatalf("confirmed drift must quarantine: %v", statErr)
+	}
+	assertCompactMarkerHasEvidence(t, quarantine,
+		"reason=post-flatten table value hash changed without row-count increase",
+		"integrity_table_drift=table=beads,before_rows=10,after_rows=10,before_hash=hash-beads-before,after_hash=hash-beads-after-writer,category=same_row_count_hash_drift",
+	)
+	logData, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
+	}
+	if strings.Contains(string(logData), "DOLT_GC") {
+		t.Fatalf("confirmed drift must block full GC:\n%s", string(logData))
+	}
+}
+
+// Quarantine notification. The default recipient was the session alias `mayor`,
+// retired 2026-05-29 — before hq's marker existed — so all 49 notify attempts
+// failed identically and silently: mail_compact_quarantine_alert returned 1, the
+// caller left the emitted flag at 0, and nothing else happened. The failure must
+// now be independently observable rather than inferable only from a
+// notify_count that never moves.
+func TestCompactScriptQuarantineMailFailureIsLoudAndObservable(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	if err := os.WriteFile(fixture.mailFailFile, nil, 0o644); err != nil {
+		t.Fatalf("arm mail-failure sentinel: %v", err)
+	}
+
+	out, err := fixture.run(t, "row_count_decreases", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("compact succeeded despite row-count decrease:\n%s", out)
+	}
+	if !strings.Contains(out, "CRITICAL: quarantine alert mail to human FAILED") {
+		t.Fatalf("a failed quarantine alert must be loud on stderr:\n%s", out)
+	}
+
+	log := readCompactGCLog(t, fixture)
+	failedEvents := compactGCLogLinesWithPrefix(log, "gc event emit dolt.compact.quarantine_notify_failed ")
+	if len(failedEvents) != 1 {
+		t.Fatalf("a failed quarantine alert must emit exactly one notify-failed event, got %d\nlog:\n%s", len(failedEvents), log)
+	}
+	if !strings.Contains(failedEvents[0], "recipient=human") ||
+		!strings.Contains(failedEvents[0], "--actor controller") {
+		t.Fatalf("notify-failed event missing recipient/actor:\nline:\n%s", failedEvents[0])
+	}
+
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if notifyCount := compactMarkerValue(t, marker, "notify_count"); notifyCount != "0" {
+		t.Fatalf("an undelivered alert must not count as notified, got notify_count=%q", notifyCount)
+	}
+}
+
+// Control for the above: a reachable recipient still records delivery, and the
+// notify-failed event must stay silent.
+func TestCompactScriptQuarantineMailSuccessRecordsNotifyCount(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "row_count_decreases", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("compact succeeded despite row-count decrease:\n%s", out)
+	}
+	if strings.Contains(out, "CRITICAL: quarantine alert mail") {
+		t.Fatalf("a delivered alert must not report a failure:\n%s", out)
+	}
+	log := readCompactGCLog(t, fixture)
+	if failed := compactGCLogLinesWithPrefix(log, "gc event emit dolt.compact.quarantine_notify_failed "); len(failed) != 0 {
+		t.Fatalf("a delivered alert must not emit a notify-failed event\nlog:\n%s", log)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if notifyCount := compactMarkerValue(t, marker, "notify_count"); notifyCount != "1" {
+		t.Fatalf("a delivered alert should record notify_count=1, got %q", notifyCount)
 	}
 }
 

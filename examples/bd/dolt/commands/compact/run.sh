@@ -77,6 +77,12 @@
 #   GC_DOLT_COMPACT_PENDING_PUSH_MAX_AGE_SECS
 #     (default: 172800) — maximum age for automatic pending remote-push retry.
 #                       Older markers require manual review before push.
+#   GC_DOLT_COMPACT_RACE_FALLBACK_AFTER_SECONDS
+#     (default: 86400) — how long the per-table writer-race defer may keep
+#                       retrying before the fixed-commit fallback decides. Bounds
+#                       the defer so a never-idle database cannot starve the
+#                       integrity check forever. Measured from the start of the
+#                       unresolved deferral chain (compact-race-defer marker).
 #   GC_DOLT_COMPACT_REMOTE               (optional) — remote to fetch/push.
 #                                         Defaults to origin when present;
 #                                         ambiguous multi-remote stores fail.
@@ -245,6 +251,8 @@ PACK_DIR="${GC_PACK_DIR:-$(unset CDPATH; cd -- "$(dirname "$0")/.." && pwd)}"
 . "$PACK_DIR/assets/scripts/runtime.sh"
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/compact-gain-drift-proof.sh"
+# shellcheck disable=SC1091
+. "$PACK_DIR/assets/scripts/compact-fixed-commit-verify.sh"
 
 if [ "${GC_DOLT_MANAGED_LOCAL:-}" = "1" ]; then
   managed_port=$(managed_runtime_port "$DOLT_STATE_FILE" "$DOLT_DATA_DIR" || true)
@@ -301,7 +309,11 @@ only_dbs="${GC_DOLT_COMPACT_ONLY_DBS:-}"
 bare_gc_input="${GC_DOLT_COMPACT_BARE_GC:-}"
 skip_fetch_input="${GC_DOLT_COMPACT_SKIP_FETCH:-}"
 skip_fetch_dbs="${GC_DOLT_COMPACT_SKIP_FETCH_DBS:-}"
-compact_alert_to="${GC_DOLT_COMPACT_ALERT_TO:-mayor}"
+# Operator-critical severity: a beads-store integrity quarantine blocks all GC of
+# the database. The former default (`mayor`) was a session alias retired
+# 2026-05-29, so every alert since has failed with "unknown recipient".
+compact_alert_to="${GC_DOLT_COMPACT_ALERT_TO:-human}"
+race_fallback_after_seconds="${GC_DOLT_COMPACT_RACE_FALLBACK_AFTER_SECONDS:-86400}"
 case "$bare_gc_input" in
   ''|0|false|FALSE|no|NO)
     bare_gc=0
@@ -375,6 +387,14 @@ case "$pending_push_max_age_secs" in
     ;;
 esac
 
+case "$race_fallback_after_seconds" in
+  ''|*[!0-9]*)
+    printf 'compact: invalid GC_DOLT_COMPACT_RACE_FALLBACK_AFTER_SECONDS=%s (must be a non-negative integer)\n' \
+      "$race_fallback_after_seconds" >&2
+    exit 2
+    ;;
+esac
+
 case "$compact_remote" in
   ''|[A-Za-z0-9_.-]*)
     case "$compact_remote" in
@@ -421,6 +441,13 @@ lock_cmd_path="$lock_dir/cmd"
 pending_gc_dir="$PACK_STATE_DIR/compact-pending-gc"
 pending_push_dir="$PACK_STATE_DIR/compact-pending-push"
 quarantine_dir="$PACK_STATE_DIR/compact-quarantine"
+# Tracks how long per-table verification has been stuck deferring on writer
+# races. It cannot ride on the pending-GC marker, whose created_at the spec for
+# this bound assumed would accumulate: the very next run's GC retry clears that
+# marker, so it never ages past one scheduling interval. This one is cleared only
+# when the check actually renders a verdict, so its created_at is the start of
+# the unresolved chain and the bound can be reached.
+race_defer_dir="$PACK_STATE_DIR/compact-race-defer"
 
 # DB discovery uses rig metadata.json files first (authoritative), with a
 # filesystem-scan fallback when gc itself is unavailable.
@@ -791,6 +818,18 @@ db_value_hash() {
   # preservation this hash must prove.
   query_single_cell "$db" "database value hash probe failed" \
     "SELECT DOLT_HASHOF_DB('HEAD')"
+}
+
+# db_working_hash — hash of the WORKING root. Companion to db_value_hash's
+# committed-root probe, and the only signal that catches the write that lands in
+# the working set without being committed: that write moves no HEAD, yet it
+# drifts every table_value_hash read (DOLT_HASHOF_TABLE is hard-coded to the
+# working root and cannot be pinned to a ref). One O(1) root-hash read — not a
+# table or row scan.
+db_working_hash() {
+  db="$1"
+  query_single_cell "$db" "database working hash probe failed" \
+    "SELECT DOLT_HASHOF_DB('WORKING')"
 }
 
 remote_count() {
@@ -1345,6 +1384,14 @@ mail_compact_quarantine_alert() {
   if gc mail send "$compact_alert_to" --from controller -s "dolt compact quarantine: $_ca_db $_ca_type" -m "$_ca_msg"; then
     return 0
   fi
+  # A swallowed return code is how a stale recipient alias went unnoticed for 68
+  # days: the caller just leaves quarantine_alert_emitted=0 and retries the same
+  # failing send forever. Make the failure independently observable (events tail,
+  # gc doctor) instead of only inferable from a never-incrementing notify_count.
+  gc event emit dolt.compact.quarantine_notify_failed --actor controller \
+    --message "$_ca_msg" || true
+  printf 'compact: db=%s CRITICAL: quarantine alert mail to %s FAILED (recipient unreachable/invalid?) — integrity issue may be going unnoticed\n' \
+    "$_ca_db" "$compact_alert_to" >&2
   return 1
 }
 
@@ -1487,6 +1534,7 @@ ensure_repair_marker_paths_writable() {
 
   ensure_compact_marker_writable "$quarantine_dir" "$db" || return 1
   ensure_compact_marker_writable "$pending_gc_dir" "$db" || return 1
+  ensure_compact_marker_writable "$race_defer_dir" "$db" || return 1
   if [ -n "$remote" ]; then
     ensure_compact_marker_writable "$pending_push_dir" "$db" || return 1
   fi
@@ -1986,6 +2034,9 @@ flatten_database() {
   head_before_reset=""
   flatten_head=""
   post_verify_head=""
+  pre_table_working_hash=""
+  post_table_working_hash=""
+  table_pass_race_detected=0
   preflight_hash=""
   postflight_hash=""
   writer_race_detected=0
@@ -2413,8 +2464,18 @@ flatten_database() {
     return 1
   fi
 
+  # Bracket the per-table pass so a write landing inside it is provable. HEAD is
+  # already bracketed across exactly this window by flatten_head (probed just
+  # above) and post_verify_head (probed just below), but HEAD alone is not
+  # enough: verify_counts reads DOLT_HASHOF_TABLE, which Dolt pins to the
+  # WORKING root, so an uncommitted-but-applied write drifts every table hash
+  # while HEAD never moves. The WORKING root hash is the signal that closes that
+  # half. Probe failures leave the value empty and cannot prove a race, so an
+  # unprovable race falls through to quarantine.
+  pre_table_working_hash=$(db_working_hash "$db" || true)
   verify_counts_rc=0
   verify_counts "$db" "$preflight_tmp" || verify_counts_rc=$?
+  post_table_working_hash=$(db_working_hash "$db" || true)
 
   # Writer-race gate (local-verify HEAD-stability). A normal MVCC writer (the
   # beads/mail workload) can commit to this db inside the flatten window, which
@@ -2443,6 +2504,18 @@ flatten_database() {
   fi
   if [ -n "$flatten_head" ] && [ -n "$post_verify_head" ] && [ "$post_verify_head" != "$flatten_head" ]; then
     writer_race_detected=1
+  fi
+
+  # Narrower than writer_race_detected: proof that a write landed during the
+  # per-table pass specifically, which is the only window whose reads
+  # verify_counts' verdict depends on.
+  table_pass_race_detected=0
+  if [ -n "$flatten_head" ] && [ -n "$post_verify_head" ] && [ "$post_verify_head" != "$flatten_head" ]; then
+    table_pass_race_detected=1
+  fi
+  if [ -n "$pre_table_working_hash" ] && [ -n "$post_table_working_hash" ] && \
+     [ "$post_table_working_hash" != "$pre_table_working_hash" ]; then
+    table_pass_race_detected=1
   fi
 
   if [ "$verify_counts_rc" -ne 0 ]; then
@@ -2519,25 +2592,105 @@ flatten_database() {
       rm -f "$preflight_tmp"
       return 0
     fi
-    if [ "$writer_race_detected" = "1" ] && \
-       { [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ] || \
-         [ "${verify_counts_saw_row_decrease:-0}" = "1" ]; }; then
-      printf 'compact: db=%s writer race detected during flatten (snapshot_HEAD=%s pre_reset_HEAD=%s flatten_HEAD=%s post_verify_HEAD=%s), but additional integrity failure category prevents defer; quarantine unchanged\n' \
-        "$db" "$head" "${head_before_reset:-<empty>}" "$flatten_head" "${post_verify_head:-<empty>}" >&2
+    # Per-table writer-race gate. Everything above is anchored on HEAD, which
+    # cannot see the write that lands in the working set without a commit — and
+    # that write drifts every DOLT_HASHOF_TABLE read verify_counts makes. The
+    # bracketed WORKING root hash sees it. This is the case that quarantined the
+    # busiest store in the fleet for 68 days on the same reason string.
+    #
+    # Deferring on every race would only relocate the failure: a store written
+    # every few minutes races on every attempt, so the check would never
+    # complete and a real corruption would never be caught. So the defer is
+    # BOUNDED by how long this database has been stuck deferring — the race-defer
+    # marker's created_at, which write_compact_marker preserves across rewrites.
+    # Past the bound we stop guessing and compare two immutable commits, which
+    # has no race window at all.
+    table_race_gate=0
+    if [ "$table_pass_race_detected" = "1" ] && \
+       [ "${verify_counts_saw_row_decrease:-0}" != "1" ] && \
+       [ "${verify_counts_saw_table_list_change:-0}" != "1" ] && \
+       [ "${verify_counts_saw_probe_failure:-0}" != "1" ]; then
+      # Exactly one drift category. This gate widens the writer-race explanation
+      # to the hash-drift cases HEAD cannot explain; it does not relax the
+      # surrounding rule that unrelated failure categories compound into a
+      # fail-closed quarantine.
+      if [ "${verify_counts_saw_same_count_hash_drift:-0}" = "1" ] && \
+         [ "${verify_counts_saw_gain_hash_drift:-0}" != "1" ]; then
+        table_race_gate=1
+      elif [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ] && \
+           [ "${verify_counts_saw_same_count_hash_drift:-0}" != "1" ]; then
+        table_race_gate=1
+      fi
     fi
-    printf 'compact: db=%s post-flatten INTEGRITY check failed — escalate (%s)\n' \
-      "$db" "$integrity_guidance" >&2
-    write_quarantine_marker "$db" "$integrity_reason" \
-      "integrity_table_drift=${verify_counts_drift_details#;}" \
-      "integrity_failure_guidance=$integrity_guidance" || {
+    if [ "$table_race_gate" = "1" ]; then
+      race_deferred_secs=0
+      if has_compact_marker "$race_defer_dir" "$db"; then
+        race_marker_epoch=$(compact_marker_created_at_epoch "$race_defer_dir" "$db" || true)
+        if [ -n "$race_marker_epoch" ]; then
+          race_deferred_secs=$(( $(date -u +%s) - race_marker_epoch ))
+          if [ "$race_deferred_secs" -lt 0 ]; then
+            race_deferred_secs=0
+          fi
+        fi
+      fi
+      if [ "$race_deferred_secs" -lt "$race_fallback_after_seconds" ]; then
+        write_compact_marker "$race_defer_dir" "$db" \
+          "per-table verification deferred on writer race" \
+          "flatten_head=$flatten_head" \
+          "compacted_from_head=${compacted_from_head:-}" \
+          "fallback_after_seconds=$race_fallback_after_seconds" || true
+        printf 'compact: db=%s writer race detected during per-table verification (flatten_HEAD=%s post_verify_HEAD=%s pre_table_working_hash=%s post_table_working_hash=%s) — table value hash drift is concurrent-writer data, not corruption; deferring %ss/%ss, will retry next run\n' \
+          "$db" "$flatten_head" "${post_verify_head:-<empty>}" \
+          "${pre_table_working_hash:-<empty>}" "${post_table_working_hash:-<empty>}" \
+          "$race_deferred_secs" "$race_fallback_after_seconds" >&2
+        if ! defer_writer_race_after_flatten "$db" "$flatten_head" \
+          "$remote" "$expected_remote_head" "$expected_remote_head_verified" \
+          "$compacted_from_head" "$local_branch" "$remote_branch"; then
+          rm -f "$preflight_tmp"
+          return 1
+        fi
+        rm -f "$preflight_tmp"
+        return 0
+      fi
+      printf 'compact: db=%s writer race has blocked per-table verification for %ss (bound %ss) — deciding from immutable commits %s..%s instead of the racing working set\n' \
+        "$db" "$race_deferred_secs" "$race_fallback_after_seconds" \
+        "${compacted_from_head:-<empty>}" "$flatten_head" >&2
+      # A verdict either way ends the deferral chain.
+      clear_compact_marker "$race_defer_dir" "$db"
+      if verify_table_drift_via_fixed_commits "$db" "${compacted_from_head:-}" "$flatten_head" "$verify_counts_drift_details"; then
+        printf 'compact: db=%s fixed-commit verification found no drift across %s..%s — the live-hash drift was concurrent-writer data; clearing the deferral and continuing\n' \
+          "$db" "${compacted_from_head:-<empty>}" "$flatten_head" >&2
+        clear_compact_marker "$pending_gc_dir" "$db"
+        verify_counts_rc=0
+      else
+        printf 'compact: db=%s fixed-commit verification confirms drift across %s..%s — this is not a writer race; quarantine\n' \
+          "$db" "${compacted_from_head:-<empty>}" "$flatten_head" >&2
+      fi
+    fi
+    if [ "$verify_counts_rc" -ne 0 ]; then
+      if [ "$writer_race_detected" = "1" ] && \
+         { [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ] || \
+           [ "${verify_counts_saw_row_decrease:-0}" = "1" ]; }; then
+        printf 'compact: db=%s writer race detected during flatten (snapshot_HEAD=%s pre_reset_HEAD=%s flatten_HEAD=%s post_verify_HEAD=%s), but additional integrity failure category prevents defer; quarantine unchanged\n' \
+          "$db" "$head" "${head_before_reset:-<empty>}" "$flatten_head" "${post_verify_head:-<empty>}" >&2
+      fi
+      printf 'compact: db=%s post-flatten INTEGRITY check failed — escalate (%s)\n' \
+        "$db" "$integrity_guidance" >&2
+      write_quarantine_marker "$db" "$integrity_reason" \
+        "integrity_table_drift=${verify_counts_drift_details#;}" \
+        "integrity_failure_guidance=$integrity_guidance" || {
+        preserve_head_after_integrity_failure "$db" "$flatten_head" || true
+        rm -f "$preflight_tmp"
+        return 1
+      }
       preserve_head_after_integrity_failure "$db" "$flatten_head" || true
+      clear_compact_marker "$race_defer_dir" "$db"
       rm -f "$preflight_tmp"
       return 1
-    }
-    preserve_head_after_integrity_failure "$db" "$flatten_head" || true
-    rm -f "$preflight_tmp"
-    return 1
+    fi
   fi
+  # Per-table verification rendered a verdict, so no deferral chain is open.
+  clear_compact_marker "$race_defer_dir" "$db"
   pre_db_hash_head=$(head_commit "$db" || true)
   if ! postflight_hash=$(db_value_hash "$db"); then
     printf 'compact: db=%s post-flatten value hash probe failed — quarantine and investigate before GC\n' \
