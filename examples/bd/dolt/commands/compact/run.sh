@@ -2639,18 +2639,23 @@ flatten_database() {
           "flatten_head=$flatten_head" \
           "compacted_from_head=${compacted_from_head:-}" \
           "fallback_after_seconds=$race_fallback_after_seconds" || true
-        printf 'compact: db=%s writer race detected during per-table verification (flatten_HEAD=%s post_verify_HEAD=%s pre_table_working_hash=%s post_table_working_hash=%s) — table value hash drift is concurrent-writer data, not corruption; deferring %ss/%ss, will retry next run\n' \
+        # Deliberately NOT a pending-GC marker. That marker's contract is
+        # "verification already passed, only the GC step is outstanding", and the
+        # next run honours it by calling run_full_gc directly — a bare
+        # CALL DOLT_GC('--full') with no re-verification of anything. Per-table
+        # content correctness is precisely what is still unresolved here, so
+        # taking that path would irreversibly GC away the pre-flatten history the
+        # fixed-commit fallback needs, and silently destroy the evidence if the
+        # drift turns out to be real. Abort the cycle with no marker instead and
+        # re-verify from a fresh preflight next run, exactly as the preflight
+        # stability loop does when HEAD will not settle. Skipping GC only costs
+        # disk, which is the same thing today's quarantine already costs.
+        printf 'compact: db=%s writer race detected during per-table verification (flatten_HEAD=%s post_verify_HEAD=%s pre_table_working_hash=%s post_table_working_hash=%s) — table value hash drift is unresolved concurrent-writer noise, not proven corruption; leaving post-flatten HEAD in place, skipping GC, re-verifying from a fresh preflight next run (chain age %ss, bound %ss)\n' \
           "$db" "$flatten_head" "${post_verify_head:-<empty>}" \
           "${pre_table_working_hash:-<empty>}" "${post_table_working_hash:-<empty>}" \
           "$race_deferred_secs" "$race_fallback_after_seconds" >&2
-        if ! defer_writer_race_after_flatten "$db" "$flatten_head" \
-          "$remote" "$expected_remote_head" "$expected_remote_head_verified" \
-          "$compacted_from_head" "$local_branch" "$remote_branch"; then
-          rm -f "$preflight_tmp"
-          return 1
-        fi
         rm -f "$preflight_tmp"
-        return 0
+        return 1
       fi
       printf 'compact: db=%s writer race has blocked per-table verification for %ss (bound %ss) — deciding from immutable commits %s..%s instead of the racing working set\n' \
         "$db" "$race_deferred_secs" "$race_fallback_after_seconds" \
@@ -2660,7 +2665,6 @@ flatten_database() {
       if verify_table_drift_via_fixed_commits "$db" "${compacted_from_head:-}" "$flatten_head" "$verify_counts_drift_details"; then
         printf 'compact: db=%s fixed-commit verification found no drift across %s..%s — the live-hash drift was concurrent-writer data; clearing the deferral and continuing\n' \
           "$db" "${compacted_from_head:-<empty>}" "$flatten_head" >&2
-        clear_compact_marker "$pending_gc_dir" "$db"
         verify_counts_rc=0
       else
         printf 'compact: db=%s fixed-commit verification confirms drift across %s..%s — this is not a writer race; quarantine\n' \

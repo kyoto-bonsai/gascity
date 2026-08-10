@@ -5249,20 +5249,31 @@ func TestCompactScriptStillQuarantinesRowDecreaseWithStableHead(t *testing.T) {
 // per-table pass had no equivalent bracket.
 
 // The immediate false positive: same-count hash drift under a live writer must
-// defer, not quarantine. Note HEAD never moves here — post_verify_HEAD equals
+// not quarantine. Note HEAD never moves here — post_verify_HEAD equals
 // flatten_HEAD — so this is caught purely by the WORKING-root bracket. A
 // HEAD-only bracket would have quarantined it, which is the 68-day bug.
-func TestCompactScriptDefersSameCountHashDriftUnderContinuousWriter(t *testing.T) {
+//
+// It must also not write a pending-GC marker. That marker means "verification
+// passed, only the GC step is outstanding", and the next run honours it by
+// calling run_full_gc directly — a bare CALL DOLT_GC('--full') with no
+// re-verification. Handing an UNRESOLVED per-table drift to that path would
+// irreversibly reclaim the pre-flatten history the fixed-commit fallback needs,
+// and destroy the evidence outright if the drift were real.
+func TestCompactScriptRaceDeferSkipsGCWithoutPendingGCHandoff(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	out, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
-	if err != nil {
-		t.Fatalf("live-writer hash drift must defer, not fail: %v\n%s", err, out)
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if _, statErr := os.Stat(pendingGC); !os.IsNotExist(statErr) {
+		t.Fatalf("an unresolved per-table drift must NOT hand off to the pending-GC path, whose next run calls run_full_gc with no re-verification; stat=%v\n%s", statErr, out)
+	}
+	if err == nil {
+		t.Fatalf("an unresolved per-table drift must not report success:\n%s", out)
 	}
 	if !strings.Contains(out, "table=beads value hash changed after flatten without row-count increase") {
-		t.Fatalf("output missing the same-count drift signal the gate downgrades:\n%s", out)
+		t.Fatalf("output missing the same-count drift signal the gate handles:\n%s", out)
 	}
 	if !strings.Contains(out, "writer race detected during per-table verification") {
-		t.Fatalf("output missing per-table writer-race defer message:\n%s", out)
+		t.Fatalf("output missing per-table writer-race message:\n%s", out)
 	}
 	if !strings.Contains(out, "flatten_HEAD=compactcommit post_verify_HEAD=compactcommit") {
 		t.Fatalf("this case must be proven by the WORKING bracket while HEAD is stable:\n%s", out)
@@ -5271,13 +5282,16 @@ func TestCompactScriptDefersSameCountHashDriftUnderContinuousWriter(t *testing.T
 	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
 		t.Fatalf("live-writer hash drift must NOT quarantine; stat=%v", statErr)
 	}
-	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
-	if reason := compactMarkerValue(t, pendingGC, "reason"); reason != "writer race during flatten deferred full GC" {
-		t.Fatalf("per-table race defer should record pending-GC retry marker, got reason %q", reason)
-	}
 	raceDefer := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-race-defer", "beads")
 	if _, statErr := os.Stat(raceDefer); statErr != nil {
 		t.Fatalf("per-table race defer must open a deferral chain marker: %v", statErr)
+	}
+	logData, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
+	}
+	if strings.Contains(string(logData), "DOLT_GC") {
+		t.Fatalf("an unresolved per-table drift must not reclaim anything:\n%s", string(logData))
 	}
 }
 
@@ -5292,22 +5306,42 @@ func TestCompactScriptBoundedRaceDeferTerminatesUnderContinuousWriter(t *testing
 	raceDefer := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-race-defer", "beads")
 
 	firstOut, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
-	if err != nil {
-		t.Fatalf("first run should defer, not fail: %v\n%s", err, firstOut)
-	}
-
-	// The next scheduled run drains the deferred GC and clears the pending-GC
-	// marker. The deferral chain must survive that, or the bound can never be
-	// reached and the defer is unbounded in practice.
-	secondOut, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
-	if err != nil {
-		t.Fatalf("pending-GC retry should succeed: %v\n%s", err, secondOut)
+	if err == nil {
+		t.Fatalf("first run should not report success:\n%s", firstOut)
 	}
 	if _, statErr := os.Stat(pendingGC); !os.IsNotExist(statErr) {
-		t.Fatalf("pending-GC retry should clear its marker; stat=%v", statErr)
+		t.Fatalf("first run must not hand off to the blind GC retry path; stat=%v", statErr)
 	}
-	if _, statErr := os.Stat(raceDefer); statErr != nil {
-		t.Fatalf("deferral chain must outlive the pending-GC retry: %v", statErr)
+	firstChainStart := compactMarkerValue(t, raceDefer, "created_at")
+
+	// The next scheduled run must re-verify from scratch rather than take any
+	// marker-driven shortcut: with no pending-GC marker there is nothing to
+	// blind-GC, so verify_counts runs again and re-evaluates the bound. The
+	// deferral chain's created_at must survive unchanged, or the elapsed clock
+	// resets every run and the bound is never reachable.
+	resetCompactFixtureHead(t, fixture)
+	secondOut, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("second run should still be unresolved:\n%s", secondOut)
+	}
+	if !strings.Contains(secondOut, "table=beads value hash changed after flatten without row-count increase") {
+		t.Fatalf("second run must re-run per-table verification, not shortcut to GC:\n%s", secondOut)
+	}
+	logData, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
+	}
+	if resets := strings.Count(string(logData), "DOLT_RESET"); resets != 2 {
+		t.Fatalf("second run must perform a full fresh flatten cycle, want 2 DOLT_RESET, got %d:\n%s", resets, string(logData))
+	}
+	if strings.Contains(string(logData), "DOLT_GC") {
+		t.Fatalf("no run may reclaim while the drift is unresolved:\n%s", string(logData))
+	}
+	if _, statErr := os.Stat(pendingGC); !os.IsNotExist(statErr) {
+		t.Fatalf("second run must not hand off to the blind GC retry path; stat=%v", statErr)
+	}
+	if got := compactMarkerValue(t, raceDefer, "created_at"); got != firstChainStart {
+		t.Fatalf("deferral chain clock reset across runs: %q -> %q", firstChainStart, got)
 	}
 
 	// The writer still has not stopped. Age the chain past the bound.
@@ -5338,11 +5372,8 @@ func TestCompactScriptBoundedFallbackResolvesCleanUnderContinuousWriter(t *testi
 	raceDefer := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-race-defer", "beads")
 
 	firstOut, err := fixture.run(t, "continuous_writer_same_count_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
-	if err != nil {
-		t.Fatalf("first run should defer: %v\n%s", err, firstOut)
-	}
-	if err := os.Remove(filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")); err != nil {
-		t.Fatalf("drain deferred GC: %v", err)
+	if err == nil {
+		t.Fatalf("first run should not report success:\n%s", firstOut)
 	}
 	replaceCompactMarkerCreatedAt(t, raceDefer, "1970-01-01T00:00:00Z")
 	resetCompactFixtureHead(t, fixture)
@@ -5379,11 +5410,8 @@ func TestCompactScriptBoundedFallbackStillQuarantinesPlantedCorruption(t *testin
 	raceDefer := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-race-defer", "beads")
 
 	firstOut, err := fixture.run(t, "continuous_writer_planted_corruption", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
-	if err != nil {
-		t.Fatalf("first run should defer: %v\n%s", err, firstOut)
-	}
-	if err := os.Remove(filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")); err != nil {
-		t.Fatalf("drain deferred GC: %v", err)
+	if err == nil {
+		t.Fatalf("first run should not report success:\n%s", firstOut)
 	}
 	replaceCompactMarkerCreatedAt(t, raceDefer, "1970-01-01T00:00:00Z")
 	resetCompactFixtureHead(t, fixture)
