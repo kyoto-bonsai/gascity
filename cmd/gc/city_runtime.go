@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
@@ -2483,6 +2484,17 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 			result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
 		}
 		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_undesired_pool_sessions", phaseStart, traceSessionSnapshotFields(sessionBeads))
+		// Deferred on boot for the identical reason as the sweep above: this
+		// runs over the same session-bead snapshot (reloaded above when that
+		// sweep closed anything, so it sees a fresh view either way) and adds
+		// only one more per-candidate read (the trigger-bead lookup).
+		phaseStart = time.Now()
+		if closedWisps := sweepClosedTriggerWispSessions(sessStore.Store, rigStores, sessionBeads, cr.cfg, cr.sp, result.snapshotQueryPartial(), cr.rec, cr.stderr); len(closedWisps) > 0 {
+			var sessionQueryPartial bool
+			sessionBeads, sessionQueryPartial = cr.loadSessionBeadSnapshotWithPartial()
+			result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
+		}
+		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_closed_trigger_wisp_sessions", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	}
 	openInfos := sessionBeads.OpenInfos()
 
@@ -3062,6 +3074,113 @@ func sweepUndesiredPoolSessionBeads(
 		candidates = append(candidates, info)
 	}
 	return len(GCSweepSessionBeads(store.Store, rigStores, candidates))
+}
+
+// sweepClosedTriggerWispSessions closes generic-ephemeral, non-manual,
+// non-named session beads whose triggering work is done (TriggerBeadID
+// resolves to a closed bead) and which hold no other open/in-progress
+// assigned work anywhere — the "closed-molecule wisp" case (ga-luwtw4). The
+// idle-sleep engine deliberately retains desired-state so a seat can be
+// woken on demand; that is correct for a seat that may be needed again, but
+// wrong here, since discoverSessionBeadsWithRoots treats every open session
+// bead as desired regardless of whether the work that spawned it still
+// exists — so a closed-molecule wisp re-materializes on every city restart
+// until its next natural sleep. This closes the bead outright instead,
+// matching GCSweepSessionBeads's existing "no assigned work -> close" shape
+// but gated by one additional, narrower condition (trigger closed) so it
+// only fires for wisps whose entire reason for existing is gone, not merely
+// idle ones — sweepUndesiredPoolSessionBeads already handles (and continues,
+// unmodified, to handle) the broader idle/undesired case.
+//
+// Deliberately a standalone sibling of sweepUndesiredPoolSessionBeads rather
+// than a modification to it, and not a change to discoverSessionBeadsWithRoots
+// at all: this keeps every existing, already-relied-upon desired-state and
+// sweep decision byte-for-byte unchanged for every session that isn't
+// specifically eligible here, so a mistake in this new, narrow path cannot
+// alter any other sweep's behavior.
+//
+// Every gate fails closed: a query error at the trigger-bead lookup or the
+// runtime-liveness probe leaves the bead untouched rather than guessing
+// toward closing it. The liveness probe is the same provider-process check
+// sweepUndesiredPoolSessionBeads already trusts (runtime.ObserveLiveness via
+// poolSessionBeadRuntimeRunningInfo — provider process presence keyed off the
+// agent template's process names, never the tmux session name and never
+// gc session list's state column, which conflates engine-slept with
+// killed/runtime-missing/city-stop) and is consulted independently of
+// whether the session holds a formal assigned-work bead — closing the gap
+// ga-imla7x named, where a bead-shaped guard alone could not protect a seat
+// mid unstructured/interactive work. closeSessionInfoIfUnassigned's own
+// fresh, cross-store, fail-closed assigned-work check (not a cached flag —
+// see ga-ven9sa) is reused verbatim as the final gate.
+func sweepClosedTriggerWispSessions(
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	sessionBeads *sessionBeadSnapshot,
+	cfg *config.City,
+	sp runtime.Provider,
+	storeQueryPartial bool,
+	rec events.Recorder,
+	stderr io.Writer,
+) []string {
+	if store == nil || sessionBeads == nil || cfg == nil || sp == nil || storeQueryPartial {
+		return nil
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	startupTimeout := cfg.Session.StartupTimeoutDuration()
+	var closed []string
+	for _, info := range sessionBeads.OpenInfos() {
+		if info.Closed {
+			continue
+		}
+		if isManualSessionInfo(info) || isNamedSessionInfo(info) {
+			continue // never touch a configured/named/manual session
+		}
+		if pendingCreateClaimStillLeasedForSweepInfo(info, startupTimeout) {
+			continue // mirror the undesired-pool sweep's create-window grace period
+		}
+		if strings.TrimSpace(info.MetadataState) == "creating" && !isStaleCreatingInfo(info) {
+			continue
+		}
+		template := normalizedSessionTemplateInfo(info, cfg)
+		agentCfg := findAgentByTemplate(cfg, template)
+		if agentCfg == nil || !isEphemeralSessionInfo(info) {
+			continue // wisps/pool workers only — never a configured agent's own instance shape
+		}
+		triggerClosed, err := triggerBeadClosedInfo(store, rigStores, info)
+		if err != nil {
+			fmt.Fprintf(stderr, "session wisp retire: checking trigger bead for %s: %v\n", info.ID, err) //nolint:errcheck
+			continue
+		}
+		if !triggerClosed {
+			continue
+		}
+		processNames := config.AgentProcessNames(cfg, *agentCfg, exec.LookPath)
+		running, err := poolSessionBeadRuntimeRunningInfo(info, sp, processNames)
+		if err != nil {
+			fmt.Fprintf(stderr, "session wisp retire: checking runtime liveness for %s: %v\n", info.ID, err) //nolint:errcheck
+			continue
+		}
+		if running {
+			continue // never retire a live process, regardless of bead-level claims
+		}
+		if !closeSessionInfoIfUnassigned(store, rigStores, cfg, info, "gc_retired_closed_trigger", time.Now().UTC(), stderr) {
+			continue // fresh cross-store check found other open/in-progress work, or the close itself failed
+		}
+		closed = append(closed, info.ID)
+		if rec != nil {
+			rec.Record(events.Event{
+				Type:      events.SessionWispRetired,
+				Actor:     "gc",
+				Subject:   info.ID,
+				SessionID: info.ID,
+				Message:   fmt.Sprintf("retired closed-trigger wisp session %s (trigger %s closed, no other claim, not running)", info.ID, strings.TrimSpace(info.TriggerBeadID)),
+				Payload:   api.SessionWispRetiredPayloadJSON(info.ID, strings.TrimSpace(info.TriggerBeadID), template),
+			})
+		}
+	}
+	return closed
 }
 
 func poolSessionBeadRuntimeRunning(bead beads.Bead, sp runtime.Provider, processNames []string) (bool, error) {

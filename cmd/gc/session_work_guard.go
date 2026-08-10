@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -79,6 +81,46 @@ func closeSessionInfoIfUnassigned(
 		return closeFailedCreateBead(sessionFrontDoor(store), info.ID, now, stderr)
 	}
 	return closeBead(store, info.ID, reason, now, stderr)
+}
+
+// triggerBeadClosedInfo reports whether info's TriggerBeadID names a bead
+// that exists and is closed. It resolves the bead through
+// TriggerBeadStoreRef when set (empty means the primary store, mirroring the
+// storeRef convention releaseOrphanedPoolAssignments and the idle-claim
+// backstop already use for the same field pair) — an unattached/unknown
+// store ref fails closed rather than guessing at the primary store.
+//
+// Empty TriggerBeadID, an unresolvable store ref, or a not-found bead all
+// report (false, nil): a wisp with no known trigger, or one whose trigger
+// cannot be located, is never eligible for retirement on this signal alone.
+// A genuine store query error (as opposed to a clean not-found) is returned
+// so the caller can fail closed AND log it, rather than silently treating a
+// transient read failure the same as "trigger is open." This is a fresh,
+// uncached read every call; callers must not memoize it across ticks.
+func triggerBeadClosedInfo(store beads.Store, rigStores map[string]beads.Store, info sessionpkg.Info) (bool, error) {
+	triggerID := strings.TrimSpace(info.TriggerBeadID)
+	if triggerID == "" {
+		return false, nil
+	}
+	target := store
+	if storeRef := strings.TrimSpace(info.TriggerBeadStoreRef); storeRef != "" {
+		rs, ok := rigStores[storeRef]
+		if !ok || rs == nil {
+			return false, nil
+		}
+		target = rs
+	}
+	if target == nil {
+		return false, nil
+	}
+	b, err := target.Get(triggerID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return b.Status == "closed", nil
 }
 
 // closeSessionBeadIfReachableStoreUnassigned closes a session bead only when

@@ -82,6 +82,18 @@ const (
 	// policy (commit-and-push, clear-assignee-and-respawn, or escalate).
 	// See gastownhall/gascity#2293.
 	SessionDrainAckedWithAssignedWork = "session.drain_acked_with_assigned_work"
+	// SessionWispRetired fires when the closed-trigger wisp-retire sweep
+	// (ga-luwtw4) closes an ephemeral session bead outright instead of
+	// leaving it sleepable, because its TriggerBeadID resolved to a closed
+	// bead and a fresh cross-store check found no other open/in-progress
+	// work assigned to it anywhere. Unlike session.slept, this is not
+	// recoverable by wake-on-demand: the session bead itself is gone, so
+	// discoverSessionBeadsWithRoots's "any open session bead is desired"
+	// rule can never re-materialize it on a later city restart. Payload
+	// carries session_id, trigger_bead_id, and template so a subscriber can
+	// audit exactly which wisp was retired and why, without re-deriving it
+	// from bead history.
+	SessionWispRetired = "session.wisp_retired"
 	// SessionStranded fires when a pool slot retains an in-progress work
 	// bead after its runtime has exited — i.e., the worker process is
 	// gone but the bead's assignee/state still references it. Surfaces

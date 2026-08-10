@@ -507,6 +507,33 @@ func SessionDrainAckedWithAssignedWorkPayloadJSON(sessionID, beadID, template, b
 	return b
 }
 
+// SessionWispRetiredPayload carries the machine-readable context for a
+// session.wisp_retired event: an ephemeral session bead closed outright by
+// the closed-trigger wisp-retire sweep (ga-luwtw4) because the bead that
+// triggered its creation is closed and it held no other open/in-progress
+// assigned work anywhere. This is the durable audit trail for a
+// non-recoverable action — unlike a sleep, there is no wake-on-demand path
+// back from this event.
+type SessionWispRetiredPayload struct {
+	SessionID     string `json:"session_id" doc:"Canonical session bead ID that was closed."`
+	TriggerBeadID string `json:"trigger_bead_id" doc:"ID of the (closed) bead that triggered this session's creation."`
+	Template      string `json:"template,omitempty" doc:"Pool template name when known at the emission site."`
+}
+
+// IsEventPayload marks SessionWispRetiredPayload as an events.Payload variant.
+func (SessionWispRetiredPayload) IsEventPayload() {}
+
+// SessionWispRetiredPayloadJSON builds the JSON wire form for attachment to
+// an events.Event.Payload field. Template is emitted only when non-empty.
+func SessionWispRetiredPayloadJSON(sessionID, triggerBeadID, template string) json.RawMessage {
+	b, _ := json.Marshal(SessionWispRetiredPayload{
+		SessionID:     sessionID,
+		TriggerBeadID: triggerBeadID,
+		Template:      template,
+	})
+	return b
+}
+
 // SessionStrandedPayload carries the machine-readable context for a
 // session.stranded event: a pool session whose runtime exited while open or
 // in-progress work beads still held it as assignee. The envelope Message
