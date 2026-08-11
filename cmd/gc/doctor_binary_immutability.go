@@ -23,14 +23,22 @@ import (
 // For each conventional gc install path present on this host, this check
 // verifies both enforcement prongs from ai/fleet/bin/lib/gc-safe-swap.sh are
 // armed — they cover different syscalls, neither alone is sufficient (see
-// ga-y275uo comment thread for the full syscall matrix):
+// ga-y275uo comment thread for the full empirical syscall matrix, kieran
+// validation 2026-08-11 02:50):
 //
 //   - prong 1: the symlink-resolved real binary file is immutable, blocking
 //     write-through (e.g. `cp <new> <live-name>` follows the symlink and
 //     writes the target).
-//   - prong 2: the PATH-visible name itself is immutable, blocking
-//     rename-over-name (e.g. `go build -o <live-name>` or `mv` replaces the
-//     symlink; this was the observed vector in the 08-10 recurrence).
+//   - prong 2: the PATH-visible name itself is immutable, blocking a pure
+//     rename-over-name (`mv` / `ln -sf`, neither of which follows an
+//     existing symlink at the destination).
+//
+// `go build -o <live-name>` — the observed 08-10 vector — is neither
+// purely: it attempts a fast rename first (stopped by prong 2 alone, like
+// mv) but on failure falls back to opening the destination and writing
+// through it (stopped only by prong 1). Prong 2 alone does NOT stop it.
+// Both prongs must be armed together, which is why gc_safe_swap_install
+// never arms just one.
 //
 // It also checks a gc.provenance.json sibling exists and matches this
 // process's own running commit — an untracked install (the actual root
@@ -50,6 +58,14 @@ type binaryImmutabilityCheck struct {
 	// runningCommit returns this process's own build commit. Overridable
 	// for tests.
 	runningCommit func() string
+	// selfPath returns the currently-running executable's own path, or ""
+	// if unknown. Overridable for tests; nil disables the exemption below
+	// (used by every existing test that doesn't care about it). Production
+	// use is selfOnlyTarget: a target that IS the running executable but is
+	// NOT one of the conventional install paths is, by construction,
+	// currently executing rather than installed, so it is exempt from the
+	// provenance-record requirement (see Run and defaultGCBinaryTargets).
+	selfPath func() string
 
 	// unprotected records targets found missing a flag this Run, so Fix can
 	// re-arm exactly those. Reset at the start of each Run — the doctor
@@ -68,18 +84,39 @@ func newBinaryImmutabilityCheck() *binaryImmutabilityCheck {
 	return &binaryImmutabilityCheck{
 		targets:       defaultGCBinaryTargets,
 		runningCommit: func() string { return commit },
+		selfPath:      func() string { p, _ := os.Executable(); return p },
 	}
+}
+
+// selfOnlyTarget reports whether target is the currently-running
+// executable's own path but NOT one of the fixed, well-known install
+// locations conventionalGCBinaryPaths returns. Such a target is, by
+// construction, running rather than installed — e.g. an ad hoc `go build`
+// a developer ran directly to test something, never intended as an install.
+// Requiring a provenance.json next to it would be a guaranteed, permanent
+// false alarm ("untracked install" on something that was never an install)
+// for exactly the audience most likely to run `gc doctor` often — kieran's
+// ga-y275uo validation finding, 2026-08-11 02:50. A target matching one of
+// the conventional paths is never exempt, self-path or not: checking your
+// actual live install's provenance is the check's whole point.
+func (c *binaryImmutabilityCheck) selfOnlyTarget(target string) bool {
+	if c.selfPath == nil {
+		return false
+	}
+	self := c.selfPath()
+	return self != "" && target == self && !containsString(conventionalGCBinaryPaths(), target)
 }
 
 func (c *binaryImmutabilityCheck) Name() string         { return "binary-immutability" }
 func (c *binaryImmutabilityCheck) WarmupEligible() bool { return false }
 
-// defaultGCBinaryTargets returns the conventional PATH-visible gc binary
-// locations on this host, plus the currently-running executable's own path
-// if not already covered, deduplicated to paths that actually exist. A
-// missing conventional path is not itself a gap (a fresh/partial install is
-// not this check's concern) — only an existing, unprotected one is.
-func defaultGCBinaryTargets() []string {
+// conventionalGCBinaryPaths returns the fixed, well-known PATH-visible gc
+// binary locations this fleet's install scripts target — independent of
+// whether they exist on this host or match the running executable. Used
+// both by defaultGCBinaryTargets (to build the checked list) and by
+// selfOnlyTarget (to tell "the real install" apart from "a self-build
+// running from a nonstandard path").
+func conventionalGCBinaryPaths() []string {
 	home, _ := os.UserHomeDir()
 	candidates := []string{"/opt/homebrew/bin/gc"}
 	if home != "" {
@@ -88,6 +125,20 @@ func defaultGCBinaryTargets() []string {
 			filepath.Join(home, ".local", "bin", "gc"),
 		)
 	}
+	return candidates
+}
+
+// defaultGCBinaryTargets returns conventionalGCBinaryPaths() plus the
+// currently-running executable's own path if not already covered,
+// deduplicated to paths that actually exist. A missing conventional path is
+// not itself a gap (a fresh/partial install is not this check's concern) —
+// only an existing, unprotected one is. The extra self-executable entry
+// (when distinct from the conventional paths) is still checked for
+// immutability — worth knowing if the binary actually running right now is
+// unprotected — but Run exempts it from the provenance-record requirement
+// via selfOnlyTarget: it was never an install, so it will never have one.
+func defaultGCBinaryTargets() []string {
+	candidates := conventionalGCBinaryPaths()
 	if exe, err := os.Executable(); err == nil && exe != "" {
 		candidates = append(candidates, exe)
 	}
@@ -184,14 +235,16 @@ func (c *binaryImmutabilityCheck) Run(_ *doctor.CheckContext) *doctor.CheckResul
 			details = append(details, fmt.Sprintf("%s: missing %s — writable in place (ga-y275uo)", target, strings.Join(missing, ", ")))
 		}
 
-		provCommit, provOK := readProvenanceCommit(provenancePathFor(target))
-		switch {
-		case !provOK:
-			issues++
-			details = append(details, fmt.Sprintf("%s: no provenance record (%s) — untracked install", target, provenancePathFor(target)))
-		case runningCommit != "" && runningCommit != "unknown" && provCommit != runningCommit:
-			issues++
-			details = append(details, fmt.Sprintf("%s: provenance build_commit=%s does not match running commit=%s", target, provCommit, runningCommit))
+		if !c.selfOnlyTarget(target) {
+			provCommit, provOK := readProvenanceCommit(provenancePathFor(target))
+			switch {
+			case !provOK:
+				issues++
+				details = append(details, fmt.Sprintf("%s: no provenance record (%s) — untracked install", target, provenancePathFor(target)))
+			case runningCommit != "" && runningCommit != "unknown" && provCommit != runningCommit:
+				issues++
+				details = append(details, fmt.Sprintf("%s: provenance build_commit=%s does not match running commit=%s", target, provCommit, runningCommit))
+			}
 		}
 	}
 

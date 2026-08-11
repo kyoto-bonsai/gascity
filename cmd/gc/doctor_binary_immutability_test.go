@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -181,6 +182,48 @@ func TestBinaryImmutabilityCheck_ProvenanceCommitMismatch_Warns(t *testing.T) {
 	}
 }
 
+// TestBinaryImmutabilityCheck_SelfOnlyTargetExemptFromProvenance covers the
+// ga-y275uo kieran validation finding (2026-08-11 02:50): a target that IS
+// the running executable but is NOT a conventional install path (an ad hoc
+// dev build, not an install) must not warn for a missing provenance record
+// — it was never installed, so it will never have one, and a permanent
+// guaranteed warning here is exactly the alert-fatigue risk kieran flagged.
+func TestBinaryImmutabilityCheck_SelfOnlyTargetExemptFromProvenance(t *testing.T) {
+	skipIfImmutabilityUnsupported(t)
+	dir := t.TempDir()
+	target := setupProtectedTarget(t, dir)
+	// Deliberately no provenance file written — the ad hoc dev build case.
+
+	c := &binaryImmutabilityCheck{
+		targets:       func() []string { return []string{target} },
+		runningCommit: func() string { return "abc123" },
+		selfPath:      func() string { return target },
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusOK {
+		t.Fatalf("status = %v, want StatusOK — a self-only target must not warn for a missing provenance record, details=%v", r.Status, r.Details)
+	}
+}
+
+// TestBinaryImmutabilityCheck_SelfPathNilStillWarnsForMissingProvenance
+// guards the other direction: with selfPath unset (nil, the zero value
+// every production-unrelated construction gets unless it opts in), the
+// exemption must never fire — every existing test above relies on this.
+func TestBinaryImmutabilityCheck_SelfPathNilStillWarnsForMissingProvenance(t *testing.T) {
+	skipIfImmutabilityUnsupported(t)
+	dir := t.TempDir()
+	target := setupProtectedTarget(t, dir)
+
+	c := newFixedCheck([]string{target}, "abc123")
+	if c.selfPath != nil {
+		t.Fatalf("newFixedCheck must leave selfPath nil (no test above sets it)")
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want StatusWarning — selfPath=nil must never exempt a target, details=%v", r.Status, r.Details)
+	}
+}
+
 func TestReadProvenanceCommit(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "gc.provenance.json")
@@ -213,6 +256,63 @@ func TestProvenancePathFor(t *testing.T) {
 	}
 }
 
+func TestConventionalGCBinaryPaths(t *testing.T) {
+	got := conventionalGCBinaryPaths()
+	if len(got) == 0 {
+		t.Fatalf("conventionalGCBinaryPaths() returned empty, want at least /opt/homebrew/bin/gc")
+	}
+	if got[0] != "/opt/homebrew/bin/gc" {
+		t.Fatalf("conventionalGCBinaryPaths()[0] = %q, want /opt/homebrew/bin/gc", got[0])
+	}
+	if home, _ := os.UserHomeDir(); home != "" {
+		want := []string{
+			"/opt/homebrew/bin/gc",
+			filepath.Join(home, "go", "bin", "gc"),
+			filepath.Join(home, ".local", "bin", "gc"),
+		}
+		if len(got) != len(want) {
+			t.Fatalf("conventionalGCBinaryPaths() = %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("conventionalGCBinaryPaths()[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestDefaultGCBinaryTargets_IncludesExistingSelfDedupedAndSorted directly
+// exercises defaultGCBinaryTargets (previously zero test coverage — every
+// other test goes through newFixedCheck's overridden targets func instead,
+// per kieran's ga-y275uo validation, 2026-08-11 02:50). Only asserts
+// invariants that hold regardless of which conventional paths happen to
+// exist on the machine running this test.
+func TestDefaultGCBinaryTargets_IncludesExistingSelfDedupedAndSorted(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	got := defaultGCBinaryTargets()
+
+	if !containsString(got, self) {
+		t.Fatalf("defaultGCBinaryTargets() = %v, want it to include the running test binary %q", got, self)
+	}
+	if !sort.StringsAreSorted(got) {
+		t.Fatalf("defaultGCBinaryTargets() = %v, want sorted", got)
+	}
+	seen := make(map[string]bool, len(got))
+	for _, p := range got {
+		if seen[p] {
+			t.Fatalf("defaultGCBinaryTargets() returned duplicate %q: %v", p, got)
+		}
+		seen[p] = true
+		if _, err := os.Lstat(p); err != nil {
+			t.Fatalf("defaultGCBinaryTargets() returned non-existent path %q: %v", p, err)
+		}
+	}
+}
+
 // -- test helpers --
 
 func writeProvenanceForTest(t *testing.T, target, buildCommit string) {
@@ -223,11 +323,4 @@ func writeProvenanceForTest(t *testing.T, target, buildCommit string) {
 	}
 }
 
-func containsSubstring(details []string, substr string) bool {
-	for _, d := range details {
-		if strings.Contains(d, substr) {
-			return true
-		}
-	}
-	return false
-}
+// containsSubstring is defined in split_topology_conformance_test.go (same package).

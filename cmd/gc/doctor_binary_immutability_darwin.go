@@ -28,8 +28,12 @@ func realBinaryIsImmutable(target string) (bool, error) {
 
 // nameIsImmutable reports whether target itself — not resolved; the
 // PATH-visible name, which is ordinarily a symlink — carries UF_IMMUTABLE
-// (prong 2 — blocks rename-over-name, e.g. `go build -o target` / `mv` /
-// `ln -sf`, none of which follow an existing symlink at the destination).
+// (prong 2 — blocks a pure rename-over-name: `mv` / `ln -sf`, neither of
+// which follows an existing symlink at the destination. `go build -o`
+// attempts the same fast rename first, but on failure falls back to a
+// write-through path this prong does not cover — see prong 1 and the
+// package doc comment in doctor_binary_immutability.go for the full
+// go-build-o mapping, empirically verified in the ga-y275uo thread).
 func nameIsImmutable(target string) (bool, error) {
 	var st unix.Stat_t
 	if err := unix.Lstat(target, &st); err != nil {
