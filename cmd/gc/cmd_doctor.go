@@ -340,6 +340,12 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// (gc -> bd.real -> dolt) that operators routinely misread as CPU saturation.
 	// Advisory + read-only (/proc/stat); no config needed.
 	register(newForkRateCheck())
+	// Host-level binary-immutability watch (ga-y275uo): catches an
+	// unenforced live gc binary (missing chflags uchg on the real file
+	// and/or the PATH-visible symlink name) or a stale/missing provenance
+	// record BEFORE it next crashes the supervisor via an in-place
+	// overwrite. Advisory; `gc doctor --fix` re-arms a cleared flag.
+	register(newBinaryImmutabilityCheck())
 	// Managed Dolt ops checks (PR 3). Size + config drift are only
 	// meaningful when the workspace uses the managed bd/Dolt backend; rigs
 	// can inherit the city-managed server even when the city itself is not a
