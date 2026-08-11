@@ -8,11 +8,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
+
+// defaultDoltBackupArtifactMaxAge is how stale the newest entry in a scope's
+// .dolt-backup/<db>/ directory may be before DoltBackupCheck downgrades an
+// otherwise-present backup from OK to a staleness warning. mol-dog-backup
+// syncs on a ~6h cadence; 24h gives ~4x slack for a missed cycle or two
+// before treating the mechanism as stopped rather than merely late (see
+// ga-0avnxn: hq's backup artifact dir sat 12.5 days stale while every other
+// rig kept syncing, invisible to this check's prior existence-only signal).
+const defaultDoltBackupArtifactMaxAge = 24 * time.Hour
 
 // DoltBackupCheck verifies that a rig's Dolt database has a backup remote
 // configured. `gc rig add` provisions the rig but does not register a
@@ -42,6 +52,19 @@ type DoltBackupCheck struct {
 	cityPath    string
 	rig         config.Rig
 	doltDataDir string
+
+	// scopeLabel, when non-empty, overrides the "rig:<name>" prefix in Name()
+	// with "<scopeLabel>:dolt-backup". Used for scopes that back this check
+	// with a synthetic config.Rig rather than a real one — see
+	// NewCityDoltBackupCheck.
+	scopeLabel string
+	// artifactMaxAge bounds how stale the newest .dolt-backup/<db>/ entry may
+	// be before a present-and-nonempty backup dir is downgraded from OK to a
+	// staleness warning. Zero means defaultDoltBackupArtifactMaxAge.
+	artifactMaxAge time.Duration
+	// now is the injectable clock for freshness comparisons; defaults to
+	// time.Now. Tests override it for deterministic staleness fixtures.
+	now func() time.Time
 }
 
 // NewDoltBackupCheck creates a per-rig dolt-backup registration check.
@@ -49,11 +72,37 @@ func NewDoltBackupCheck(cityPath string, rig config.Rig, doltDataDir string) *Do
 	if strings.TrimSpace(doltDataDir) == "" {
 		doltDataDir = filepath.Join(cityPath, ".beads", "dolt")
 	}
-	return &DoltBackupCheck{cityPath: cityPath, rig: rig, doltDataDir: doltDataDir}
+	return &DoltBackupCheck{
+		cityPath:       cityPath,
+		rig:            rig,
+		doltDataDir:    doltDataDir,
+		artifactMaxAge: defaultDoltBackupArtifactMaxAge,
+		now:            time.Now,
+	}
 }
 
-// Name returns the check identifier ("rig:<name>:dolt-backup").
+// NewCityDoltBackupCheck creates a dolt-backup artifact check for the city's
+// own store (hq). The per-rig registration loop in cmd_doctor.go iterates
+// cfg.Rigs, which never includes the city itself, so hq previously had no
+// dolt-backup artifact check at all — not even the existence-only signal
+// every configured rig gets. hq is modeled as a synthetic rig rooted at
+// cityPath so the existing resolution logic (metadata.json dolt_database
+// lookup, external-endpoint detection, the backup-dir and repo_state.json
+// signals) applies unchanged; only Name() differs, via scopeLabel, so the
+// check reads "city:dolt-backup" rather than the misleading
+// "rig:hq:dolt-backup".
+func NewCityDoltBackupCheck(cityPath, doltDataDir string) *DoltBackupCheck {
+	c := NewDoltBackupCheck(cityPath, config.Rig{Name: "hq", Path: cityPath}, doltDataDir)
+	c.scopeLabel = "city"
+	return c
+}
+
+// Name returns the check identifier ("rig:<name>:dolt-backup", or
+// "<scopeLabel>:dolt-backup" for non-rig scopes — see scopeLabel).
 func (c *DoltBackupCheck) Name() string {
+	if c.scopeLabel != "" {
+		return c.scopeLabel + ":dolt-backup"
+	}
 	return "rig:" + c.rig.Name + ":dolt-backup"
 }
 
@@ -88,9 +137,7 @@ func (c *DoltBackupCheck) Run(_ *CheckContext) *CheckResult {
 	case err != nil:
 		r.Details = append(r.Details, fmt.Sprintf("read backup dir: %v", err))
 	case backupDirHasContent:
-		r.Status = StatusOK
-		r.Message = fmt.Sprintf("backup artifact dir present (assumed previously synced): %s", backupDir)
-		return r
+		return c.freshnessResult(r, backupDir, dbName)
 	}
 
 	// Signal 2: backup remote is registered in repo_state.json.
@@ -111,6 +158,89 @@ func (c *DoltBackupCheck) Run(_ *CheckContext) *CheckResult {
 	r.Message = fmt.Sprintf("rig %q: no dolt backup registered (expected %s)", c.rig.Name, backupDir)
 	r.FixHint = doltBackupFixHint(dbName, backupDir)
 	return r
+}
+
+// freshnessResult finalizes r for a backup directory already confirmed to
+// have contents (dirHasEntries): OK when the newest entry is within
+// artifactMaxAge, a staleness warning otherwise. This is the recency check
+// the directory-existence signal alone cannot provide — a scope whose sync
+// mechanism stopped days ago still has a nonempty, "previously synced"
+// directory, which is exactly how hq's 12.5-day-stale backup hid behind this
+// check before ga-0avnxn (existence, not recency, was all this check knew).
+//
+// A directory whose newest-entry mtime can't be determined (e.g. a stat
+// error on an already-listed entry) falls back to the pre-existing
+// "assumed previously synced" OK behavior rather than failing the check on
+// an incidental read error — staying fail-open here matches how the
+// repo_state.json read-error path below already behaves.
+func (c *DoltBackupCheck) freshnessResult(r *CheckResult, backupDir, dbName string) *CheckResult {
+	newest, err := newestEntryModTime(backupDir)
+	if err != nil {
+		r.Details = append(r.Details, fmt.Sprintf("stat newest backup entry: %v", err))
+		r.Status = StatusOK
+		r.Message = fmt.Sprintf("backup artifact dir present (assumed previously synced): %s", backupDir)
+		return r
+	}
+
+	now := c.now
+	if now == nil {
+		now = time.Now
+	}
+	maxAge := c.artifactMaxAge
+	if maxAge <= 0 {
+		maxAge = defaultDoltBackupArtifactMaxAge
+	}
+	age := now().Sub(newest)
+
+	if age <= maxAge {
+		r.Status = StatusOK
+		r.Message = fmt.Sprintf("backup artifact dir present and fresh (newest entry %s old): %s", age.Round(time.Minute), backupDir)
+		return r
+	}
+
+	r.Status = StatusWarning
+	r.Severity = SeverityAdvisory
+	r.Message = fmt.Sprintf("%q: backup artifact dir present but STALE — newest entry %s old (> %s): %s",
+		c.rig.Name, age.Round(time.Minute), maxAge, backupDir)
+	r.FixHint = fmt.Sprintf(
+		"the sync mechanism (e.g. mol-dog-backup) may have stopped for this scope specifically — check "+
+			"`gc order check` / `gc order history mol-dog-backup`, then confirm a manual sync lands a fresh "+
+			"file:\n%s",
+		doltBackupFixHint(dbName, backupDir),
+	)
+	return r
+}
+
+// newestEntryModTime returns the most recent modification time among dir's
+// direct (non-recursive) entries. A shallow scan is sufficient here because
+// the sync mechanism this check observes (mol-dog-backup) creates or touches
+// a new top-level entry in .dolt-backup/<db>/ on every run — matching
+// dirHasEntries' own shallow-scan precedent one signal up. Callers should
+// have already confirmed the directory is non-empty (dirHasEntries); an
+// empty or unreadable directory returns an error.
+func newestEntryModTime(dir string) (time.Time, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var newest time.Time
+	found := false
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			// Racing against a concurrent sync (e.g. a file renamed away
+			// mid-listing) — skip rather than fail the whole scan.
+			continue
+		}
+		if !found || info.ModTime().After(newest) {
+			newest = info.ModTime()
+			found = true
+		}
+	}
+	if !found {
+		return time.Time{}, fmt.Errorf("no readable entries in %s", dir)
+	}
+	return newest, nil
 }
 
 // CanFix returns false. Registering a backup destination is operator

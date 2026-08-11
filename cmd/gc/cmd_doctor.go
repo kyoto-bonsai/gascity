@@ -364,6 +364,16 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// looks healthy to every other backup check while its recovery point ages
 	// out — the only surviving backup can be weeks stale before anyone notices.
 	register(doctor.NewBdBackupFreshnessCheckForConfig(cityPath, cfg, cfgErr))
+	// City-scope dolt-backup artifact check (ga-0avnxn): the per-rig loop
+	// below runs DoltBackupCheck for every configured rig, but cfg.Rigs never
+	// includes the city's own hq store, so hq had no dolt-backup artifact
+	// coverage at all — not even the existence-only signal every rig gets.
+	// Registered here, unconditionally like its city-dolt-server sibling
+	// above, rather than inside the per-rig loop, since hq is not a
+	// config.Rig entry.
+	if !opts.SkipCityDoltCheck {
+		register(doctor.NewCityDoltBackupCheck(cityPath, managedDoltDataDir))
+	}
 	// Worktree checks deliberately run even when cfgErr != nil — they
 	// only need the city path, and a broken city.toml is exactly when
 	// silent disk-fill is most likely. The zero-value DoctorConfig

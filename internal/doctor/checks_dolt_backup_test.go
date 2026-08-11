@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
 )
@@ -289,5 +290,152 @@ func TestDoltBackupCheck_ExternalEndpoint_NoWarn(t *testing.T) {
 	}
 	if r.FixHint != "" {
 		t.Errorf("external endpoint must not emit a localhost fix hint: %s", r.FixHint)
+	}
+}
+
+// Regression coverage for ga-0avnxn: a backup directory that exists but has
+// stopped receiving fresh syncs previously read as StatusOK forever — the
+// check only ever asked "any entries?", never "how old is the newest one?".
+func TestDoltBackupCheck_StaleBackupDir_Warns(t *testing.T) {
+	cityPath := t.TempDir()
+	doltDataDir := filepath.Join(cityPath, ".beads", "dolt")
+	rigPath := filepath.Join(cityPath, "rig")
+	if err := os.MkdirAll(rigPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeRigMetadata(t, rigPath, "testdb")
+	backupDir := filepath.Join(cityPath, ".dolt-backup", "testdb")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldFile := filepath.Join(backupDir, "old-sync.marker")
+	if err := os.WriteFile(oldFile, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(oldFile, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	rig := config.Rig{Name: "testrig", Path: rigPath}
+	c := NewDoltBackupCheck(cityPath, rig, doltDataDir)
+	r := c.Run(&CheckContext{CityPath: cityPath})
+
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want StatusWarning (stale backup dir); message=%s", r.Status, r.Message)
+	}
+	if r.Severity != SeverityAdvisory {
+		t.Errorf("Severity = %v, want SeverityAdvisory", r.Severity)
+	}
+	if !strings.Contains(r.Message, "STALE") {
+		t.Errorf("Message should flag staleness: %s", r.Message)
+	}
+	if !strings.Contains(r.Message, "testrig") {
+		t.Errorf("Message should name the scope %q: %s", "testrig", r.Message)
+	}
+	if !strings.Contains(r.FixHint, "mol-dog-backup") {
+		t.Errorf("FixHint should point at the sync mechanism: %s", r.FixHint)
+	}
+}
+
+func TestDoltBackupCheck_FreshBackupDir_OKWithFreshMessage(t *testing.T) {
+	cityPath := t.TempDir()
+	doltDataDir := filepath.Join(cityPath, ".beads", "dolt")
+	rigPath := filepath.Join(cityPath, "rig")
+	if err := os.MkdirAll(rigPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeRigMetadata(t, rigPath, "testdb")
+	backupDir := filepath.Join(cityPath, ".dolt-backup", "testdb")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "fresh-sync.marker"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rig := config.Rig{Name: "testrig", Path: rigPath}
+	c := NewDoltBackupCheck(cityPath, rig, doltDataDir)
+	r := c.Run(&CheckContext{CityPath: cityPath})
+
+	if r.Status != StatusOK {
+		t.Fatalf("status = %d, want StatusOK (fresh backup dir); message=%s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "fresh") {
+		t.Errorf("Message should say fresh rather than the old unconditional 'assumed previously synced': %s", r.Message)
+	}
+}
+
+func TestDoltBackupCheck_ArtifactMaxAgeCustom(t *testing.T) {
+	// Exercise the injectable clock + a custom max age directly, so the
+	// boundary is exact instead of racing the real test-run clock.
+	cityPath := t.TempDir()
+	doltDataDir := filepath.Join(cityPath, ".beads", "dolt")
+	rigPath := filepath.Join(cityPath, "rig")
+	if err := os.MkdirAll(rigPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeRigMetadata(t, rigPath, "testdb")
+	backupDir := filepath.Join(cityPath, ".dolt-backup", "testdb")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entry := filepath.Join(backupDir, "sync.marker")
+	if err := os.WriteFile(entry, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	written := time.Now()
+	if err := os.Chtimes(entry, written, written); err != nil {
+		t.Fatal(err)
+	}
+
+	rig := config.Rig{Name: "testrig", Path: rigPath}
+	c := NewDoltBackupCheck(cityPath, rig, doltDataDir)
+	c.artifactMaxAge = time.Hour
+	c.now = func() time.Time { return written.Add(2 * time.Hour) }
+
+	if r := c.Run(&CheckContext{CityPath: cityPath}); r.Status != StatusWarning {
+		t.Fatalf("status = %d, want StatusWarning (2h old > 1h max); message=%s", r.Status, r.Message)
+	}
+
+	c.now = func() time.Time { return written.Add(30 * time.Minute) }
+	if r := c.Run(&CheckContext{CityPath: cityPath}); r.Status != StatusOK {
+		t.Fatalf("status = %d, want StatusOK (30m old <= 1h max); message=%s", r.Status, r.Message)
+	}
+}
+
+// Regression coverage for ga-0avnxn: hq (the city's own store) previously had
+// no dolt-backup check of any kind, because the per-rig registration loop in
+// cmd_doctor.go only ever iterates cfg.Rigs.
+func TestNewCityDoltBackupCheck_Name(t *testing.T) {
+	cityPath := t.TempDir()
+	c := NewCityDoltBackupCheck(cityPath, filepath.Join(cityPath, ".beads", "dolt"))
+	if got, want := c.Name(), "city:dolt-backup"; got != want {
+		t.Errorf("Name() = %q, want %q", got, want)
+	}
+}
+
+func TestNewCityDoltBackupCheck_UsesCityPathAsScopeRoot(t *testing.T) {
+	// hq's own metadata.json lives at the city root, not under a rig
+	// subdirectory — confirm the synthetic-rig resolution reads it from there
+	// and reports under the "city:dolt-backup" identifier, not "rig:hq:...".
+	cityPath := t.TempDir()
+	doltDataDir := filepath.Join(cityPath, ".beads", "dolt")
+	writeRigMetadata(t, cityPath, "hq")
+	backupDir := filepath.Join(cityPath, ".dolt-backup", "hq")
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "sync.marker"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewCityDoltBackupCheck(cityPath, doltDataDir)
+	r := c.Run(&CheckContext{CityPath: cityPath})
+	if r.Status != StatusOK {
+		t.Fatalf("status = %d, want StatusOK; message=%s", r.Status, r.Message)
+	}
+	if r.Name != "city:dolt-backup" {
+		t.Errorf("Result Name = %q, want %q", r.Name, "city:dolt-backup")
 	}
 }
