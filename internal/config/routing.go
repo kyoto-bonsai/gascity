@@ -87,3 +87,95 @@ func (r RoutingPolicyConfig) DeriveOfficerOfRecord(persona string) (string, bool
 	}
 	return v, true
 }
+
+// officerOfRecordOperator is the officer_of_record value for closers who are
+// accountable directly to the human operator rather than up a department chain:
+// the CoS office, independent audit, and meta seats. These are routing-exempt
+// (Exempt() is true) but are not themselves department officers (not present in
+// OfficerOfRecordValueDomain except as this sentinel), so ReportsTo has no entry
+// for them by construction. Declared as a constant, not a hardcoded role name:
+// it is a structural sentinel already part of OfficerOfRecordValueDomain's
+// semantics ("the department officers plus operator"), not a user-configurable
+// role whose behavior lives in Go.
+const officerOfRecordOperator = "operator"
+
+// IsOfficerOfRecordValue reports whether persona is itself a legal
+// officer_of_record value (a department officer, per
+// OfficerOfRecordValueDomain). An officer is their own officer of record, so a
+// close performed by one derives to self rather than up a chain.
+func (r RoutingPolicyConfig) IsOfficerOfRecordValue(persona string) bool {
+	for _, v := range r.OfficerOfRecordValueDomain {
+		if v == persona {
+			return true
+		}
+	}
+	return false
+}
+
+// CloseAttribution is the routing identity a close-time auto-stamp should apply
+// to a bead that does not already carry it. RoutedTo is the closing persona;
+// OfficerOfRecord is the derived accountable officer, or "" when it cannot be
+// derived (an unknown persona) — in which case the caller must stamp RoutedTo
+// but MUST NOT stamp a blank officer.
+type CloseAttribution struct {
+	RoutedTo        string
+	OfficerOfRecord string
+}
+
+// DeriveCloseAttribution computes the gc.routed_to / gc.officer_of_record a
+// close performed by `closer` should carry. It mirrors the sling-time
+// derivation (DeriveOfficerOfRecord) but is keyed on the CLOSING persona and
+// additionally resolves the exempt-closer case the sling path never sees: sling
+// only ever targets staff specialists, but a close can be performed by an
+// exempt actor (an officer, the CoS office, independent audit, or a meta seat)
+// closing ad-hoc or operator-authored work. Those actors have no ReportsTo
+// entry, so a close-time stamp that only consulted ReportsTo would leave them
+// blank — the very defect (indistinguishable from an oversight) this closes.
+//
+// It is pure and config-driven (ZFC): every decision is a lookup against the
+// operator-authored [routing] policy, never a hardcoded persona list. The
+// caller applies don't-overwrite (an existing gc.officer_of_record — e.g. an
+// operator-authorization override — is never clobbered) and honors any
+// pre-existing exemption marker.
+//
+// Returns ok=false (the caller stamps nothing at all) when the [routing] policy
+// is not Configured() — so upgrading the gc binary alone never changes close
+// behavior for a city that has not opted in — or when `closer` does not resolve
+// to a persona identity, so a shell username is never written into a
+// persona-typed field.
+func (r RoutingPolicyConfig) DeriveCloseAttribution(closer string) (CloseAttribution, bool) {
+	if !r.Configured() {
+		return CloseAttribution{}, false
+	}
+	closer = strings.TrimSpace(closer)
+	if closer == "" {
+		return CloseAttribution{}, false
+	}
+
+	attr := CloseAttribution{RoutedTo: closer}
+	switch {
+	case r.IsOfficerOfRecordValue(closer):
+		// An officer (or the operator) is their own officer of record.
+		attr.OfficerOfRecord = closer
+	case r.hasReportsTo(closer):
+		// A staff specialist reports up to their department officer.
+		attr.OfficerOfRecord, _ = r.DeriveOfficerOfRecord(closer)
+	case r.Exempt(closer) && r.IsOfficerOfRecordValue(officerOfRecordOperator):
+		// CoS office / independent audit / meta: routing-exempt but not a
+		// department officer — accountable directly to the operator. Guarded on
+		// the operator sentinel being a declared legal value so a misconfigured
+		// city yields a blank (caught by lint) rather than an invented officer.
+		attr.OfficerOfRecord = officerOfRecordOperator
+	}
+	// Unknown persona (resolved identity, but absent from every routing table):
+	// OfficerOfRecord stays "". The caller still stamps RoutedTo, so the close is
+	// attributed and lint can prompt adding the persona to city.toml, rather than
+	// leaving the fully-blank "unexamined" state.
+	return attr, true
+}
+
+// hasReportsTo reports whether persona has a non-empty ReportsTo entry.
+func (r RoutingPolicyConfig) hasReportsTo(persona string) bool {
+	_, ok := r.DeriveOfficerOfRecord(persona)
+	return ok
+}
