@@ -1563,8 +1563,9 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". If the recipient is a
-currently-live session, it is nudged automatically -- no flag required.
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". The recipient is
+notified automatically on send -- a live session is nudged, a non-running
+one gets a managed wake request -- no flag required. Unread mail alone does not request a wake.
 Use --from to override the sender identity. Use --to as an alternative to
 the positional <to> argument. Use -s/--subject for the summary line and
 -m/--message for the body text. Use --body-file to read the body from a file
@@ -1614,7 +1615,7 @@ additional effect.`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&notify, "notify", false, "no-op, kept for backward compatibility -- live recipients are nudged automatically")
+	cmd.Flags().BoolVar(&notify, "notify", false, "kept for backward compatibility -- notification (including a managed wake for a non-running recipient) happens automatically regardless of this flag")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
 	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
@@ -1722,10 +1723,11 @@ func newMailReplyCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Reply to a message. The reply is addressed to the original sender.
 
 Inherits the thread ID from the original message for conversation tracking.
-If the recipient is a currently-live session, it is nudged automatically --
-no flag required. Use -s/--subject for the reply subject and -m/--message
-for the reply body. --notify/--nudge are accepted for backward compatibility
-and have no additional effect.`,
+The recipient is notified automatically on reply -- a live session is
+nudged, a non-running one gets a managed wake request -- no flag required.
+Unread mail alone does not request a wake. Use -s/--subject for the reply
+subject and -m/--message for the reply body. --notify/--nudge are accepted
+for backward compatibility and have no additional effect.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0
@@ -1742,7 +1744,7 @@ and have no additional effect.`,
 	}
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "reply subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "reply body text")
-	cmd.Flags().BoolVar(&notify, "notify", false, "no-op, kept for backward compatibility -- live recipients are nudged automatically")
+	cmd.Flags().BoolVar(&notify, "notify", false, "kept for backward compatibility -- notification (including a managed wake for a non-running recipient) happens automatically regardless of this flag")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
 	_ = cmd.Flags().MarkHidden("nudge")

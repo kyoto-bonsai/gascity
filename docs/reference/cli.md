@@ -2531,10 +2531,11 @@ gc mail read <id> [flags]
 Reply to a message. The reply is addressed to the original sender.
 
 Inherits the thread ID from the original message for conversation tracking.
-If the recipient is a currently-live session, it is nudged automatically --
-no flag required. Use -s/--subject for the reply subject and -m/--message
-for the reply body. --notify/--nudge are accepted for backward compatibility
-and have no additional effect.
+The recipient is notified automatically on reply -- a live session is
+nudged, a non-running one gets a managed wake request -- no flag required.
+Unread mail alone does not request a wake. Use -s/--subject for the reply
+subject and -m/--message for the reply body. --notify/--nudge are accepted
+for backward compatibility and have no additional effect.
 
 ```
 gc mail reply <id> [-s subject] [-m body] [flags]
@@ -2544,7 +2545,7 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | reply body text |
-| `--notify` | bool |  | no-op, kept for backward compatibility -- live recipients are nudged automatically |
+| `--notify` | bool |  | kept for backward compatibility -- notification (including a managed wake for a non-running recipient) happens automatically regardless of this flag |
 | `-s`, `--subject` | string |  | reply subject line |
 
 ## gc mail send
@@ -2552,8 +2553,9 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". If the recipient is a
-currently-live session, it is nudged automatically -- no flag required.
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". The recipient is
+notified automatically on send -- a live session is nudged, a non-running
+one gets a managed wake request -- no flag required. Unread mail alone does not request a wake.
 Use --from to override the sender identity. Use --to as an alternative to
 the positional &lt;to&gt; argument. Use -s/--subject for the summary line and
 -m/--message for the body text. Use --body-file to read the body from a file
@@ -2589,7 +2591,7 @@ gc mail send --all "Status update: tests passing"
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
-| `--notify` | bool |  | no-op, kept for backward compatibility -- live recipients are nudged automatically |
+| `--notify` | bool |  | kept for backward compatibility -- notification (including a managed wake for a non-running recipient) happens automatically regardless of this flag |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
