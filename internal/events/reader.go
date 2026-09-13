@@ -654,6 +654,18 @@ func ReadFilteredTail(ctx context.Context, path string, filter Filter, limit int
 	return combined, nil
 }
 
+// ReadActiveTail reads up to limit trailing matching events from the active
+// file at path only, NEVER extending into sibling .gz archives — the strict
+// counterpart to ReadFilteredTail for a caller whose own "recent activity"
+// contract requires knowing precisely when the active log alone did not
+// cover the request (so it can say so), rather than having the read
+// transparently backfill from history. Returns fewer than limit events
+// (including zero) when the active file itself holds fewer, rather than
+// reaching into archives to fill the page. limit must be positive.
+func ReadActiveTail(ctx context.Context, path string, filter Filter, limit int) ([]Event, error) {
+	return activeFilteredTail(ctx, path, filter, limit)
+}
+
 // activeFilteredTail reads the trailing matching events from the active file
 // at path only, never its sibling archives. Returns (nil, nil) if the active
 // file doesn't exist yet.

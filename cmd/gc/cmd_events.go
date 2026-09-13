@@ -671,7 +671,7 @@ func readLocalCityEvents(scope eventsAPIScope, apiErr error, typeFilter, sinceFl
 	// archive the tail read cannot see — and the window never invents events
 	// that are not in it.
 	if filter.Since.IsZero() {
-		all, err := events.ReadFilteredTail(context.Background(), path, filter, int(cityEventsPageLimit))
+		all, err := events.ReadActiveTail(context.Background(), path, filter, int(cityEventsPageLimit))
 		if err != nil {
 			return nil, true, fmt.Errorf("reading local city events: %w", err)
 		}
