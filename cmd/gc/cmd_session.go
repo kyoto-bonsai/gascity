@@ -1591,6 +1591,39 @@ func cmdSessionAttach(args []string, stdout, stderr io.Writer) int {
 // sessionKind is the persisted session kind when available. A provider session
 // was created from a bare provider name, so agent-template lookup must be
 // skipped to avoid agent/provider name collisions.
+//
+// resumeOverridesAreDeclaredChoices reports whether every override that
+// targets a closed-enum option (one with a declared Choices list) matches
+// one of those choices. config.ResolveExplicitOptions' passthrough path
+// (ga-b0flc8: "pass through verbatim or fail the spawn") is correct for the
+// create/reconciler path, where a hard failure is an acceptable outcome --
+// but resume is deliberately best-effort and must never lock the operator
+// out of an existing session, so an unrecognized value for an
+// otherwise-closed option should fall back to provider defaults here
+// instead of launching with a verbatim-passthrough flag value the
+// underlying provider CLI was never declared to accept (ga-ycnaxn 3/3).
+// Options with no declared Choices (genuinely free-form) are not this
+// check's concern.
+func resumeOverridesAreDeclaredChoices(schema []config.ProviderOption, overrides map[string]string) bool {
+	for _, opt := range schema {
+		value, ok := overrides[opt.Key]
+		if !ok || len(opt.Choices) == 0 {
+			continue
+		}
+		found := false
+		for _, choice := range opt.Choices {
+			if choice.Value == value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, sessionKind string, metadata map[string]string, stderr io.Writer) (string, runtime.Config) {
 	cmd := session.BuildResumeCommand(info)
 	if cfg == nil {
@@ -1622,14 +1655,17 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 		}
 		if overrides, err := session.ParseTemplateOverrides(metadata); err == nil {
 			transport := strings.TrimSpace(info.Transport)
+			validOverrides := resumeOverridesAreDeclaredChoices(resolved.OptionsSchema, overrides)
 			launchCommand, err := config.BuildProviderLaunchCommand(cityPath, resolved, overrides, transport)
-			if err == nil && strings.TrimSpace(launchCommand.Command) != "" {
+			if err == nil && strings.TrimSpace(launchCommand.Command) != "" && validOverrides {
 				command = launchCommand.Command
 			} else {
 				appendDefaultArgs()
 			}
-			if command, err := config.BuildProviderResumeCommand(resolved, overrides); err == nil && strings.TrimSpace(command) != "" {
-				resumeCommand = command
+			if validOverrides {
+				if command, err := config.BuildProviderResumeCommand(resolved, overrides); err == nil && strings.TrimSpace(command) != "" {
+					resumeCommand = command
+				}
 			}
 		} else {
 			appendDefaultArgs()
