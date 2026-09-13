@@ -107,6 +107,19 @@ subcommand of its own: "release-if-current <issue-id> <assignee>", which
 conditionally resets an in-progress assignment only when the bead still has
 that assignee.
 
+On a city that has opted into [routing] (city.toml), a successful "gc bd
+close" (or "update --status closed") also records who closed the bead:
+gc.routed_to is set to the closing persona (the session's GC_TEMPLATE) and
+gc.officer_of_record to that persona's accountable officer, derived from
+[routing].reports_to / routing_exempt / officer_of_record_value_domain.
+Neither field is ever overwritten if already present. A close that
+legitimately carries no officer (a Tier-1 single-seat self-close, an
+operator's own direct close) declares that instead of leaving the fields
+blank: "gc bd close --exempt-reason '<why>' <id>" records
+gc.officer_exempt_reason and skips the officer derivation. The flag is gc's
+own — it is stripped before the arguments reach bd — and only meaningful on
+close.
+
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
 auto-export behavior, invoke bd directly.`,
@@ -116,7 +129,8 @@ auto-export behavior, invoke bd directly.`,
   gc bd list --rig my-project -s open
   gc bd --city /path/to/city list    # pins the city (HQ) store, no rig auto-detect
   gc bd heartbeat my-project-abc     # refresh the claim lease you hold
-  gc bd release-if-current my-project-abc worker-1`,
+  gc bd release-if-current my-project-abc worker-1
+  gc bd close --exempt-reason "Tier-1 single-seat self-close" my-project-abc -r done`,
 		DisableFlagParsing: true,
 		RunE: func(_ *cobra.Command, args []string) error {
 			// Plumb doBd's numeric exit code through exitForCode so the
@@ -323,6 +337,15 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// gc's own --exempt-reason (close-time attribution, ga-15x4xy) comes off
+	// here, before bdMutationWriteIDs — which is fail-closed on unknown flags —
+	// and before anything reaches bd, which does not know it.
+	bdArgs, exemptReason, err := extractBdExemptReason(bdArgs)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc bd: %v\n", errBdExemptReasonUsage(err)) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
 	// Refuse a dropped --set-metadata pair before any store work, so nothing is
 	// written and the exit code is honest. bd applies the subset and exits 0.
 	if msg, mistyped := mistypedMetadataPairRefusal(bdArgs); mistyped {
@@ -412,6 +435,11 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// cwd) is resolved inside resolveBdScopeTarget and deliberately does not
 	// travel — see refuseRigScopedClassOwnedTarget.
 	if code, handled := maybeRouteBdByID(cityPath, rigName, bdArgs, stdout, stderr); handled {
+		if exemptReason != "" {
+			// The class-owned door closes in process and carries no attribution
+			// stamp; say so rather than drop a declared exemption on the floor.
+			fmt.Fprintf(stderr, "gc bd: close-attribution: %s not recorded: this bead is served by a class binding, which the close-time stamp does not cover yet\n", bdExemptReasonFlag) //nolint:errcheck // best-effort stderr
+		}
 		return code
 	}
 	if id, expectedAssignee, ok, err := parseBdReleaseIfCurrentArgs(bdArgs); ok || err != nil {
@@ -623,6 +651,19 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// for this one field.
 	if ids, ok := bdCloseReasonCheckTargets(bdArgs); ok {
 		verifyBdCloseReasonPersisted(ids, target.ScopeRoot, cityPath, stderr)
+	}
+
+	// Close-time attribution (ga-15x4xy): bd has closed these beads; record who
+	// closed them and under which officer, or the declared exemption. Reuses the
+	// store the write-ID guard opened when it did; best-effort, exit code is bd's.
+	if ids, ok := bdCloseAttributionTargets(bdArgs); ok {
+		store := guardStore
+		if store == nil {
+			store, _ = openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
+		}
+		stampBdCloseAttribution(ids, exemptReason, store, cfg, os.Getenv, stderr)
+	} else if exemptReason != "" {
+		fmt.Fprintf(stderr, "gc bd: close-attribution: %s not recorded: no bead id named on the command line\n", bdExemptReasonFlag) //nolint:errcheck // best-effort stderr
 	}
 
 	return 0

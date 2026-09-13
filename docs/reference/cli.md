@@ -299,6 +299,19 @@ subcommand of its own: "release-if-current &lt;issue-id&gt; &lt;assignee&gt;", w
 conditionally resets an in-progress assignment only when the bead still has
 that assignee.
 
+On a city that has opted into [routing] (city.toml), a successful "gc bd
+close" (or "update --status closed") also records who closed the bead:
+gc.routed_to is set to the closing persona (the session's GC_TEMPLATE) and
+gc.officer_of_record to that persona's accountable officer, derived from
+[routing].reports_to / routing_exempt / officer_of_record_value_domain.
+Neither field is ever overwritten if already present. A close that
+legitimately carries no officer (a Tier-1 single-seat self-close, an
+operator's own direct close) declares that instead of leaving the fields
+blank: "gc bd close --exempt-reason '&lt;why&gt;' &lt;id&gt;" records
+gc.officer_exempt_reason and skips the officer derivation. The flag is gc's
+own — it is stripped before the arguments reach bd — and only meaningful on
+close.
+
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
 auto-export behavior, invoke bd directly.
@@ -317,6 +330,7 @@ gc bd list --rig my-project -s open
 gc bd --city /path/to/city list    # pins the city (HQ) store, no rig auto-detect
 gc bd heartbeat my-project-abc     # refresh the claim lease you hold
 gc bd release-if-current my-project-abc worker-1
+gc bd close --exempt-reason "Tier-1 single-seat self-close" my-project-abc -r done
 ```
 
 ## gc beads
