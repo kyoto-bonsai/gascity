@@ -1099,6 +1099,116 @@ func TestOrderFiringCurrent_LastRunTimeout_DegradesOneOrder_OthersUnaffected(t *
 	}
 }
 
+// TestOrderFiringCurrent_PrefetchTimeoutPreservesTailDerivedLastFired pins
+// ga-nwgp8q, an escaped defect found validating ga-3h3ovu: the prefetch
+// resolver's errOrderHistoryLookupTimedOut sentinel arrives at
+// latestOrderFiredAtUsing through its ordinary res.err != nil branch, which
+// discards the tail-derived `latest` the same way a genuine lookup error
+// would — but a timed-out (inconclusive) confirmation is not a genuine
+// error, and the inline per-order timeout path a few lines below already
+// knows this. A stale-but-present tail (order overdue, not "never fired")
+// must keep classifying as overdue/Warning, not collapse to a
+// lastFired-zero "never fired"/Blocking Error — exactly what the currently-
+// live binary (dcf076336) does and what this regressed against.
+func TestOrderFiringCurrent_PrefetchTimeoutPreservesTailDerivedLastFired(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "overdue-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-5 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "overdue-cooldown", Ts: now.Add(-2 * time.Hour)},
+	)
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+		<-release // simulates ga-t2brh8 Dolt contention
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	check.lastRunTimeout = 20 * time.Millisecond
+	// historyTimeout stays at its generous 15s default: the whole-check
+	// budget must have plenty left when this order's confirmation times out,
+	// so the pre-pass actually attempts (and clamps) the call instead of
+	// skipping it outright — that's a different scenario (ga-3h3ovu),
+	// already covered by StalledLastRun_DegradesInsteadOfBlindingWholeCheck.
+
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	details := strings.Join(result.Details, "\n")
+	if !strings.Contains(details, "last fired 2h ago, expected every 1h (overdue)") {
+		t.Fatalf("details = %v, want the tail-derived (overdue) classification preserved — not lost to a zero-value 'never fired'", result.Details)
+	}
+	if !strings.Contains(details, "confirmation timed out") {
+		t.Fatalf("details = %v, want an unconfirmed-lookup annotation", result.Details)
+	}
+	if result.Status != StatusWarning {
+		t.Fatalf("status = %v, want warning (matches live dcf076336 — an inconclusive confirmation must not escalate a merely-overdue order to blocking); msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if result.Severity != SeverityAdvisory {
+		t.Fatalf("severity = %v, want advisory (a timed-out confirmation is inconclusive, not proof of a stale order)", result.Severity)
+	}
+	if !result.TimedOut {
+		t.Fatalf("TimedOut = false, want true")
+	}
+}
+
+// TestOrderFiringCurrent_PrefetchLimitZeroPreservesTailDerivedLastFired pins
+// the same ga-nwgp8q defect through prefetchLastRuns' OTHER route to the
+// sentinel: when the shared budget at pre-pass start is positive but smaller
+// than a single per-call timeout, prefetchLastRuns' affordable-slots
+// calculation floors to 0 and stamps every pending order timed-out with no
+// attempt at all (see CONCERN-3 on ga-nwgp8q, not fixed here — the stamping
+// itself is instantaneous, which is exactly why this reaches a DIFFERENT
+// budget state than the direct-timeout test above rather than duplicating
+// it: costing no real wall-clock time means the classification loop's own
+// re-check of the same deadline, moments later, still sees the budget it
+// started with, comfortably positive — so it proceeds to consume the
+// stamped sentinel through the same buggy branch instead of hitting its own
+// perCallTimeout<=0 shortcut.
+func TestOrderFiringCurrent_PrefetchLimitZeroPreservesTailDerivedLastFired(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "overdue-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-5 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "overdue-cooldown", Ts: now.Add(-2 * time.Hour)},
+	)
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	lastRunCalled := false
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(orders.Order) (time.Time, error) {
+		lastRunCalled = true
+		<-release
+		return time.Time{}, nil
+	}))
+	check.clock = func() time.Time { return now }
+	// 50ms remaining (100ms historyTimeout - 50ms reserve) is less than the
+	// 200ms per-call timeout, so prefetchLastRuns' affordable-slots
+	// calculation floors to 0 and stamps every pending order timed-out
+	// immediately (limit <= 0) — lastRun is never actually called.
+	check.deadlineReserve = 50 * time.Millisecond
+	check.lastRunTimeout = 200 * time.Millisecond
+	check.historyTimeout = 100 * time.Millisecond
+
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if lastRunCalled {
+		t.Fatalf("lastRun was called; want the pre-pass's collapsed slot budget (limit <= 0) to skip the attempt outright")
+	}
+	details := strings.Join(result.Details, "\n")
+	if !strings.Contains(details, "last fired 2h ago, expected every 1h (overdue)") {
+		t.Fatalf("details = %v, want the tail-derived (overdue) classification preserved — not lost to a zero-value 'never fired'", result.Details)
+	}
+	if result.Status != StatusWarning {
+		t.Fatalf("status = %v, want warning; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if result.Severity != SeverityAdvisory {
+		t.Fatalf("severity = %v, want advisory", result.Severity)
+	}
+}
+
 // TestOrderFiringCurrent_FindsRecentFiring_AmongLargeNoisyHistory pins the
 // ga-17ow3v fix: on a live city, events.jsonl plus its rotated archives can
 // carry 40k+ order.fired lines and exceed 350MB, and the old unconditional

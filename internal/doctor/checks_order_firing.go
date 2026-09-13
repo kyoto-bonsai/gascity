@@ -897,6 +897,14 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAtUsing(lastRun OrderFiringCur
 
 	select {
 	case res := <-resultCh:
+		if errors.Is(res.err, errOrderHistoryLookupTimedOut) {
+			// The prefetched resolver already gave up on this order
+			// (ga-3h3ovu): degrade exactly like the inline timeout case
+			// below instead of falling into the generic error branch, which
+			// would discard the tail-derived value this order already has
+			// (ga-nwgp8q).
+			return latest, res.err
+		}
 		if res.err != nil {
 			return time.Time{}, res.err
 		}
