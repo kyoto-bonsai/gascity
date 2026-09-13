@@ -73,7 +73,7 @@ func doHookClaimByID(id, dir string, opts hookClaimOptions, ops hookClaimOps, st
 	}
 
 	claimsErrored := false
-	if hookCandidateClaimable(bead, opts.RouteTargets) {
+	if hookCandidateClaimable(bead, opts.RouteTargets, ops.nowOrWallClock()) {
 		claimResult := claimFirstEligibleHookCandidate(candidates, opts, ops, dir, stdout, stderr)
 		if claimResult.terminal {
 			return claimResult.code
