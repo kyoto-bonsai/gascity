@@ -276,18 +276,23 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext, deadline time.Time) *Ch
 	// Track severity contributions across error-level entries. Warnings should
 	// stay visible without converting an advisory error into a blocking gate.
 	var blockingErrors, advisoryErrors int
+	// degradedLookups counts orders whose confirmation timed out, regardless
+	// of the status that resulted. A timed-out lookup is inconclusive, not
+	// proof of a problem (#4895) — same reasoning as Run's own whole-check
+	// timeout branch — so on its own (no order actually confirmed blocking)
+	// it must move the whole check's Severity to advisory too, not leave it
+	// at the SeverityBlocking zero value.
+	var degradedLookups int
 	suspendedRigs := orderFiringCurrentSuspendedRigs(c.cfg, cityPath)
 	zeroMinPools := orderFiringCurrentZeroMinPools(c.cfg)
 
 	// Resolve every order-run lookup the loop below will need up front and in
 	// parallel. The pre-pass shares the cron-interval cache with the loop, so
 	// the expected intervals — and therefore which orders need a lookup — are
-	// identical to what the loop derives for itself. Bounded by the same
-	// shared deadline the loop's own per-order fallback uses below: an
-	// unbounded pre-pass moves the real store round-trip earlier, where the
-	// per-order/aggregate budget could no longer see it, letting one stalled
-	// order blind the whole check again (ga-3h3ovu) — exactly what ga-17ow3v
-	// had already fixed for the non-prefetch path.
+	// identical to what the loop derives for itself. deadline is threaded
+	// through so the pre-pass honors the same shared budget the per-order
+	// fallback below does (ga-3h3ovu): upstream's original version of this
+	// pre-pass ran every pending lookup blind to that budget.
 	lastRunFor := c.prefetchedLastRunFunc(c.pendingLastRunOrders(allOrders, firedEvents, suspendedRigs, cronIntervals, now), deadline)
 
 	for _, order := range allOrders {
@@ -330,6 +335,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext, deadline time.Time) *Ch
 			if status == StatusOK {
 				status = StatusWarning
 			}
+			degradedLookups++
 		}
 		worst = worseStatus(worst, status)
 		result.Details = append(result.Details, detail)
@@ -362,8 +368,16 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext, deadline time.Time) *Ch
 	case StatusError:
 		result.Message = "scheduled orders are stale"
 	}
-	if blockingErrors == 0 && advisoryErrors > 0 {
+	if blockingErrors == 0 && (advisoryErrors > 0 || degradedLookups > 0) {
 		result.Severity = SeverityAdvisory
+	}
+	if degradedLookups > 0 {
+		// At least one order's confirmation timed out (as opposed to the
+		// whole check timing out, handled by Run's own select/TimedOut
+		// branch above) — same signal, so callers get the same distinction
+		// between "inconclusive" and "confirmed" regardless of which level
+		// the timeout happened at.
+		result.TimedOut = true
 	}
 	if firstNonOK != "" {
 		result.FixHint = fmt.Sprintf(orderFiringInspectHintFmt, firstNonOK)
@@ -934,12 +948,9 @@ func (c *OrderFiringCurrentCheck) pendingLastRunOrders(allOrders []orders.Order,
 }
 
 // prefetchedLastRunFunc resolves pending in parallel and returns a resolver
-// serving those results. A lookup the pre-pass did not anticipate — or one
-// abandoned when the shared deadline ran out before it finished — still
-// falls through to the live resolver, so the classification loop can never
-// silently lose an answer; latestOrderFiredAtUsing's own per-order bound is
-// what degrades an abandoned straggler instead of the pre-pass blocking the
-// whole check on it (ga-3h3ovu).
+// serving those results. A lookup the pre-pass did not anticipate still falls
+// through to the live resolver, so the classification loop can never silently
+// lose an answer.
 func (c *OrderFiringCurrentCheck) prefetchedLastRunFunc(pending []orders.Order, deadline time.Time) OrderFiringCurrentLastRunFunc {
 	if c.lastRun == nil {
 		return nil
@@ -961,34 +972,53 @@ func (c *OrderFiringCurrentCheck) prefetchedLastRunFunc(pending []orders.Order, 
 // (ga-klv). Results (values AND errors) are handed back verbatim so the
 // classification loop behaves exactly as it did when it called inline.
 //
-// The whole fan-out is bounded by the shared check deadline (see
-// orderFiringDeadlineReserve), the same budget latestOrderFiredAtUsing
-// enforces per order below: a fan-out already exhausted before it starts is
-// never attempted, and one still running when the deadline arrives is
-// abandoned rather than awaited. Any order left unresolved here falls
-// through to the live resolver, where the classification loop's own
-// per-order bound — now correctly seeing an exhausted-or-shrunk deadline —
-// degrades it instead of the pre-pass blocking the whole check on it
-// (ga-3h3ovu): a single stalled order used to blind order-firing-current
-// entirely because the real store round-trip happened here, unbounded,
-// before the loop's own deadline logic ever got a chance to see it.
+// The fan-out shares the SAME whole-check deadline latestOrderFiredAtUsing
+// bounds each inline fallback attempt with (ga-3h3ovu): upstream's original
+// version of this pre-pass ran every pending lookup unconditionally, ahead of
+// and blind to that budget, which silently defeated both of
+// latestOrderFiredAtUsing's protections for anything routed through here —
+// the skip-if-already-exhausted check (never reached, since the eager
+// pre-pass had already made the call before the loop got a chance to ask) and
+// the aggregate-budget bound (the unconditional wg.Wait() below had no
+// deadline of its own, so one stalled order could block this whole pre-pass,
+// and therefore the whole check, well past the check's own timeout). The
+// concurrent fan-out itself (limit) is unchanged; what's new is that the
+// number of SLOTS available for the WHOLE pre-pass is additionally capped by
+// how many full per-call timeouts the remaining shared budget can actually
+// afford, so a run of genuinely-stalled orders degrades the same way a
+// serial caller would instead of borrowing time the check doesn't have.
 func (c *OrderFiringCurrentCheck) prefetchLastRuns(pending []orders.Order, deadline time.Time) map[string]orderFiringLastRunResult {
 	out := make(map[string]orderFiringLastRunResult, len(pending))
 	if c.lastRun == nil || len(pending) == 0 {
 		return out
 	}
-	var remaining time.Duration
-	if !deadline.IsZero() {
-		remaining = time.Until(deadline) - c.resolvedDeadlineReserve()
-		if remaining <= 0 {
-			return out
-		}
-	}
 
+	perCallTimeout := c.resolvedLastRunTimeout()
 	limit := orderFiringLastRunConcurrency
 	if len(pending) < limit {
 		limit = len(pending)
 	}
+	if !deadline.IsZero() {
+		remaining := time.Until(deadline) - c.resolvedDeadlineReserve()
+		if remaining <= 0 {
+			// The shared deadline is already exhausted: every pending order
+			// degrades without this pre-pass attempting a single lookup.
+			for _, order := range pending {
+				out[order.ScopedName()] = orderFiringLastRunResult{err: errOrderHistoryLookupTimedOut}
+			}
+			return out
+		}
+		if affordable := int(remaining / perCallTimeout); affordable < limit {
+			limit = affordable
+		}
+	}
+	if limit <= 0 {
+		for _, order := range pending {
+			out[order.ScopedName()] = orderFiringLastRunResult{err: errOrderHistoryLookupTimedOut}
+		}
+		return out
+	}
+
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, limit)
@@ -998,40 +1028,55 @@ func (c *OrderFiringCurrentCheck) prefetchLastRuns(pending []orders.Order, deadl
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			at, err := c.lastRun(order)
+
+			// Re-derive the per-call bound at the moment this order actually
+			// acquires a slot, exactly as latestOrderFiredAtUsing does for its
+			// own fallback attempts: a slot that only frees up once earlier
+			// occupants have burned through most of the shared deadline must
+			// not then hand a stale, over-generous timeout to whichever order
+			// was waiting for it.
+			callTimeout := perCallTimeout
+			if !deadline.IsZero() {
+				if remaining := time.Until(deadline) - c.resolvedDeadlineReserve(); remaining < callTimeout {
+					callTimeout = remaining
+				}
+			}
+			if callTimeout <= 0 {
+				mu.Lock()
+				out[order.ScopedName()] = orderFiringLastRunResult{err: errOrderHistoryLookupTimedOut}
+				mu.Unlock()
+				return
+			}
+
+			type lastRunResult struct {
+				at  time.Time
+				err error
+			}
+			resultCh := make(chan lastRunResult, 1)
+			go func() {
+				at, err := c.lastRun(order)
+				resultCh <- lastRunResult{at, err}
+			}()
+
+			var result orderFiringLastRunResult
+			select {
+			case res := <-resultCh:
+				result = orderFiringLastRunResult(res)
+			case <-time.After(callTimeout):
+				// Leaked deliberately: c.lastRun may still return well after
+				// this attempt gives up (ga-t2brh8 contention). gc doctor is
+				// short-lived, the same tolerance Run and
+				// latestOrderFiredAtUsing already rely on for their own
+				// per-call timeouts.
+				result = orderFiringLastRunResult{err: errOrderHistoryLookupTimedOut}
+			}
 			mu.Lock()
-			out[order.ScopedName()] = orderFiringLastRunResult{at: at, err: err}
+			out[order.ScopedName()] = result
 			mu.Unlock()
 		}(order)
 	}
-
-	if deadline.IsZero() {
-		wg.Wait()
-		return out
-	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return out
-	case <-time.After(remaining):
-		// Abandoned: the goroutines above keep running and writing to out
-		// under mu in the background (there is no context to cancel
-		// c.lastRun with — see the identical trade-off in Run and in
-		// latestOrderFiredAtUsing). Snapshot what completed so far instead
-		// of returning out directly, since it is still being written
-		// concurrently with whatever the caller does next.
-		mu.Lock()
-		defer mu.Unlock()
-		snapshot := make(map[string]orderFiringLastRunResult, len(out))
-		for k, v := range out {
-			snapshot[k] = v
-		}
-		return snapshot
-	}
+	wg.Wait()
+	return out
 }
 
 // orderFiringLastRunResult is one prefetched order-run lookup outcome.

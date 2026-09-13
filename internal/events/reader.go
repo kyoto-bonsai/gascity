@@ -452,6 +452,13 @@ func mergeEventsBySeq(a, b []Event) []Event {
 func archiveFilesIn(dir string) ([]archiveInfo, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// No runtime directory yet (e.g. a city that has never rotated —
+			// or, per ga-3h3ovu, never written — an event log) means no
+			// archives exist, exactly like activeFilteredTail's own ENOENT
+			// case for the active file: a valid empty state, not an error.
+			return nil, nil
+		}
 		return nil, err
 	}
 	var archives []archiveInfo

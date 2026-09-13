@@ -177,23 +177,23 @@ func TestOrderFiringCurrent_FiringOlderThanTailFallsBackToLastRun(t *testing.T) 
 // old text blamed "beads/Dolt connectivity", which sent triage at the data
 // plane while the data plane was healthy and cost a full triage cycle (ga-klv).
 // A timeout here is a query-cost problem, so the hint must say so.
+// The event-tail read (unlike the lastRun fallback, see ga-3h3ovu) has no
+// bound of its own: it must genuinely stall the whole check to exercise
+// Run's own whole-check timeout branch and this FixHint. A stalled lastRun no
+// longer reaches it — that scenario now degrades gracefully per-order
+// instead of blinding the whole check, see
+// TestOrderFiringCurrent_StalledLastRun_DegradesInsteadOfBlindingWholeCheck.
 func TestOrderFiringCurrent_TimeoutHintNamesQueryCost(t *testing.T) {
-	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
 	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stalled-history", "cron", "0 */4 * * *")
-	writeOrderFiringTestEvents(t, cityPath,
-		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
-		events.Event{Type: events.OrderFired, Subject: "mol-dog-stalled-history", Ts: now.Add(-13 * time.Hour)},
-	)
 
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
-	check.clock = func() time.Time { return now }
 	check.historyTimeout = 20 * time.Millisecond
-	check.lastRun = func(orders.Order) (time.Time, error) {
+	check.readEvents = func(string, events.Filter, int) ([]events.Event, error) {
 		<-release
-		return time.Time{}, nil
+		return nil, nil
 	}
 
 	result := check.Run(&CheckContext{CityPath: cityPath})
