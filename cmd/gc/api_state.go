@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	beadsexec "github.com/gastownhall/gascity/internal/beads/exec"
+	"github.com/gastownhall/gascity/internal/closeattr"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/configedit"
 	"github.com/gastownhall/gascity/internal/emergency"
@@ -72,6 +74,10 @@ type controllerState struct {
 	cacheCtx      context.Context
 	beadStores    map[string]beads.Store
 	cityBeadStore beads.Store // city-level store for session beads
+	// closeAttributionStderr receives the close-time attribution stamp's
+	// diagnostics (runBeadCloseAttribution). nil means os.Stderr; tests inject
+	// a buffer.
+	closeAttributionStderr io.Writer
 	// storageRoutes is the opened non-work storage binding the city runtime
 	// resolved at boot: a constructor input, written once in
 	// newControllerStateWithRoutes and never reassigned, so reads are lock-free
@@ -802,6 +808,7 @@ func (cs *controllerState) applyBeadEventToStores(evt events.Event) {
 		cs.mu.RUnlock()
 		executionevent.EmitCompletedFromClosedNotification(rec, cs.GraphBeadStore().Store, evt.Payload, evt.Actor)
 		cs.runBeadCloseAutoclose(evt.Subject, stores[0], storeRef)
+		cs.runBeadCloseAttribution(evt.Subject, stores[0])
 	}
 }
 
@@ -848,6 +855,76 @@ func (cs *controllerState) runBeadCloseAutoclose(beadID string, store beads.Stor
 		doConvoyAutocloseWith(store, rec, beadID, os.Stderr, os.Stderr)
 		doWispAutocloseWith(store, beadID, os.Stderr, graphStore)
 		doMoleculeAutocloseWith(store, storeRef, rec, beadID, os.Stderr, graphStore)
+	})
+}
+
+// runBeadCloseAttribution is the controller-side projection of the close-time
+// attribution rule (ga-15x4xy): on bead.closed, record the closing persona as
+// gc.routed_to and its accountable officer as gc.officer_of_record via
+// closeattr.Patch, so a bead minted outside gc sling does not end its life with
+// both fields blank. It is the in-process successor of the on_close hook line
+// the original spec called for (installBeadHooks now removes those hooks).
+//
+// The closer is resolved from the bead's durable session back-reference —
+// gc.session_id, stamped by gc hook --claim and by direct routing — through the
+// typed session store to that session's template: a pool seat's persona
+// template, or a named session's agent qualified name, the same identity the
+// sling side keys [routing] on. A reconcile-sourced bead.closed carries no
+// closer (Actor is cacheReconcileActor) and bd persists the close actor only in
+// its own events table, so the session stamp is the one durable link a
+// controller can read. A bead with no such stamp (never claimed, closed raw)
+// is left alone: the gc bd close projection covers that path when the close
+// goes through gc, and lint owns the residual "neither" state.
+//
+// Idempotent with the client projection by construction (closeattr.Patch never
+// overwrites). Best-effort and off the event path (same dispatch as autoclose):
+// every failure is one "close-attribution:" stderr line, nothing retries.
+// No-ops for a city that has not opted into [routing].
+func (cs *controllerState) runBeadCloseAttribution(beadID string, store beads.Store) {
+	cs.mu.RLock()
+	cfg := cs.cfg
+	stderr := cs.closeAttributionStderr
+	cs.mu.RUnlock()
+	if store == nil || cfg == nil || !cfg.RoutingPolicy.Configured() {
+		return
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	beadCloseAutocloseDispatch(func() {
+		bead, err := store.Get(beadID)
+		if err != nil {
+			fmt.Fprintf(stderr, "close-attribution: %s: reading closed bead: %v\n", beadID, err) //nolint:errcheck // best-effort stderr
+			return
+		}
+		if !closeattr.NeedsStamp(bead.Metadata) {
+			return
+		}
+		sessionID := strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey])
+		if sessionID == "" {
+			return
+		}
+		info, err := session.NewStore(cs.SessionsBeadStore()).Get(sessionID)
+		if err != nil {
+			fmt.Fprintf(stderr, "close-attribution: %s: session %q from gc.session_id: %v; close left unattributed\n", beadID, sessionID, err) //nolint:errcheck // best-effort stderr
+			return
+		}
+		closer := strings.TrimSpace(info.Template)
+		if closer == "" {
+			fmt.Fprintf(stderr, "close-attribution: %s: session %q carries no template; close left unattributed\n", beadID, sessionID) //nolint:errcheck // best-effort stderr
+			return
+		}
+		attr, ok := cfg.RoutingPolicy.DeriveCloseAttribution(closer)
+		if !ok {
+			return
+		}
+		patch := closeattr.Patch(bead.Metadata, attr)
+		if len(patch) == 0 {
+			return
+		}
+		if err := store.SetMetadataBatch(beadID, patch); err != nil {
+			fmt.Fprintf(stderr, "close-attribution: %s: stamping %v: %v\n", beadID, patch, err) //nolint:errcheck // best-effort stderr
+		}
 	})
 }
 
