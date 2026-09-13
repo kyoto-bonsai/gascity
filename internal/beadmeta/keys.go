@@ -190,6 +190,13 @@ const (
 	ModelMetadataKey                    = "gc.model"
 	NativeStepDependenciesMetadataKey   = "gc.native_step_dependencies.v1"
 	NextAttemptMetadataKey              = "gc.next_attempt"
+	// OfficerExemptReasonMetadataKey is the positive exemption marker a closer
+	// declares when a close legitimately carries no gc.officer_of_record (e.g. a
+	// Tier-1 single-seat self-close with no validation loop). Its presence lets
+	// lint distinguish "exempt, declared" from "blank, unexamined" mechanically,
+	// and suppresses the close-time officer derivation in internal/closeattr
+	// (ga-15x4xy). The value is the human-readable reason; it is never blank.
+	OfficerExemptReasonMetadataKey = "gc.officer_exempt_reason"
 	// OfficerOfRecordMetadataKey pins the accountable department officer (or
 	// "operator") for a staff-persona-routed bead. Required by the gc sling
 	// hard gate (rigs/personas/ariadne-plan-persona-standards-2026-07-25.md
