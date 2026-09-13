@@ -282,8 +282,13 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext, deadline time.Time) *Ch
 	// Resolve every order-run lookup the loop below will need up front and in
 	// parallel. The pre-pass shares the cron-interval cache with the loop, so
 	// the expected intervals — and therefore which orders need a lookup — are
-	// identical to what the loop derives for itself.
-	lastRunFor := c.prefetchedLastRunFunc(c.pendingLastRunOrders(allOrders, firedEvents, suspendedRigs, cronIntervals, now))
+	// identical to what the loop derives for itself. Bounded by the same
+	// shared deadline the loop's own per-order fallback uses below: an
+	// unbounded pre-pass moves the real store round-trip earlier, where the
+	// per-order/aggregate budget could no longer see it, letting one stalled
+	// order blind the whole check again (ga-3h3ovu) — exactly what ga-17ow3v
+	// had already fixed for the non-prefetch path.
+	lastRunFor := c.prefetchedLastRunFunc(c.pendingLastRunOrders(allOrders, firedEvents, suspendedRigs, cronIntervals, now), deadline)
 
 	for _, order := range allOrders {
 		if order.Trigger != "cron" && order.Trigger != "cooldown" {
@@ -929,14 +934,17 @@ func (c *OrderFiringCurrentCheck) pendingLastRunOrders(allOrders []orders.Order,
 }
 
 // prefetchedLastRunFunc resolves pending in parallel and returns a resolver
-// serving those results. A lookup the pre-pass did not anticipate still falls
-// through to the live resolver, so the classification loop can never silently
-// lose an answer.
-func (c *OrderFiringCurrentCheck) prefetchedLastRunFunc(pending []orders.Order) OrderFiringCurrentLastRunFunc {
+// serving those results. A lookup the pre-pass did not anticipate — or one
+// abandoned when the shared deadline ran out before it finished — still
+// falls through to the live resolver, so the classification loop can never
+// silently lose an answer; latestOrderFiredAtUsing's own per-order bound is
+// what degrades an abandoned straggler instead of the pre-pass blocking the
+// whole check on it (ga-3h3ovu).
+func (c *OrderFiringCurrentCheck) prefetchedLastRunFunc(pending []orders.Order, deadline time.Time) OrderFiringCurrentLastRunFunc {
 	if c.lastRun == nil {
 		return nil
 	}
-	prefetched := c.prefetchLastRuns(pending)
+	prefetched := c.prefetchLastRuns(pending, deadline)
 	return func(order orders.Order) (time.Time, error) {
 		if result, ok := prefetched[order.ScopedName()]; ok {
 			return result.at, result.err
@@ -952,10 +960,29 @@ func (c *OrderFiringCurrentCheck) prefetchedLastRunFunc(pending []orders.Order) 
 // fan-out reports a blocking failure that says nothing about order firing
 // (ga-klv). Results (values AND errors) are handed back verbatim so the
 // classification loop behaves exactly as it did when it called inline.
-func (c *OrderFiringCurrentCheck) prefetchLastRuns(pending []orders.Order) map[string]orderFiringLastRunResult {
+//
+// The whole fan-out is bounded by the shared check deadline (see
+// orderFiringDeadlineReserve), the same budget latestOrderFiredAtUsing
+// enforces per order below: a fan-out already exhausted before it starts is
+// never attempted, and one still running when the deadline arrives is
+// abandoned rather than awaited. Any order left unresolved here falls
+// through to the live resolver, where the classification loop's own
+// per-order bound — now correctly seeing an exhausted-or-shrunk deadline —
+// degrades it instead of the pre-pass blocking the whole check on it
+// (ga-3h3ovu): a single stalled order used to blind order-firing-current
+// entirely because the real store round-trip happened here, unbounded,
+// before the loop's own deadline logic ever got a chance to see it.
+func (c *OrderFiringCurrentCheck) prefetchLastRuns(pending []orders.Order, deadline time.Time) map[string]orderFiringLastRunResult {
 	out := make(map[string]orderFiringLastRunResult, len(pending))
 	if c.lastRun == nil || len(pending) == 0 {
 		return out
+	}
+	var remaining time.Duration
+	if !deadline.IsZero() {
+		remaining = time.Until(deadline) - c.resolvedDeadlineReserve()
+		if remaining <= 0 {
+			return out
+		}
 	}
 
 	limit := orderFiringLastRunConcurrency
@@ -977,8 +1004,34 @@ func (c *OrderFiringCurrentCheck) prefetchLastRuns(pending []orders.Order) map[s
 			mu.Unlock()
 		}(order)
 	}
-	wg.Wait()
-	return out
+
+	if deadline.IsZero() {
+		wg.Wait()
+		return out
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return out
+	case <-time.After(remaining):
+		// Abandoned: the goroutines above keep running and writing to out
+		// under mu in the background (there is no context to cancel
+		// c.lastRun with — see the identical trade-off in Run and in
+		// latestOrderFiredAtUsing). Snapshot what completed so far instead
+		// of returning out directly, since it is still being written
+		// concurrently with whatever the caller does next.
+		mu.Lock()
+		defer mu.Unlock()
+		snapshot := make(map[string]orderFiringLastRunResult, len(out))
+		for k, v := range out {
+			snapshot[k] = v
+		}
+		return snapshot
+	}
 }
 
 // orderFiringLastRunResult is one prefetched order-run lookup outcome.
