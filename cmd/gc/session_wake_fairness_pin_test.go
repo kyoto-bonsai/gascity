@@ -203,6 +203,121 @@ func TestWakeFairnessInfoTwinCharacterization(t *testing.T) {
 	}
 }
 
+// TestSortCandidatesByWakeFairness_PendingCreatesPrecedeRewakes pins the
+// ga-r6lc7g ordering change: pending-create candidates sort ahead of every
+// re-wake candidate regardless of wake-fairness time, because a
+// pending-create is racing a hard lease expiry
+// (pendingCreateNeverStartedLeaseExpiredInfo) that a re-wake does not carry.
+// Within each tier the pre-existing least-recently-woken order must be
+// unchanged -- this only moves the tier boundary, never reorders inside a
+// tier (verified here by giving the re-wake tier the same relative ordering
+// TestWakeFairnessInfoTwinCharacterization already pins).
+func TestSortCandidatesByWakeFairness_PendingCreatesPrecedeRewakes(t *testing.T) {
+	base := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+
+	beadWithMeta := func(id string, created time.Time, meta map[string]string) beads.Bead {
+		return beads.Bead{
+			ID:        id,
+			Type:      session.BeadType,
+			Title:     "worker",
+			Labels:    []string{session.LabelSession},
+			CreatedAt: created,
+			Metadata:  meta,
+		}
+	}
+	candidateFor := func(bead beads.Bead) startCandidate {
+		return startCandidate{info: sessiontest.SeedBead(t, bead)}
+	}
+
+	// Two re-wakes with a well-established relative order (ga-old before
+	// ga-new is wrong; wake fairness wants the OLDER last_woke_at first).
+	rewakeOld := candidateFor(beadWithMeta("ga-rewake-old", base.Add(-3*time.Hour), map[string]string{
+		"template": "worker", "last_woke_at": base.Add(-2 * time.Hour).Format(time.RFC3339),
+	}))
+	rewakeNew := candidateFor(beadWithMeta("ga-rewake-new", base.Add(-3*time.Hour), map[string]string{
+		"template": "worker", "last_woke_at": base.Add(-10 * time.Minute).Format(time.RFC3339),
+	}))
+	// A pending-create minted AFTER both re-wakes' last_woke_at (so on the old
+	// single-tier fairness sort it would land LAST, behind both re-wakes --
+	// exactly the ga-r6lc7g starvation pattern).
+	pendingCreate := candidateFor(beadWithMeta("ga-wisp-6p5f0b", base, map[string]string{
+		"template": "worker", "pending_create_claim": "true", "state": "creating",
+	}))
+	if !pendingCreate.info.PendingCreateClaim {
+		t.Fatal("test setup: expected pendingCreate candidate to carry PendingCreateClaim=true")
+	}
+
+	cands := []startCandidate{rewakeOld, rewakeNew, pendingCreate}
+	sortCandidatesByWakeFairness(cands)
+	gotOrder := []string{cands[0].info.ID, cands[1].info.ID, cands[2].info.ID}
+	wantOrder := []string{"ga-wisp-6p5f0b", "ga-rewake-old", "ga-rewake-new"}
+	for i := range wantOrder {
+		if gotOrder[i] != wantOrder[i] {
+			t.Fatalf("fairness sort order = %v, want %v (pending-create must lead, re-wake relative order must be unchanged)", gotOrder, wantOrder)
+		}
+	}
+}
+
+// TestEnumeratedStartCandidateSummaries pins the ga-r6lc7g trace-visibility
+// addition: every candidate this tick considered is named (id, session name,
+// pending-create flag) so a future incident can directly answer "was this
+// bead even enumerated this tick" from the trace, instead of inferring it
+// from the absence of a downstream record.
+func TestEnumeratedStartCandidateSummaries(t *testing.T) {
+	base := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	beadWithMeta := func(id string, created time.Time, meta map[string]string) beads.Bead {
+		return beads.Bead{
+			ID: id, Type: session.BeadType, Title: "worker",
+			Labels: []string{session.LabelSession}, CreatedAt: created, Metadata: meta,
+		}
+	}
+	candidateFor := func(bead beads.Bead) startCandidate {
+		return startCandidate{info: sessiontest.SeedBead(t, bead)}
+	}
+
+	t.Run("empty input returns nil, not an empty slice", func(t *testing.T) {
+		if got := enumeratedStartCandidateSummaries(nil); got != nil {
+			t.Errorf("enumeratedStartCandidateSummaries(nil) = %#v, want nil", got)
+		}
+	})
+
+	t.Run("records id, session name, and pending-create flag", func(t *testing.T) {
+		pc := candidateFor(beadWithMeta("ga-wisp-6p5f0b", base, map[string]string{
+			"template": "worker", "pending_create_claim": "true", "session_name": "np51-probe",
+		}))
+		rw := candidateFor(beadWithMeta("ga-rewake", base, map[string]string{
+			"template": "worker", "session_name": "persona-nils-4-pool",
+		}))
+		out := enumeratedStartCandidateSummaries([]startCandidate{pc, rw})
+		if len(out) != 2 {
+			t.Fatalf("len(out) = %d, want 2", len(out))
+		}
+		if out[0]["id"] != "ga-wisp-6p5f0b" || out[0]["pending_create"] != true {
+			t.Errorf("out[0] = %#v, want id=ga-wisp-6p5f0b pending_create=true", out[0])
+		}
+		if out[1]["id"] != "ga-rewake" || out[1]["pending_create"] != false {
+			t.Errorf("out[1] = %#v, want id=ga-rewake pending_create=false", out[1])
+		}
+	})
+
+	t.Run("caps at maxEnumeratedCandidateSummaries and notes the remainder", func(t *testing.T) {
+		var many []startCandidate
+		for i := 0; i < maxEnumeratedCandidateSummaries+5; i++ {
+			many = append(many, candidateFor(beadWithMeta("ga-c"+string(rune('a'+i%26)), base, map[string]string{
+				"template": "worker",
+			})))
+		}
+		out := enumeratedStartCandidateSummaries(many)
+		if len(out) != maxEnumeratedCandidateSummaries+1 {
+			t.Fatalf("len(out) = %d, want %d (cap + 1 truncation marker)", len(out), maxEnumeratedCandidateSummaries+1)
+		}
+		last := out[len(out)-1]
+		if remaining, ok := last["truncated_remaining"].(int); !ok || remaining != 5 {
+			t.Errorf("truncation marker = %#v, want truncated_remaining=5", last)
+		}
+	})
+}
+
 func mustParseRFC3339(t *testing.T, s string) time.Time {
 	t.Helper()
 	parsed, err := time.Parse(time.RFC3339, s)

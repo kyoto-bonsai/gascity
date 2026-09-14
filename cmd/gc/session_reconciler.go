@@ -28,6 +28,8 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/reconcilerhealth"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/storeref"
@@ -4360,7 +4362,26 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	recordPhase(TraceSiteSessionReconcileStartExecution, "session_reconcile.execute_planned_starts", phaseStart, map[string]any{
 		"start_candidate_count": len(startCandidates),
 		"planned_wake_count":    plannedWakes,
+		// enumerated_candidates names every bead this tick considered a start
+		// candidate (id, session name, whether it's a pending-create) so a
+		// stuck bead's own trace answers "was I even enumerated this tick" --
+		// distinct from "enumerated but failed to start" or "never claimed a
+		// candidate slot at all." Without this, a bead that expires its
+		// pending-create lease before any tick enumerates it (ga-r6lc7g) is
+		// indistinguishable, after the fact, from one that was enumerated and
+		// then silently dropped -- the absence of a reconciler.start.execute
+		// record cannot tell those apart on its own.
+		"enumerated_candidates": enumeratedStartCandidateSummaries(startCandidates),
 	})
+	// Best-effort liveness gauge for `gc doctor` (ga-r6lc7g) -- a write
+	// failure here must never fail or slow the reconciler tick itself, only
+	// degrade the gauge's freshness, so errors are swallowed after a
+	// diagnostic line.
+	if cityPath != "" {
+		if err := reconcilerhealth.Record(fsys.OSFS{}, cityPath, time.Since(phaseStart), len(startCandidates), plannedWakes); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: warn: recording tick-health gauge: %v\n", err) //nolint:errcheck // best-effort diagnostics
+		}
+	}
 
 	if ctx != nil && ctx.Err() != nil {
 		return plannedWakes

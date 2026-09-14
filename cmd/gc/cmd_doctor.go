@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/pathutil"
+	"github.com/gastownhall/gascity/internal/reconcilerhealth"
 	"github.com/gastownhall/gascity/internal/rollout"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/spf13/cobra"
@@ -134,6 +135,95 @@ func (c *doltTopologyCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 func (c *doltTopologyCheck) CanFix() bool { return false }
 
 func (c *doltTopologyCheck) Fix(_ *doctor.CheckContext) error { return nil }
+
+// reconcilerTickStalenessLimit and reconcilerTickWaveLimit are the BLOCKING
+// thresholds requested on ga-r6lc7g: a tick-health gauge older than 2x the
+// pending-create never-started lease (pendingCreateNeverStartedTimeout, 10m)
+// means a pending-create session minted right after the last recorded tick
+// could already have rolled back before the reconciler got back around to
+// it; a single start-execution phase over 60s is the wave-duration ceiling
+// the validator named directly (healthy baseline observed ~5s; the incident
+// saw one wave at 4m49s).
+var (
+	reconcilerTickStalenessLimit = 2 * pendingCreateNeverStartedTimeout
+	reconcilerTickWaveLimit      = 60 * time.Second
+)
+
+// reconcilerTickHealthCheck surfaces the session reconciler's per-tick
+// liveness gauge (.gc/runtime/reconciler-tick-health.json, written by
+// reconcilerhealth.Record from session_reconciler.go every tick) as a
+// doctor check, so degraded tick cadence — the root cause the ga-r6lc7g
+// investigation found (ticks 24 minutes apart against a 10-minute
+// pending-create lease, so a fresh pending-create could expire before any
+// tick ever enumerated it) — is visible without grepping supervisor.log or
+// parsing trace segments after the fact.
+type reconcilerTickHealthCheck struct {
+	cityPath          string
+	controllerRunning bool
+	// now is overridable in tests so the staleness threshold (tens of
+	// minutes) can be exercised without a real sleep. Defaults to time.Now.
+	now func() time.Time
+}
+
+func newReconcilerTickHealthCheck(cityPath string, controllerRunning bool) *reconcilerTickHealthCheck {
+	return &reconcilerTickHealthCheck{cityPath: cityPath, controllerRunning: controllerRunning}
+}
+
+func (c *reconcilerTickHealthCheck) Name() string { return "reconciler-tick-health" }
+
+func (c *reconcilerTickHealthCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
+	r := &doctor.CheckResult{Name: c.Name()}
+	if !c.controllerRunning {
+		r.Status = doctor.StatusOK
+		r.Message = "controller not running; tick-health gauge not applicable"
+		return r
+	}
+	st, err := reconcilerhealth.Load(fsys.OSFS{}, c.cityPath)
+	if err != nil {
+		r.Status = doctor.StatusWarning
+		r.Message = fmt.Sprintf("reading tick-health gauge: %v", err)
+		return r
+	}
+	if st.LastTickCompletedAt.IsZero() {
+		// A running controller with no gauge yet means either a binary older
+		// than this gauge, or the reconciler has not completed its first
+		// start-execution phase since the file was cleared/never created.
+		// Ambiguous, not itself evidence of a stall -- warn, don't block.
+		r.Status = doctor.StatusWarning
+		r.Message = "no tick-health gauge recorded yet (fresh controller start, or a pre-gauge binary)"
+		return r
+	}
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	age := now().Sub(st.LastTickCompletedAt)
+	lastPhase := time.Duration(st.LastPhaseDurationMs) * time.Millisecond
+	switch {
+	case age > reconcilerTickStalenessLimit:
+		r.Status = doctor.StatusError
+		r.Message = fmt.Sprintf("reconciler tick gauge is %s stale (limit %s, %dx the %s pending-create lease) -- pending-create sessions may be expiring before any tick enumerates them",
+			age.Round(time.Second), reconcilerTickStalenessLimit, 2, pendingCreateNeverStartedTimeout)
+		r.FixHint = "check controller liveness (gc supervisor status) and upstream store latency (gc doctor dolt checks); this gauge only reports the symptom"
+		return r
+	case lastPhase > reconcilerTickWaveLimit:
+		r.Status = doctor.StatusError
+		r.Message = fmt.Sprintf("last reconciler start-execution phase took %s (limit %s) -- ticks are running far slower than the healthy single-digit-second baseline",
+			lastPhase.Round(time.Millisecond), reconcilerTickWaveLimit)
+		r.FixHint = "check upstream store latency (Dolt); a slow wave here degrades tick cadence for every session in the city, not just start candidates"
+		return r
+	}
+	r.Status = doctor.StatusOK
+	r.Message = fmt.Sprintf("last tick %s ago, last start-execution phase %s (candidates=%d planned=%d)",
+		age.Round(time.Second), lastPhase.Round(time.Millisecond), st.StartCandidateCount, st.PlannedWakeCount)
+	return r
+}
+
+func (c *reconcilerTickHealthCheck) CanFix() bool { return false }
+
+func (c *reconcilerTickHealthCheck) Fix(_ *doctor.CheckContext) error { return nil }
+
+func (c *reconcilerTickHealthCheck) WarmupEligible() bool { return false }
 
 type buildDoctorChecksOpts struct {
 	Stderr               io.Writer
@@ -271,6 +361,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	controllerRunning := opts.ControllerRunning
 	register(doctor.NewControllerCheck(cityPath, controllerRunning))
 	register(doctor.NewSupervisorHTTPCheck(opts.SupervisorRunning))
+	register(newReconcilerTickHealthCheck(cityPath, controllerRunning))
 
 	if cfgErr == nil && cfg != nil {
 		cityName := loadedCityName(cfg, cityPath)

@@ -24,6 +24,15 @@ func RuntimeDataDir(cityRoot string) string {
 	return RuntimePath(cityRoot, "runtime")
 }
 
+// ReconcilerTickHealthFile returns the path to the session reconciler's
+// per-tick liveness gauge (.gc/runtime/reconciler-tick-health.json):
+// last-completed-tick timestamp and last start-execution phase duration,
+// written every tick so `gc doctor` can detect degraded tick cadence
+// (ga-r6lc7g) without depending on trace-segment parsing.
+func ReconcilerTickHealthFile(cityRoot string) string {
+	return RuntimePath(cityRoot, "runtime", "reconciler-tick-health.json")
+}
+
 // ControlDispatcherTraceDefaultPath returns the default control-dispatcher
 // workflow trace file under the canonical runtime root.
 func ControlDispatcherTraceDefaultPath(cityRoot string) string {

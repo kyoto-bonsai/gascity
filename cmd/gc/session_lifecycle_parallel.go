@@ -212,10 +212,65 @@ func wakeFairnessTime(c startCandidate) time.Time {
 // budget-limited tick rotates wakes across sessions instead of always deferring
 // the same back-of-order sessions. Stable on the original order for ties. Callers
 // must only sort within a dependency wave (every candidate's deps are satisfied).
+//
+// Pending-creates sort ahead of every re-wake as a primary key (ga-r6lc7g): a
+// pending-create candidate is racing a hard wall-clock lease expiry
+// (pendingCreateLeaseExpiredForRollbackInfo) that a re-wake candidate does not
+// carry, so under a budget-constrained tick a re-wake losing this tick's slot
+// just waits for the next one, while a pending-create losing it can roll back
+// and lose the session entirely. Within each tier the existing
+// least-recently-woken ordering is unchanged -- this only changes which tier
+// goes first, never the relative order inside a tier. This helps a tick that
+// DOES run choose better among its ready candidates; it cannot by itself
+// rescue a lease that expires because no tick ran at all during its window
+// (the ga-r6lc7g finding was degraded tick CADENCE, ~24min against a 10min
+// lease -- a separate, not-yet-fixed problem, probably upstream per ga-0re4hh).
 func sortCandidatesByWakeFairness(candidates []startCandidate) {
 	sort.SliceStable(candidates, func(i, j int) bool {
+		iPending, jPending := candidates[i].info.PendingCreateClaim, candidates[j].info.PendingCreateClaim
+		if iPending != jPending {
+			return iPending
+		}
 		return wakeFairnessTime(candidates[i]).Before(wakeFairnessTime(candidates[j]))
 	})
+}
+
+// maxEnumeratedCandidateSummaries caps the per-tick candidate-set trace field
+// (enumeratedStartCandidateSummaries) so a pathological tick with an unusually
+// large candidate list cannot inflate always-on baseline trace volume. Normal
+// ticks run one to a handful of candidates (MaxWakesPerTick budget), so this
+// is a defensive ceiling, not an expected truncation.
+const maxEnumeratedCandidateSummaries = 100
+
+// enumeratedStartCandidateSummaries renders the compact per-candidate detail
+// (bead id, session name, pending-create flag) that
+// session_reconcile.execute_planned_starts stamps onto the always-on baseline
+// trace. It exists so a bead that never gets far enough to attempt a start
+// (ga-r6lc7g: a pending-create lease can expire before any tick even
+// enumerates the bead as a candidate) is still visible in the trace as
+// "considered, not started" rather than leaving a silent gap indistinguishable
+// from "never looked at this session at all."
+func enumeratedStartCandidateSummaries(candidates []startCandidate) []map[string]any {
+	if len(candidates) == 0 {
+		return nil
+	}
+	n := len(candidates)
+	truncated := n > maxEnumeratedCandidateSummaries
+	if truncated {
+		n = maxEnumeratedCandidateSummaries
+	}
+	out := make([]map[string]any, 0, n+1)
+	for _, c := range candidates[:n] {
+		out = append(out, map[string]any{
+			"id":             c.info.ID,
+			"session_name":   c.name(),
+			"pending_create": c.info.PendingCreateClaim,
+		})
+	}
+	if truncated {
+		out = append(out, map[string]any{"truncated_remaining": len(candidates) - n})
+	}
+	return out
 }
 
 func (c startCandidate) logicalTemplate(cfg *config.City) string {
