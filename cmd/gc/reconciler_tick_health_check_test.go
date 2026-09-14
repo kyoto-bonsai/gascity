@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"testing"
 	"time"
 
@@ -27,7 +28,7 @@ func TestReconcilerTickHealthCheck_NoGaugeYet_Warns(t *testing.T) {
 
 func TestReconcilerTickHealthCheck_FreshHealthyGauge_OK(t *testing.T) {
 	cityDir := t.TempDir()
-	if err := reconcilerhealth.Record(fsys.OSFS{}, cityDir, 3*time.Second, 2, 1); err != nil {
+	if err := reconcilerhealth.Record(fsys.OSFS{}, cityDir, 3*time.Second, 2, 1, io.Discard); err != nil {
 		t.Fatalf("seeding gauge: %v", err)
 	}
 	c := newReconcilerTickHealthCheck(cityDir, true)
@@ -39,7 +40,7 @@ func TestReconcilerTickHealthCheck_FreshHealthyGauge_OK(t *testing.T) {
 
 func TestReconcilerTickHealthCheck_StaleTick_BlockingError(t *testing.T) {
 	cityDir := t.TempDir()
-	if err := reconcilerhealth.Record(fsys.OSFS{}, cityDir, time.Second, 1, 1); err != nil {
+	if err := reconcilerhealth.Record(fsys.OSFS{}, cityDir, time.Second, 1, 1, io.Discard); err != nil {
 		t.Fatalf("seeding gauge: %v", err)
 	}
 	// Backdate the gauge past the staleness limit by writing it directly --
@@ -63,7 +64,7 @@ func TestReconcilerTickHealthCheck_StaleTick_BlockingError(t *testing.T) {
 
 func TestReconcilerTickHealthCheck_SlowWave_BlockingError(t *testing.T) {
 	cityDir := t.TempDir()
-	if err := reconcilerhealth.Record(fsys.OSFS{}, cityDir, reconcilerTickWaveLimit+time.Second, 1, 1); err != nil {
+	if err := reconcilerhealth.Record(fsys.OSFS{}, cityDir, reconcilerTickWaveLimit+time.Second, 1, 1, io.Discard); err != nil {
 		t.Fatalf("seeding gauge: %v", err)
 	}
 	c := newReconcilerTickHealthCheck(cityDir, true)

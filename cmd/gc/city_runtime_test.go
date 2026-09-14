@@ -234,7 +234,26 @@ func TestCityRuntimeBeadReconcileTick_BootDoesNotBlockOnWispSweep(t *testing.T) 
 	}
 
 	// Steady-state tick MUST reach the wisp-tier sweep read.
-	go cr.beadReconcileTick(context.Background(), result(), snap(), nil, false)
+	//
+	// ga-r6lc7g / persona-ava round-2: this goroutine used to be un-joined --
+	// the test only waited for store.hit (fired mid-tick, well before the
+	// tick actually finishes) and then returned, leaving beadReconcileTick
+	// still running on its own goroutine past the test function's return.
+	// Go's t.TempDir() cleanup (registered via t.Cleanup, fires when this
+	// function returns) could then race whatever that still-running tick
+	// does with cityPath -- reproduced via
+	// internal/reconcilerhealth.Record's cityPath/.gc/runtime/ write
+	// (added by a later diff) racing os.RemoveAll and intermittently
+	// failing with "directory not empty" (11/30 on -count=30, 0/30 on the
+	// commit before that diff). The write was what SURFACED the race, but
+	// the race itself -- an un-joined background goroutine outliving the
+	// test that started it, mutating a directory the test's own cleanup
+	// then removes -- was already there and would bite the next thing that
+	// makes ANY filesystem write reachable from this path, not just this
+	// one gauge. Join it properly: wait for the steady-state tick to
+	// actually finish before returning, same pattern as bootDone above.
+	steadyDone := make(chan struct{})
+	go func() { cr.beadReconcileTick(context.Background(), result(), snap(), nil, false); close(steadyDone) }()
 	select {
 	case <-store.hit:
 		// good: the steady-state tick ran the sweep and reached the wisp read.
@@ -242,6 +261,11 @@ func TestCityRuntimeBeadReconcileTick_BootDoesNotBlockOnWispSweep(t *testing.T) 
 		t.Fatal("steady-state reconcile did not reach the wisp-tier sweep read; sweep did not run")
 	}
 	unblock()
+	select {
+	case <-steadyDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("steady-state reconcile did not finish after unblock; goroutine leaked past test return")
+	}
 }
 
 func TestPoolSweepWouldDrain(t *testing.T) {

@@ -20,6 +20,8 @@ package reconcilerhealth
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -81,8 +83,47 @@ func Load(fs fsys.FS, cityPath string) (State, error) {
 // a concurrent writer racing this read-modify-write can under-count, which
 // is acceptable for a liveness gauge that only needs "count is roughly
 // increasing," never an exact total). LastTickCompletedAt is stamped to
-// now(); callers pass everything else.
-func Record(fs fsys.FS, cityPath string, phaseDuration time.Duration, startCandidateCount, plannedWakeCount int) error {
+// now(); callers pass everything else. log receives one diagnostic line for
+// a benign no-op (see below); pass io.Discard to suppress it. Record never
+// returns a non-nil error for a condition a caller should treat as fatal or
+// even noteworthy beyond logging -- see the doc on the cityPath-vanished
+// case below.
+//
+// ga-r6lc7g / ga-78s673 hardening (persona-ava's round-2 validation,
+// 2026-09-14): a reconciler tick runs on a background goroutine relative to
+// whatever else might be concurrently tearing down or moving cityPath (a
+// test's t.TempDir() cleanup is the proven case -- see
+// TestRecord_ToleratesConcurrentCityPathRemoval -- but nothing here assumes
+// it's ONLY tests; a city directory disappearing out from under a live
+// process is exactly the kind of thing a best-effort liveness gauge must
+// survive, not propagate). Before this hardening, a write that raced a
+// directory removal could recreate cityPath/.gc/runtime/<file> in a
+// directory a concurrent os.RemoveAll had already listed as empty,
+// producing "directory not empty" in the REMOVER, not here -- Record itself
+// often returned nil (a "successful" write to a path about to vanish
+// anyway). The fix is to check immediately before writing whether cityPath
+// itself is still present and, if not, skip the write entirely rather than
+// recreate content in a directory something else believes is empty. This
+// narrows the race window; it cannot make it zero-width (TOCTOU is
+// unavoidable from the writer's side alone against a concurrent, unrelated
+// remover) -- the actually-sufficient fix for the reproduced test flake is
+// synchronizing the racing goroutine so it never overlaps cityPath removal
+// in the first place. This hardening is defense in depth for every OTHER
+// case (a vanished city directory this package cannot control the timing
+// of), logged and swallowed rather than bubbled up as a tick-recording
+// failure.
+func Record(fs fsys.FS, cityPath string, phaseDuration time.Duration, startCandidateCount, plannedWakeCount int, log io.Writer) error {
+	if log == nil {
+		log = io.Discard
+	}
+	if _, err := fs.Lstat(cityPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(log, "reconcilerhealth: skipping tick-health write: city path %q no longer exists (benign -- likely mid-teardown)\n", cityPath) //nolint:errcheck // best-effort diagnostics
+			return nil
+		}
+		return err
+	}
+
 	prior, err := Load(fs, cityPath)
 	if err != nil {
 		// A corrupt or unreadable prior file must not block the reconciler
@@ -98,6 +139,10 @@ func Record(fs fsys.FS, cityPath string, phaseDuration time.Duration, startCandi
 	}
 	p := citylayout.ReconcilerTickHealthFile(cityPath)
 	if err := fs.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(log, "reconcilerhealth: skipping tick-health write: %v (benign -- city path removed concurrently)\n", err) //nolint:errcheck // best-effort diagnostics
+			return nil
+		}
 		return err
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
@@ -105,5 +150,12 @@ func Record(fs fsys.FS, cityPath string, phaseDuration time.Duration, startCandi
 		return err
 	}
 	data = append(data, '\n')
-	return fsys.WriteFileAtomic(fs, p, data, 0o644)
+	if err := fsys.WriteFileAtomic(fs, p, data, 0o644); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(log, "reconcilerhealth: skipping tick-health write: %v (benign -- city path removed concurrently)\n", err) //nolint:errcheck // best-effort diagnostics
+			return nil
+		}
+		return err
+	}
+	return nil
 }

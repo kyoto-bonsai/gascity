@@ -4378,7 +4378,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// degrade the gauge's freshness, so errors are swallowed after a
 	// diagnostic line.
 	if cityPath != "" {
-		if err := reconcilerhealth.Record(fsys.OSFS{}, cityPath, time.Since(phaseStart), len(startCandidates), plannedWakes); err != nil {
+		if err := reconcilerhealth.Record(fsys.OSFS{}, cityPath, time.Since(phaseStart), len(startCandidates), plannedWakes, stderr); err != nil {
 			fmt.Fprintf(stderr, "session reconciler: warn: recording tick-health gauge: %v\n", err) //nolint:errcheck // best-effort diagnostics
 		}
 	}
