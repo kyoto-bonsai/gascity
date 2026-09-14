@@ -2,6 +2,7 @@ package nudgequeue
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -10,6 +11,111 @@ import (
 
 	"github.com/gastownhall/gascity/internal/clock"
 )
+
+// TestWithState_SkipsRewriteWhenUnchanged guards ga-cssm95: a no-op fn (the
+// common case for the poller fleet's list/claim-scan ticks, which run a
+// maintenance pass but usually find nothing to recover/prune/claim) must not
+// pay for a JSON marshal + atomic rewrite of state.json. Proven by seeding
+// the state file by hand in a form WithState's own MarshalIndent would never
+// produce (compact, single line) and confirming a no-op call leaves those
+// exact bytes untouched -- if a rewrite happened, the file would come back
+// re-indented even though the field values are unchanged.
+func TestWithState_SkipsRewriteWhenUnchanged(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Dir(StatePath(cityPath)), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	const handWritten = `{"pending":[{"id":"seed","agent":"a","source":"s","message":"m","created_at":"2026-01-01T00:00:00Z","deliver_after":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T00:00:00Z"}]}`
+	if err := os.WriteFile(StatePath(cityPath), []byte(handWritten), 0o644); err != nil {
+		t.Fatalf("seed state.json: %v", err)
+	}
+
+	if err := WithState(cityPath, func(_ *State) error {
+		return nil // no-op: the common poller-tick shape
+	}); err != nil {
+		t.Fatalf("WithState (no-op): %v", err)
+	}
+
+	got, err := os.ReadFile(StatePath(cityPath))
+	if err != nil {
+		t.Fatalf("reading state.json after no-op call: %v", err)
+	}
+	if string(got) != handWritten {
+		t.Fatalf("state.json was rewritten by a no-op WithState call: got %q, want untouched %q (ga-cssm95: this unconditional rewrite is what starves writers under poller load)", got, handWritten)
+	}
+}
+
+// TestWithState_WriterSucceedsUnderPollerLoad guards ga-cssm95: a real writer
+// (sling/mail/nudge -- anything that actually mutates the queue) must not
+// starve behind a fleet of no-op poller ticks hammering the same exclusive
+// lock. Models the production shape: ~50 concurrent `gc nudge poll` sidecars,
+// each re-entering WithState roughly every 2s and finding nothing to
+// recover/prune/claim on the overwhelming majority of ticks.
+//
+// The assertion here is deliberately just "did the write succeed at all",
+// not a tight wall-clock figure: WithState already self-enforces
+// defaultLockWaitTimeout internally, and a per-test absolute-millisecond
+// bound would be load-flaky on a busy box -- exactly the failure class this
+// bug itself is (ga-cssm95's writers weren't slow, they were failing
+// outright after the full 8s budget).
+func TestWithState_WriterSucceedsUnderPollerLoad(t *testing.T) {
+	cityPath := t.TempDir()
+
+	const pollers = 50
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < pollers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				// Mirrors the real poller's dominant-case tick: runs the
+				// same locked pass a maintenance/claim-scan call does and
+				// finds nothing to change. Errors are intentionally ignored
+				// here (a real poller just retries on its own schedule);
+				// the test's actual assertion is on the writer below.
+				_ = WithState(cityPath, func(_ *State) error { return nil })
+			}
+		}()
+	}
+	// Let the poller fleet reach steady-state contention before the writer
+	// joins, matching production where a writer arrives into an
+	// already-busy queue rather than racing pollers from a cold start.
+	time.Sleep(50 * time.Millisecond)
+
+	const writeID = "real-write"
+	writeErr := WithState(cityPath, func(state *State) error {
+		state.Pending = append(state.Pending, Item{ID: writeID, Agent: "a", Source: "s", Message: "m"})
+		return nil
+	})
+
+	close(stop)
+	wg.Wait()
+
+	if writeErr != nil {
+		t.Fatalf("WithState (real write) failed under %d-poller no-op load: %v (ga-cssm95: a writer must not time out behind no-op reader/maintenance ticks)", pollers, writeErr)
+	}
+
+	state, err := LoadState(cityPath)
+	if err != nil {
+		t.Fatalf("LoadState after write: %v", err)
+	}
+	found := false
+	for _, item := range state.Pending {
+		if item.ID == writeID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("real write did not persist despite WithState reporting success")
+	}
+}
 
 // TestWithState_TimesOutInsteadOfBlockingForever guards ga-2kzci3 FR1/FR2:
 // WithState itself -- not just the withStateBounded helper it wraps -- must

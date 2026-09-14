@@ -2,6 +2,7 @@
 package nudgequeue
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -164,9 +165,39 @@ func withStateBounded(cityPath string, waitTimeout time.Duration, clk clock.Cloc
 	if err != nil {
 		return err
 	}
+
+	// ga-cssm95: skip the marshal+atomic-rewrite when fn made no observable
+	// change. Every read-shaped caller (list/status/liveness/claim-scan
+	// paths) routes through this same exclusive lock and runs its
+	// maintenance/claim-scan pass inside fn regardless of whether there is
+	// anything to recover/prune/claim -- on a healthy queue that finds
+	// nothing to do on the overwhelming majority of calls. Under ~50
+	// concurrent poller ticks every ~2s, paying a full JSON marshal + fsync +
+	// rename on every no-op call is what was starving real writers
+	// (sling/mail/nudge) past their defaultLockWaitTimeout budget on a loaded
+	// box: that write was the dominant cost per critical section, not the
+	// lock acquisition itself.
+	//
+	// Compared via json.Marshal, deliberately not reflect.DeepEqual:
+	// DeepEqual on time.Time can report a difference from monotonic-clock
+	// reading noise alone even when the wall-clock value fn produced is
+	// identical; JSON has no concept of the monotonic reading, so marshaling
+	// both sides normalizes that away.
+	before, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal nudge queue (pre-check): %w", err)
+	}
 	if err := fn(&state); err != nil {
 		return err
 	}
+	after, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("marshal nudge queue: %w", err)
+	}
+	if bytes.Equal(before, after) {
+		return nil
+	}
+
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal nudge queue: %w", err)
