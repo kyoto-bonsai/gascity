@@ -1955,7 +1955,7 @@ func (m *nudgeMaintenanceStore) frontForState(state *nudgeQueueState) *nudgequeu
 func (m *nudgeMaintenanceStore) ensureOpen() beads.NudgesStore {
 	if !m.opened {
 		m.opened = true
-		m.store = openNudgeBeadStore(m.cityPath)
+		m.store = openNudgeBeadStoreBounded(m.cityPath, nudgeMaintenanceStoreOpenTimeout)
 		if m.store.Store != nil {
 			m.front = nudgeFrontDoor(m.store)
 		}

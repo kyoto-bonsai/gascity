@@ -31,6 +31,47 @@ var openNudgeBeadStore = func(cityPath string) beads.NudgesStore {
 	return store
 }
 
+// nudgeMaintenanceStoreOpenTimeout bounds nudgeMaintenanceStore.ensureOpen's
+// wait for openNudgeBeadStore (ga-cssm95, 2026-09-15 recurrence). ensureOpen
+// runs INSIDE the nudge queue's locked callback (see frontForState's doc
+// comment, which already flagged this as an unbounded holder path before
+// this fix landed) -- when the Dolt bead store is slow, an uncapped open
+// here pinned the flock for minutes and starved every 8s-bounded writer.
+//
+// Hardcoded to the SAME 8s value as internal/nudgequeue/state.go's
+// defaultLockWaitTimeout, deliberately not cross-package-referenced: that
+// constant is unexported (a different package, cmd/gc cannot see it without
+// exporting it, which this follow-on fix chose not to do to keep its diff
+// confined to cmd/gc -- the same package this whole holder-side lives in).
+// If defaultLockWaitTimeout's value ever changes, this one must change with
+// it by hand; that coupling is documented here and at the other end.
+const nudgeMaintenanceStoreOpenTimeout = 8 * time.Second
+
+// openNudgeBeadStoreBounded calls openNudgeBeadStore (the existing test seam
+// above) with a hard wall-clock bound. On timeout it returns the zero-value
+// beads.NudgesStore{} -- exactly what openNudgeBeadStore itself already
+// returns on an open error (see its own swallowed-error comment: "a nil
+// store means do nothing"), so a slow-but-eventually-successful open
+// degrades to "nothing to do this tick" via the SAME nil-tolerant contract
+// every maintenance pass already respects, not a new failure shape.
+//
+// The losing goroutine is deliberately abandoned rather than canceled:
+// openNudgeBeadStore has no cancellation hook to call, and closing a store
+// handle out from under a goroutine that might still be using it would be
+// worse than leaving it to finish (or fail) on its own. The result channel
+// is buffered so that goroutine's eventual send never blocks on a caller
+// who stopped listening.
+func openNudgeBeadStoreBounded(cityPath string, timeout time.Duration) beads.NudgesStore {
+	result := make(chan beads.NudgesStore, 1)
+	go func() { result <- openNudgeBeadStore(cityPath) }()
+	select {
+	case store := <-result:
+		return store
+	case <-time.After(timeout):
+		return beads.NudgesStore{}
+	}
+}
+
 // openNudgeBeadStoreErr is openNudgeBeadStore with the open failure kept instead
 // of swallowed into a nil-safe zero store.
 //
