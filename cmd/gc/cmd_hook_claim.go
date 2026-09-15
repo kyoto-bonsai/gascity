@@ -807,7 +807,11 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 			// try the next candidate. If none claim, claimsErrored makes the shared
 			// drain report claims_errored instead of a healthy no_work so the write
 			// failure stays visible; the work is reclaimed next tick (NDI) either way.
-			fmt.Fprintf(stderr, "gc hook --claim: skipping %s: %v\n", candidate.ID, err) //nolint:errcheck
+			//
+			// "FAILED TO CLAIM", not "skipping": this candidate was not passed over
+			// by a routing decision, its claim mutation errored (ga-k5ul2d) — an
+			// operator grepping logs for dropped dispatches will not find "skipping".
+			fmt.Fprintf(stderr, "gc hook --claim: FAILED TO CLAIM %s: %v\n", candidate.ID, err) //nolint:errcheck
 			claimsErrored = true
 			continue
 		}
@@ -1298,9 +1302,18 @@ func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.
 // terminal no-claim outcome: an idle no-work store, a claims-errored store, and a
 // refused stale session. For a --json caller it emits the schema-backed drain
 // line; when drainAck is set it first runs drainAckFn and marks the result
-// acknowledged. The exit code mirrors the historical contract — 0 once drain is
-// acknowledged, else 1 — so a non-drain-ack caller still reports action=drain
-// (a completed drain) rather than a bare failure.
+// acknowledged — this still happens for claims_errored (ga-k5ul2d): the runtime
+// drain/reclaim lifecycle is independent of why there was no work, and the work
+// itself is reclaimed on lease expiry (NDI) either way, so suppressing the ack
+// would only strand the session's own runtime state, not protect the bead.
+//
+// The exit code mirrors the historical contract for a genuinely idle drain — 0
+// once acknowledged, else 1 — EXCEPT for claims_errored: that reason always
+// exits non-zero, drain-ack or not (ga-k5ul2d). A dropped delivery is not the
+// same outcome as "nothing was routed", and a caller branching on exit code
+// alone (every pool seat's wake path) must be able to tell them apart without
+// also parsing --json output, which may not have been requested. Exit 0 is
+// reserved for "delivered work" and "genuinely nothing routed" only.
 //
 // label names the door that answered ("gc hook --claim" or "gc hook"). Every
 // caller but the drain-pending fence is claim-only, but that fence is reachable
@@ -1335,6 +1348,14 @@ func writeHookClaimDrain(label, reason string, jsonOut, drainAck bool, drainAckF
 			fmt.Fprintf(stderr, "%s: writing JSON: %v\n", label, err) //nolint:errcheck
 			return 1
 		}
+	}
+	// claims_errored always exits non-zero, drain-ack or not (ga-k5ul2d): a
+	// dropped delivery is not the same outcome as a genuinely idle drain. This
+	// check comes after the JSON write above (the ackFailed guarantee: a --json
+	// caller always gets the record) but ahead of the ack-success return below,
+	// so a successful ack can never mask a dropped claim.
+	if reason == hookClaimReasonClaimsErrored {
+		return 1
 	}
 	if drainAck && !ackFailed {
 		return 0

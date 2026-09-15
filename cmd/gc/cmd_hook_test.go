@@ -3065,10 +3065,14 @@ func TestDoHookClaimDrainsClaimsErroredWhenEveryCandidateErrors(t *testing.T) {
 	// When a store reports ready work but EVERY eligible candidate's claim
 	// mutation errors — the can-read-but-can't-write window of store contention
 	// or a controller-socket flap between the work query and the claim — the hook
-	// must still drain (the work is reclaimed next tick via NDI) but must surface
-	// a distinct claims_errored reason. Laundering an operational write failure
-	// into a healthy no_work idle would hide sustained contention from any monitor
-	// keying on the drain reason.
+	// must still drain-ack (the runtime reclaims the seat; the WORK is reclaimed
+	// separately, next tick via NDI, regardless of exit code) but the exit code
+	// must be non-zero: a dropped delivery is not "nothing was routed" (ga-k5ul2d
+	// defect 1). Laundering an operational write failure into a 0 exit would hide
+	// sustained contention from every pool seat's wake path, which branches on
+	// exit code alone. The JSON reason (asserted below) stays claims_errored
+	// either way — that distinction existed before ga-k5ul2d; only the exit code
+	// was wrong.
 	var attempts []string
 	runner := func(string, string) (string, error) {
 		return `[
@@ -3098,21 +3102,24 @@ func TestDoHookClaimDrainsClaimsErroredWhenEveryCandidateErrors(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("doHookClaim(all candidates error) = %d, want 0; stderr=%s", code, stderr.String())
+	if code != 1 {
+		t.Fatalf("doHookClaim(all candidates error) = %d, want 1 (ga-k5ul2d: a dropped delivery is not a healthy drain); stderr=%s", code, stderr.String())
 	}
 	if !drained {
-		t.Fatal("drain ack was not called")
+		t.Fatal("drain ack was not called — a non-zero exit must not suppress the runtime reclaim")
 	}
 	if got := strings.Join(attempts, ","); got != "hw-a,hw-b" {
 		t.Fatalf("claim attempts = %q, want hw-a,hw-b (every eligible candidate attempted before drain)", got)
+	}
+	if !strings.Contains(stderr.String(), "FAILED TO CLAIM hw-a") || !strings.Contains(stderr.String(), "FAILED TO CLAIM hw-b") {
+		t.Fatalf("stderr = %q, want FAILED TO CLAIM for both candidates (ga-k5ul2d: a write failure is not a routing \"skip\")", stderr.String())
 	}
 	var result hookClaimJSONResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
 	}
-	if result.Action != "drain" || result.Reason != "claims_errored" {
-		t.Fatalf("claim result = %+v, want drain/claims_errored (operational write failure kept visible)", result)
+	if result.Action != "drain" || result.Reason != "claims_errored" || !result.DrainAcknowledged {
+		t.Fatalf("claim result = %+v, want drain/claims_errored/acknowledged (operational write failure kept visible, reclaim still ran)", result)
 	}
 }
 
@@ -3120,7 +3127,9 @@ func TestClaimHookWorkDrainsClaimsErroredWhenEveryCandidateErrors(t *testing.T) 
 	// The federated drain must carry the claims_errored signal too: a store
 	// reports ready work, but every claim against its captured rows errors, so the
 	// store is exhausted and the shared drain fires. The reason must distinguish
-	// the write-path failure from an ordinary idle no_work.
+	// the write-path failure from an ordinary idle no_work, and (ga-k5ul2d) so
+	// must the exit code: a dropped delivery exits non-zero even under
+	// --drain-ack, since every pool seat's wake path branches on exit code alone.
 	stores := []hookStore{
 		{dir: "city", env: []string{"GC_STORE=city"}},
 	}
@@ -3149,8 +3158,8 @@ func TestClaimHookWorkDrainsClaimsErroredWhenEveryCandidateErrors(t *testing.T) 
 	emitted := false
 	var stdout, stderr bytes.Buffer
 	code := claimHookWorkWithRunner("bd ready --json", "city", stores[0].env, stores, opts, ops, run, func(string, error) { emitted = true }, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("claimHookWorkWithRunner(all candidates error) = %d, want 0; stderr=%s", code, stderr.String())
+	if code != 1 {
+		t.Fatalf("claimHookWorkWithRunner(all candidates error) = %d, want 1 (ga-k5ul2d); stderr=%s", code, stderr.String())
 	}
 	if emitted {
 		t.Fatal("a skipped claim error is not a work-query failure and must not emit one")
@@ -3159,8 +3168,8 @@ func TestClaimHookWorkDrainsClaimsErroredWhenEveryCandidateErrors(t *testing.T) 
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
 	}
-	if result.Action != "drain" || result.Reason != "claims_errored" {
-		t.Fatalf("claim result = %+v, want drain/claims_errored", result)
+	if result.Action != "drain" || result.Reason != "claims_errored" || !result.DrainAcknowledged {
+		t.Fatalf("claim result = %+v, want drain/claims_errored/acknowledged", result)
 	}
 }
 

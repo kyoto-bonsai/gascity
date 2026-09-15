@@ -335,13 +335,23 @@ func isBdErrorLine(line string) bool {
 // gc.current_run_id write budget), it reports that effective budget so the
 // failure is not misreported as the much larger per-command bd timeout; when
 // the per-command timer wins, it reports that timeout unchanged.
+//
+// The caller-deadline branch also reports the real elapsed wall-clock time
+// (ga-k5ul2d, defect (d)): budget is how much time was LEFT when this attempt
+// started, which is frequently 0 (or clamped to it) when an already-exhausted
+// parent context was starved of scheduling before this exec even began — under
+// severe store contention that has measured as "timed out after 0s" on a call
+// that ran 39s of real wall-clock. Read alone, 0s points a diagnostician at an
+// unset/zero deadline instead of a starved store; elapsed gives the number that
+// actually answers "how long did this hang".
 func bdExecTimeoutError(parent context.Context, timeout time.Duration, start time.Time) error {
+	elapsed := time.Since(start)
 	if deadline, ok := parent.Deadline(); ok && deadline.Before(start.Add(timeout)) {
 		budget := deadline.Sub(start)
 		if budget < 0 {
 			budget = 0
 		}
-		return fmt.Errorf("timed out after %s (caller deadline)", budget.Round(time.Millisecond))
+		return fmt.Errorf("timed out after %s budget (caller deadline; %s elapsed)", budget.Round(time.Millisecond), elapsed.Round(time.Millisecond))
 	}
 	return fmt.Errorf("timed out after %s", timeout)
 }
