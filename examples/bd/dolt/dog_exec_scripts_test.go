@@ -343,6 +343,32 @@ func rewriteLegacyPendingPushMarker(t *testing.T, markerPath, createdAt string) 
 	}
 }
 
+// writeLegacyQuarantineMarker constructs a quarantine marker in the shape
+// written before write_quarantine_marker() started recording the
+// structured-evidence fields (flatten_preflight_head and its siblings) --
+// db/reason/created_at plus the notify-bookkeeping fields only. Mirrors
+// production's real hq marker (created 2026-06-02, predates the format).
+func writeLegacyQuarantineMarker(t *testing.T, fixture compactScriptFixture, reason string) string {
+	t.Helper()
+	dir := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir quarantine dir: %v", err)
+	}
+	marker := filepath.Join(dir, "beads")
+	content := "db=beads\n" +
+		"reason=" + reason + "\n" +
+		"created_at=2026-06-02T23:24:58Z\n" +
+		"seen_count=190\n" +
+		"notify_count=3\n" +
+		"last_notified_ts=2026-09-15T03:03:34Z\n" +
+		"last_notified_reason=" + reason + "\n" +
+		"last_notify_error=\n"
+	if err := os.WriteFile(marker, []byte(content), 0o600); err != nil {
+		t.Fatalf("write legacy quarantine marker: %v", err)
+	}
+	return marker
+}
+
 func writeBSDOnlyDate(t *testing.T, binDir string) {
 	t.Helper()
 	writeExecutable(t, filepath.Join(binDir, "date"), `#!/bin/sh
@@ -4127,6 +4153,85 @@ func TestCompactScriptAutoClearsRaceClassQuarantineWhenDriftConfinedToKnownTable
 	}
 }
 
+// TestCompactScriptBackfillsMissingFlattenPreflightHeadOnLegacyQuarantineMarker
+// covers ga-0re4hh's bootstrap-deadlock finding: a marker written before
+// write_quarantine_marker() started recording flatten_preflight_head (e.g.
+// production's real hq marker, created 2026-06-02) can never populate that
+// field through the normal report_existing_quarantine path -- it patches
+// only notify bookkeeping (seen_count/notify_count/last_notified_*), never
+// the evidence fields. Without a baseline, the auto-clear proof below can
+// never even attempt to run: diffing an empty "from" fails closed by
+// construction. Cycle 1 must detect the missing baseline, backfill it from
+// a fresh HEAD read, and defer (report-existing, not hard-attempt-and-fail)
+// -- preserving every pre-existing field. Cycle 2, now that a baseline
+// exists, must be able to actually attempt (and here, succeed) the real
+// proof -- proving the marker is no longer permanently stuck.
+func TestCompactScriptBackfillsMissingFlattenPreflightHeadOnLegacyQuarantineMarker(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	reason := "post-flatten table value hash changed without row-count increase"
+	marker := writeLegacyQuarantineMarker(t, fixture, reason)
+
+	preData, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read seeded marker: %v", err)
+	}
+	if strings.Contains(string(preData), "flatten_preflight_head=") {
+		t.Fatalf("test setup: legacy marker must start without flatten_preflight_head:\n%s", preData)
+	}
+
+	firstOut, err := fixture.run(t, "success", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("cycle 1 against a still-quarantined db should not succeed:\n%s", firstOut)
+	}
+	if !strings.Contains(firstOut, "backfilling baseline") {
+		t.Fatalf("output missing backfill notice:\n%s", firstOut)
+	}
+	if strings.Contains(firstOut, "cannot auto-clear") {
+		t.Fatalf("missing-baseline case must defer, not attempt-and-fail the proof:\n%s", firstOut)
+	}
+	if !strings.Contains(firstOut, "integrity quarantine marker exists") {
+		t.Fatalf("missing-baseline case must still report the existing quarantine:\n%s", firstOut)
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("backfill must not remove the quarantine marker: %v", statErr)
+	}
+	if backfilled := compactMarkerValue(t, marker, "flatten_preflight_head"); backfilled == "" {
+		t.Fatalf("cycle 1 should have backfilled a non-empty flatten_preflight_head")
+	}
+	if got := compactMarkerValue(t, marker, "reason"); got != reason {
+		t.Fatalf("backfill must not alter reason: got %q want %q", got, reason)
+	}
+	if got := compactMarkerValue(t, marker, "created_at"); got != "2026-06-02T23:24:58Z" {
+		t.Fatalf("backfill must preserve the original created_at, got %q", got)
+	}
+	if got := compactMarkerValue(t, marker, "seen_count"); got != "191" {
+		t.Fatalf("cycle 1 should still bump seen_count via the normal report path, got %q", got)
+	}
+	doltLogData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	if strings.Contains(string(doltLogData), "DOLT_GC") {
+		t.Fatalf("a deferred backfill cycle must not run full GC:\n%s", doltLogData)
+	}
+
+	// Cycle 2: a baseline now exists, so the real proof can finally attempt
+	// to run. Reuses the mode
+	// TestCompactScriptAutoClearsRaceClassQuarantineWhenDriftConfinedToKnownTables
+	// already proves confines drift to known, content-preserved tables, from
+	// the same "headcommit" baseline this backfill produces.
+	secondOut, err := fixture.run(t, "quarantine_autoclear_confined", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("cycle 2 should auto-clear now that a real baseline exists: %v\n%s", err, secondOut)
+	}
+	if !strings.Contains(secondOut, "quarantine marker auto-cleared") {
+		t.Fatalf("output missing auto-clear notice:\n%s", secondOut)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("cycle 2 should have cleared the marker; stat err=%v", statErr)
+	}
+}
+
 // TestCompactScriptQuarantineProbeFailureHardBlocksAutoClear covers exit
 // point 4 of the auto-clear contract: when the preservation probe itself
 // cannot run (table discovery fails), the marker must NOT be cleared, the
@@ -6490,7 +6595,7 @@ func TestCompactScriptStillQuarantinesRowDecreaseWithStableHead(t *testing.T) {
 // HEAD-only bracket would have quarantined it, which is the 68-day bug.
 //
 // It must also not write a pending-GC marker. That marker means "verification
-// passed, only the GC step is outstanding", and the next run honours it by
+// passed, only the GC step is outstanding", and the next run honors it by
 // calling run_full_gc directly — a bare CALL DOLT_GC('--full') with no
 // re-verification. Handing an UNRESOLVED per-table drift to that path would
 // irreversibly reclaim the pre-flatten history the fixed-commit fallback needs,

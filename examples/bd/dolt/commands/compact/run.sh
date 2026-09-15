@@ -1801,6 +1801,46 @@ record_marker_notify_state() {
   return 0
 }
 
+# backfill_quarantine_preflight_head DIR DB HEAD
+#   One-time bootstrap for a quarantine marker written before
+#   write_quarantine_marker() started recording flatten_preflight_head:
+#   patches HEAD in as the missing auto-clear baseline, preserving every
+#   other field byte-for-byte. Same preserve-the-rest shape as
+#   record_marker_notify_state above, inverted to patch the evidence field
+#   instead of the notify-bookkeeping fields. A missing marker or write
+#   failure is a silent no-op — bootstrap backfill must never block or fail
+#   compaction, same contract as record_marker_notify_state.
+backfill_quarantine_preflight_head() {
+  _bf_dir="$1"
+  _bf_db="$2"
+  _bf_head="$3"
+
+  _bf_marker=$(compact_marker_path "$_bf_dir" "$_bf_db")
+  [ -f "$_bf_marker" ] && [ -r "$_bf_marker" ] || return 0
+
+  _bf_old_umask=$(umask)
+  umask 077
+  _bf_tmp=$(mktemp "$_bf_dir/$_bf_db.tmp.XXXXXX") || {
+    umask "$_bf_old_umask"
+    return 0
+  }
+  umask "$_bf_old_umask"
+  if ! awk '!/^flatten_preflight_head=/' "$_bf_marker" > "$_bf_tmp" 2>/dev/null; then
+    rm -f "$_bf_tmp"
+    return 0
+  fi
+  if ! printf 'flatten_preflight_head=%s\n' "$_bf_head" >> "$_bf_tmp" 2>/dev/null; then
+    rm -f "$_bf_tmp"
+    return 0
+  fi
+  if ! grep -q '^db=' "$_bf_tmp" 2>/dev/null; then
+    rm -f "$_bf_tmp"
+    return 0
+  fi
+  mv -f "$_bf_tmp" "$_bf_marker" || rm -f "$_bf_tmp"
+  return 0
+}
+
 # report_existing_quarantine DB
 #   Diagnostic + alert path for a compact/bare-gc invocation that hit an
 #   already-quarantined database. The event still fires every cycle; the
@@ -2457,6 +2497,30 @@ flatten_database() {
     case "${quarantine_reason:-}" in
       "post-flatten table value hash changed without row-count increase"|"post-flatten value hash changed without row-count increase"|"post-flatten table value hash changed with row-count increase"|"post-flatten value hash changed with row-count increase")
         autoclear_preflight_head=$(compact_marker_value "$quarantine_dir" "$db" flatten_preflight_head || true)
+        if [ -z "$autoclear_preflight_head" ]; then
+          # Marker predates write_quarantine_marker() recording
+          # flatten_preflight_head (created before this evidence field
+          # existed). The auto-clear proof needs it as the diff "from"
+          # point and has no other source for one -- report_existing_
+          # quarantine never writes it (patches only notify bookkeeping),
+          # so without this backfill a pre-existing marker can never
+          # acquire a baseline and the proof below can never even attempt
+          # to run, cycle after cycle, forever. Backfill from a fresh HEAD
+          # read and defer the actual proof to the next cycle: diffing a
+          # baseline against itself would report no drift, which
+          # diff_stat_preserved_tables treats as a failed proof (nothing
+          # to confirm), not a vacuous pass.
+          if bootstrap_head=$(head_commit "$db") && [ -n "$bootstrap_head" ]; then
+            printf 'compact: db=%s quarantine marker predates flatten_preflight_head evidence — backfilling baseline=%s from live HEAD, auto-clear proof deferred to next cycle\n' \
+              "$db" "$bootstrap_head" >&2
+            backfill_quarantine_preflight_head "$quarantine_dir" "$db" "$bootstrap_head"
+          else
+            printf 'compact: db=%s quarantine marker predates flatten_preflight_head evidence and live HEAD probe failed — cannot backfill baseline\n' \
+              "$db" >&2
+          fi
+          report_existing_quarantine "$db"
+          return 1
+        fi
         autoclear_preserved_tables_tmp=$(mktemp)
         if autoclear_current_head=$(head_commit "$db") && [ -n "$autoclear_current_head" ] && \
            diff_stat_preserved_tables "$db" "$autoclear_preflight_head" "$autoclear_current_head" > "$autoclear_preserved_tables_tmp" && \
