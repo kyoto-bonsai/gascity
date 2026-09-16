@@ -13,6 +13,29 @@ import (
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
 )
 
+// assertAuthoritativeFold compares an in-memory "folded" Info (built by
+// applying a metadata patch onto the pre-write Info -- see
+// normalizeNonExpandingPoolSessionInfo / recordDeferredNonExpandingPoolAliasConflictInfo)
+// against a fresh post-write re-read, EXCEPT for UpdatedAt (ga-r1wouq added
+// it to session.Info): the fold can only simulate what the CALLER's
+// metadata patch changes, never the store's own internal write-time
+// bookkeeping -- ApplyPatch's metadata-only simulation has no way to
+// predict a value the store engine assigns at write time, and these
+// functions' "authoritative" claim was never about that field. persisted's
+// UpdatedAt is checked non-zero first, so a store that silently stops
+// stamping writes still fails loudly here, just not via the fold
+// comparison.
+func assertAuthoritativeFold(t *testing.T, label string, folded, persisted session.Info) {
+	t.Helper()
+	if persisted.UpdatedAt.IsZero() {
+		t.Errorf("%s: persisted.UpdatedAt is zero -- store did not stamp the write", label)
+	}
+	folded.UpdatedAt = persisted.UpdatedAt
+	if !reflect.DeepEqual(folded, persisted) {
+		t.Errorf("%s did not return the authoritative persisted value (UpdatedAt excluded from the comparison):\n folded=%+v\n persisted=%+v", label, folded, persisted)
+	}
+}
+
 // wpoolSessionBead builds an open (or closed) session bead for the W-pool twin
 // oracles.
 func wpoolSessionBead(id, status, title string, labels []string, meta map[string]string) beads.Bead {
@@ -305,9 +328,7 @@ func TestNormalizeNonExpandingPoolSessionInfoIsAuthoritative(t *testing.T) {
 	if err != nil {
 		t.Fatalf("info store Get: %v", err)
 	}
-	if !reflect.DeepEqual(foldedInfo, infoPersisted) {
-		t.Errorf("normalize did not return the authoritative persisted value:\n folded=%+v\n persisted=%+v", foldedInfo, infoPersisted)
-	}
+	assertAuthoritativeFold(t, "normalize", foldedInfo, infoPersisted)
 }
 
 // TestRecordDeferredNonExpandingPoolAliasConflictInfoFold pins the deferred-conflict
@@ -338,9 +359,7 @@ func TestRecordDeferredNonExpandingPoolAliasConflictInfoFold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("info store Get: %v", err)
 	}
-	if !reflect.DeepEqual(foldedInfo, infoPersisted) {
-		t.Errorf("recordDeferred did not return the authoritative persisted value:\n folded=%+v\n persisted=%+v", foldedInfo, infoPersisted)
-	}
+	assertAuthoritativeFold(t, "recordDeferred", foldedInfo, infoPersisted)
 }
 
 // TestRecordDeferredNonExpandingPoolAliasConflictInfoBackoff pins the fix for the

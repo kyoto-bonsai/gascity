@@ -95,7 +95,17 @@ type Info struct {
 	ResumeStyle   string // "flag" or "subcommand"
 	ResumeCommand string // explicit resume command template ({{.SessionKey}})
 	CreatedAt     time.Time
-	LastActive    time.Time
+	// UpdatedAt mirrors the bead's own UpdatedAt (bead-level, not metadata-
+	// derived — set directly in infoFromPersistedBead's prologue, exactly
+	// like CreatedAt). Bumped by any metadata write, so it is a reliable
+	// staleness signal for the PURE bead-snapshot read path (loadSessionBeadSnapshot
+	// / InfoFromPersistedBead), unlike LastActive below, which stays the zero
+	// value there — it is populated only by Manager.EnrichInfo's live runtime
+	// probe (GetLastActivity), a codepath the plain snapshot never invokes.
+	// ga-r1wouq: the provider seat cap needed a freshness signal available
+	// without a live probe; this is that signal.
+	UpdatedAt  time.Time
+	LastActive time.Time
 	// LastNudgeDeliveredAt records the wall-clock time of the most recent
 	// successful nudge delivery to this session. Zero when no nudge has
 	// been delivered yet (or the metadata predates the stamping path).

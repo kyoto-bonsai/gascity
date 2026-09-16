@@ -28,6 +28,7 @@ func infoFromPersistedBead(b beads.Bead) Info {
 		Title:     b.Title,
 		Labels:    b.Labels,
 		CreatedAt: b.CreatedAt,
+		UpdatedAt: b.UpdatedAt,
 		Closed:    b.Status == "closed",
 	}
 	// Project every metadata-derived field through the shared codec table. An

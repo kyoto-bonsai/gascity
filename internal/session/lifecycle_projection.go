@@ -940,8 +940,24 @@ func projectDesiredState(input LifecycleInput, terminal bool, blockers []Lifecyc
 }
 
 func countsAgainstCapacity(base BaseState) bool {
-	switch base {
-	case BaseStateStartPending, BaseStateCreating, BaseStateActive, BaseStateDraining, BaseStateQuarantined:
+	return CountsAgainstCapacity(compatStateForBase(base))
+}
+
+// CountsAgainstCapacity reports whether a session in the given (exported,
+// compat) State should be counted against a concurrency cap — pool
+// occupancy (countsAgainstCapacity's BaseState caller) or a provider's
+// ratified seat cap (ga-r1wouq, cmd/gc's checkProviderSeatCap). A session
+// counts when it either owns a live runtime process now (Active, Awake —
+// the two raw metadata spellings that both project to BaseStateActive, see
+// projectBaseState), is imminently about to (StartPending, Creating), is
+// mid-shutdown but still holding resources (Draining), or is deliberately
+// held as still-occupying a slot by churn protection (Quarantined).
+// Asleep, Suspended, Drained/Stopped, FailedCreate, Archived, and Orphaned
+// sessions hold no runtime process and do not count — this is the single
+// source of truth both call sites share; do not hand-copy this switch.
+func CountsAgainstCapacity(state State) bool {
+	switch state {
+	case StateStartPending, StateCreating, StateActive, StateAwake, StateDraining, StateQuarantined:
 		return true
 	default:
 		return false

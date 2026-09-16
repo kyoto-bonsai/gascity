@@ -1170,3 +1170,66 @@ func lifecycleRepoRoot(t *testing.T) string {
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 }
+
+// TestCountsAgainstCapacity pins the exported policy (ga-r1wouq, cmd/gc's
+// provider seat cap): which states own -- or are about to own, or are
+// mid-shutdown but still holding -- a real runtime process, and which do
+// not. StateAwake is included alongside StateActive because both are real,
+// distinct raw metadata spellings a bead can carry (compatStateForBase
+// folds both onto BaseStateActive; there is no BaseStateAwake), so an
+// awake session must count exactly like an active one.
+func TestCountsAgainstCapacity(t *testing.T) {
+	counting := map[State]bool{
+		StateStartPending: true,
+		StateCreating:     true,
+		StateActive:       true,
+		StateAwake:        true,
+		StateDraining:     true,
+		StateQuarantined:  true,
+		StateAsleep:       false,
+		StateSuspended:    false,
+		StateFailedCreate: false,
+		StateArchived:     false,
+		State("drained"):  false,
+		State("stopped"):  false,
+		State("orphaned"): false,
+		State("closed"):   false,
+		State("closing"):  false,
+		State(""):         false,
+	}
+	for state, want := range counting {
+		t.Run(string(state)+"_or_empty", func(t *testing.T) {
+			if got := CountsAgainstCapacity(state); got != want {
+				t.Errorf("CountsAgainstCapacity(%q) = %v, want %v", state, got, want)
+			}
+		})
+	}
+}
+
+// TestCountsAgainstCapacityAgreesWithBaseStateProjection guards the
+// countsAgainstCapacity(BaseState) refactor (ga-r1wouq): it now delegates
+// to the exported CountsAgainstCapacity(State) via compatStateForBase, so
+// this proves that delegation reproduces the original policy for every
+// known BaseState -- the two must never silently diverge.
+func TestCountsAgainstCapacityAgreesWithBaseStateProjection(t *testing.T) {
+	allBaseStates := []BaseState{
+		BaseStateNone, BaseStateCreating, BaseStateStartPending, BaseStateActive,
+		BaseStateAsleep, BaseStateSuspended, BaseStateFailedCreate, BaseStateDraining,
+		BaseStateDrained, BaseStateArchived, BaseStateOrphaned, BaseStateClosed,
+		BaseStateClosing, BaseStateQuarantined, BaseStateStopped,
+	}
+	want := map[BaseState]bool{
+		BaseStateStartPending: true,
+		BaseStateCreating:     true,
+		BaseStateActive:       true,
+		BaseStateDraining:     true,
+		BaseStateQuarantined:  true,
+	}
+	for _, base := range allBaseStates {
+		t.Run(string(base)+"_or_none", func(t *testing.T) {
+			if got := countsAgainstCapacity(base); got != want[base] {
+				t.Errorf("countsAgainstCapacity(%q) = %v, want %v", base, got, want[base])
+			}
+		})
+	}
+}
