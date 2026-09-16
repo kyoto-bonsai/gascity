@@ -40,6 +40,13 @@ if [ -n "$staged_go_files" ]; then
   go run ./cmd/genschema
   git add docs/reference/schema/city-schema.json docs/reference/schema/city-schema.txt docs/reference/config.md docs/reference/cli.md
 
+  # Regenerate the Cobra command census so a commit adding/renaming a gc
+  # subcommand never ships a stale committed census (ga-wv1spb). Via `make`,
+  # not a raw `go run` like the steps above, so it inherits the icu4c CGO
+  # exports instead of widening ga-79sevz's trap by a fifth raw step.
+  make gen-command-census
+  git add cmd/gc/metrics_census_gen.go internal/productmetrics/command_ids_gen.go schemas/metrics/example/result.schema.json
+
   make vet
   # Heavy `go test` fan-out runs in .githooks/pre-push, not here (#3628).
   # Invoking `make test-fast-parallel` on every commit fired an
