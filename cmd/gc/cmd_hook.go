@@ -702,6 +702,12 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 	// work but every eligible claim mutation errored, so the shared drain below can
 	// report claims_errored instead of laundering a write failure into no_work.
 	claimsErrored := false
+	// claimsErroredNonOperational (ga-wt5p4u) stays true only if EVERY store that
+	// contributes to claimsErrored proved its own contribution non-operational
+	// (tryHookClaim's own merge already applies the same all-or-nothing rule
+	// within one store); one store with an unproven (possibly-operational)
+	// contribution taints the federated result for all of them.
+	claimsErroredNonOperational := true
 	for len(remaining) > 0 {
 		discovered, selected, err := selectStoreWithWorkRetrying(workQuery, remaining, primary, run)
 		if err != nil {
@@ -744,6 +750,9 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		}
 		if res.claimsErrored {
 			claimsErrored = true
+			if !res.claimsErroredNonOperational {
+				claimsErroredNonOperational = false
+			}
 		}
 		// This store reported ready work but the claim acquired nothing — every
 		// claimable row was lost to another claimant, none matched this session, or
@@ -753,7 +762,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		// signal to the shared drain.
 		remaining = removeHookStore(remaining, claimStore)
 	}
-	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, workDir, stdout, stderr)
+	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, claimsErrored && claimsErroredNonOperational, workDir, stdout, stderr)
 }
 
 // Claim-read retry pacing. A work-query ERROR is a failed read, and the failures

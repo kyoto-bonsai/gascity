@@ -329,6 +329,17 @@ type hookClaimResult struct {
 	// see-but-cannot-claim shape — is not laundered into an idle signal.
 	// Meaningless on a terminal result.
 	claimsErrored bool
+	// claimsErroredNonOperational narrows claimsErrored (ga-wt5p4u escaped
+	// defect on ga-k5ul2d): true only when EVERY contribution to claimsErrored
+	// is PROVEN non-operational — claimFirstReadyHookAssignment's
+	// hookClaimBeadIsElsewhere/hookClaimBindingRefusedTheClaim skip, never a
+	// genuine write/mutation failure (those short-circuit that function to a
+	// terminal result before this field is ever reached). claimFirstEligible
+	// HookCandidate does not distinguish reasons at all, so ANY of its own
+	// contribution keeps this false — a dropped delivery on that tier must
+	// still fail closed. Consulted only when claimsErrored is also true;
+	// meaningless otherwise.
+	claimsErroredNonOperational bool
 }
 
 func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps, stdout, stderr io.Writer) int {
@@ -336,7 +347,7 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 	if res.terminal {
 		return res.code
 	}
-	return writeHookClaimNoWork(opts, ops, res.claimsErrored, dir, stdout, stderr)
+	return writeHookClaimNoWork(opts, ops, res.claimsErrored, res.claimsErroredNonOperational, dir, stdout, stderr)
 }
 
 // tryHookClaim runs the work query for one store (dir, via ops.Runner) and
@@ -474,6 +485,15 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	// tier: both tiers feed ONE shared drain, and dropping the flag here would
 	// launder an assigned-tier write failure into a healthy no_work.
 	if !eligibleResult.terminal && readyResult.claimsErrored {
+		// ga-wt5p4u: only mark the merged result non-operational when the
+		// eligible tier itself found NOTHING wrong — i.e. readyResult is the
+		// ENTIRE reason claimsErrored is becoming true. If eligibleResult already
+		// had its own (unclassified, possibly-operational) claimsErrored, that
+		// contribution can't be proven benign, so the merge must not mark it
+		// non-operational just because readyResult's own half was.
+		if !eligibleResult.claimsErrored {
+			eligibleResult.claimsErroredNonOperational = readyResult.claimsErroredNonOperational
+		}
 		eligibleResult.claimsErrored = true
 	}
 	return eligibleResult
@@ -740,7 +760,12 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 		}
 		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, stdout, stderr)}
 	}
-	return hookClaimResult{claimsErrored: claimsErrored}
+	// Every claimsErrored=true return in this function is the hookClaimBeadIsElsewhere
+	// / hookClaimBindingRefusedTheClaim skip above: a genuine operational mutation
+	// failure on a bead this session already owns returns terminal, code:1
+	// directly (a few lines up) and never reaches here. So whenever this is
+	// true, it is PROVEN non-operational (ga-wt5p4u).
+	return hookClaimResult{claimsErrored: claimsErrored, claimsErroredNonOperational: claimsErrored}
 }
 
 // hookClaimBeadIsElsewhere reports whether a failed claim proves the bead is not
@@ -1214,16 +1239,24 @@ func warnHookClaimAwaitingParked(result hookClaimJSONResult, stderr io.Writer) {
 // eligible claim mutation errored — so an operational write failure stays
 // distinguishable from idle even though both still drain and reclaim next tick.
 //
+// claimsErroredNonOperational (ga-wt5p4u) narrows the EXIT CODE only, never the
+// reported reason: a claims_errored proven to be entirely the benign
+// "resolved elsewhere" shape (hookClaimBeadIsElsewhere / hookClaimBindingRefusedTheClaim)
+// still reports reason=claims_errored — a refused claim must not be laundered
+// into a healthy no_work — but does not force a non-zero exit the way a genuine
+// operational write failure must. Meaningless when claimsErrored is false.
+//
 // dir is the store context the diagnostics classification reads through; it is
 // used ONLY after the drain has been written. See recordDemandClaimDivergence:
 // a demand-spawned seat draining empty is either correct pull or a broken
 // agreement invariant, and the drain itself cannot tell an operator which.
-func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, claimsErrored bool, dir string, stdout, stderr io.Writer) int {
+func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, claimsErrored, claimsErroredNonOperational bool, dir string, stdout, stderr io.Writer) int {
 	reason := hookClaimReasonNoWork
 	if claimsErrored {
 		reason = hookClaimReasonClaimsErrored
 	}
-	code := writeHookClaimDrain(hookClaimLabel, reason, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
+	operationalFailure := claimsErrored && !claimsErroredNonOperational
+	code := writeHookClaimDrain(hookClaimLabel, reason, opts.JSON, opts.DrainAck, operationalFailure, ops.DrainAck, stdout, stderr)
 	// Strictly after the result: the drain is already written and its exit code
 	// is already decided, so nothing below can influence either.
 	if reason == hookClaimReasonNoWork {
@@ -1284,7 +1317,7 @@ func writeHookClaimDrainPending(label, sessionID string, opts hookClaimOptions, 
 		"%s: drain pending for this session; run: gc runtime drain-ack %s — then exit\n",
 		label, sessionID)
 
-	return writeHookClaimDrain(label, hookClaimReasonDrainPending, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
+	return writeHookClaimDrain(label, hookClaimReasonDrainPending, opts.JSON, opts.DrainAck, false, ops.DrainAck, stdout, stderr)
 }
 
 // writeHookClaimStaleSessionDrain emits the terminal result for a refused stale
@@ -1295,7 +1328,7 @@ func writeHookClaimDrainPending(label, sessionID string, opts hookClaimOptions, 
 // acknowledges drain and exits cleanly rather than seeing a bare exit 1 and
 // retrying the refusal forever.
 func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.Writer) int {
-	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonStaleSession, opts.JSON, opts.DrainAck, hookRuntimeDrainAck, stdout, stderr)
+	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonStaleSession, opts.JSON, opts.DrainAck, false, hookRuntimeDrainAck, stdout, stderr)
 }
 
 // writeHookClaimDrain writes the single structured drain result shared by every
@@ -1308,18 +1341,28 @@ func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.
 // would only strand the session's own runtime state, not protect the bead.
 //
 // The exit code mirrors the historical contract for a genuinely idle drain — 0
-// once acknowledged, else 1 — EXCEPT for claims_errored: that reason always
-// exits non-zero, drain-ack or not (ga-k5ul2d). A dropped delivery is not the
-// same outcome as "nothing was routed", and a caller branching on exit code
-// alone (every pool seat's wake path) must be able to tell them apart without
-// also parsing --json output, which may not have been requested. Exit 0 is
-// reserved for "delivered work" and "genuinely nothing routed" only.
+// once acknowledged, else 1 — EXCEPT for an operationalFailure claims_errored:
+// that case always exits non-zero, drain-ack or not (ga-k5ul2d). A dropped
+// delivery is not the same outcome as "nothing was routed", and a caller
+// branching on exit code alone (every pool seat's wake path) must be able to
+// tell them apart without also parsing --json output, which may not have been
+// requested. Exit 0 is reserved for "delivered work" and "genuinely nothing
+// routed" only.
+//
+// operationalFailure (ga-wt5p4u) is consulted ONLY when reason is claims_errored,
+// and only narrows the exit code, never the reported reason: a claims_errored
+// PROVEN to be the benign "resolved elsewhere" shape (class-fanout / assigned-
+// federation tiers skipping a bead this store cannot resolve, never a genuine
+// write/mutation failure) passes false here and follows the normal ack-based
+// exit path instead of forcing 1. Every other caller (drain-pending,
+// stale-session — neither reason is ever claims_errored) passes false; the
+// value is inert for them.
 //
 // label names the door that answered ("gc hook --claim" or "gc hook"). Every
 // caller but the drain-pending fence is claim-only, but that fence is reachable
 // through the DISCOVERY door too, and a hardcoded prefix would report the wrong
 // command to the operator reading the pane.
-func writeHookClaimDrain(label, reason string, jsonOut, drainAck bool, drainAckFn hookDrainAckFunc, stdout, stderr io.Writer) int {
+func writeHookClaimDrain(label, reason string, jsonOut, drainAck, operationalFailure bool, drainAckFn hookDrainAckFunc, stdout, stderr io.Writer) int {
 	result := hookClaimJSONResult{
 		SchemaVersion: "1",
 		OK:            true,
@@ -1349,12 +1392,15 @@ func writeHookClaimDrain(label, reason string, jsonOut, drainAck bool, drainAckF
 			return 1
 		}
 	}
-	// claims_errored always exits non-zero, drain-ack or not (ga-k5ul2d): a
-	// dropped delivery is not the same outcome as a genuinely idle drain. This
-	// check comes after the JSON write above (the ackFailed guarantee: a --json
-	// caller always gets the record) but ahead of the ack-success return below,
-	// so a successful ack can never mask a dropped claim.
-	if reason == hookClaimReasonClaimsErrored {
+	// An OPERATIONAL claims_errored always exits non-zero, drain-ack or not
+	// (ga-k5ul2d): a dropped delivery is not the same outcome as a genuinely
+	// idle drain. This check comes after the JSON write above (the ackFailed
+	// guarantee: a --json caller always gets the record) but ahead of the
+	// ack-success return below, so a successful ack can never mask a dropped
+	// claim. A claims_errored PROVEN non-operational (ga-wt5p4u) falls through
+	// to the same ack-based exit every other reason gets — the reason string
+	// still says claims_errored, only the exit code follows the normal path.
+	if reason == hookClaimReasonClaimsErrored && operationalFailure {
 		return 1
 	}
 	if drainAck && !ackFailed {
