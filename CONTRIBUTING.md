@@ -27,23 +27,6 @@ runs the fast CI-equivalent gates for local changes: `make lint`,
 `make vet`, and `make test` for Go changes, and `make check-docs` for
 Markdown/docs/spec changes.
 
-**ICU CGO flags for the hook's raw codegen steps.** The hook's Go codegen
-steps (`go run ./cmd/genspec`, `go generate ./internal/api/genclient`, `go
-run ./cmd/genschema`) run outside `make`, so they do **not** inherit the
-Makefile's `icu4c` auto-detection (see [README.md](README.md) for the ICU
-dependency itself). On macOS with a keg-only `icu4c`, export these before
-committing:
-
-```bash
-export CGO_CPPFLAGS="-I$(brew --prefix icu4c)/include"
-export CGO_LDFLAGS="-L$(brew --prefix icu4c)/lib"
-```
-
-Without them, the hook dies on a missing `unicode/regex.h` — *after*
-`golangci-lint` has already printed "0 issues.", leaving a staged index
-behind. That sequencing reads as a flaky, retry-able failure; it isn't —
-export the flags above first.
-
 **Dashboard SPA.** The dashboard at `cmd/gc/dashboard/web/` is a
 TypeScript SPA that talks directly to the supervisor's OpenAPI-typed
 endpoints. When `internal/api/openapi.json` or files under
