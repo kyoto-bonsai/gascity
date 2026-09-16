@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
 )
@@ -254,6 +255,134 @@ func TestSortCandidatesByWakeFairness_PendingCreatesPrecedeRewakes(t *testing.T)
 	for i := range wantOrder {
 		if gotOrder[i] != wantOrder[i] {
 			t.Fatalf("fairness sort order = %v, want %v (pending-create must lead, re-wake relative order must be unchanged)", gotOrder, wantOrder)
+		}
+	}
+}
+
+// TestSortCandidatesByWakeFairness_RewakeStarvedBySustainedPendingCreates was
+// a KNOWN-LIMITATION pin (ga-8nuqlp): sortCandidatesByWakeFairness's strict
+// categorical priority for the pending-create tier had no fairness floor, so
+// a re-wake could be starved indefinitely by sustained pending-create arrival
+// at or above the per-tick wake budget (DefaultMaxWakesPerTick = 5,
+// internal/config/config.go) -- not just deferred to "the next tick". This is
+// the finding's own reproduction: one re-wake starved 6h against 5
+// freshly-minted pending-creates.
+//
+// FLIPPED (ga-yjbz92, the FULL deliverable): applyRewakeFairnessFloor now
+// reserves a re-wake slot whenever the budget would otherwise go entirely to
+// pending-creates, so this asserts the fix instead of the gap -- the starved
+// re-wake must land INSIDE the budget, not past it.
+func TestSortCandidatesByWakeFairness_RewakeStarvedBySustainedPendingCreates(t *testing.T) {
+	base := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+
+	beadWithMeta := func(id string, created time.Time, meta map[string]string) beads.Bead {
+		return beads.Bead{
+			ID: id, Type: session.BeadType, Title: "worker",
+			Labels: []string{session.LabelSession}, CreatedAt: created, Metadata: meta,
+		}
+	}
+	candidateFor := func(bead beads.Bead) startCandidate {
+		return startCandidate{info: sessiontest.SeedBead(t, bead)}
+	}
+
+	starvedRewake := candidateFor(beadWithMeta("ga-rewake-starved-6h", base.Add(-6*time.Hour), map[string]string{
+		"template": "worker", "last_woke_at": base.Add(-6 * time.Hour).Format(time.RFC3339),
+	}))
+
+	cands := []startCandidate{starvedRewake}
+	for i := 0; i < config.DefaultMaxWakesPerTick; i++ {
+		id := "ga-wisp-fresh-" + string(rune('a'+i))
+		cands = append(cands, candidateFor(beadWithMeta(id, base, map[string]string{
+			"template": "worker", "pending_create_claim": "true", "state": "creating",
+		})))
+	}
+
+	sortCandidatesByWakeFairness(cands)
+	applyRewakeFairnessFloor(cands, config.DefaultMaxWakesPerTick)
+
+	starvedRank := -1
+	for i, c := range cands {
+		if c.info.ID == "ga-rewake-starved-6h" {
+			starvedRank = i
+			break
+		}
+	}
+	if starvedRank < 0 {
+		t.Fatal("test setup: starved re-wake candidate went missing from the sorted slice")
+	}
+	if starvedRank >= config.DefaultMaxWakesPerTick {
+		t.Fatalf("starved re-wake landed at rank %d, outside the %d-wide per-tick budget -- "+
+			"the fairness floor (ga-yjbz92) did not serve it", starvedRank, config.DefaultMaxWakesPerTick)
+	}
+	// The floor must not overcorrect: exactly one budget slot goes to the
+	// re-wake, the rest of the budget prefix is still pending-creates.
+	pendingInBudget := 0
+	for i := 0; i < config.DefaultMaxWakesPerTick; i++ {
+		if cands[i].info.PendingCreateClaim {
+			pendingInBudget++
+		}
+	}
+	if want := config.DefaultMaxWakesPerTick - 1; pendingInBudget != want {
+		t.Fatalf("pending-creates inside budget = %d, want %d (exactly one budget slot reserved for the re-wake)", pendingInBudget, want)
+	}
+}
+
+// TestSortCandidatesByWakeFairness_RewakeFloorBoundedAcrossSustainedTicks is
+// the sustained-pressure case the ga-8nuqlp FULL acceptance criteria asked
+// for beyond the single-tick pin above: pending-creates keep arriving at or
+// above budget for N consecutive ticks, and the starved re-wake's wait must
+// stay bounded independent of N -- not merely served once by luck on one
+// tick. applyRewakeFairnessFloor is a pure per-call permutation with no
+// state carried between calls, so the guarantee it gives on tick 1 must
+// reproduce identically on every later tick; this exercises that directly
+// rather than trusting it from the mechanism alone.
+func TestSortCandidatesByWakeFairness_RewakeFloorBoundedAcrossSustainedTicks(t *testing.T) {
+	base := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+
+	beadWithMeta := func(id string, created time.Time, meta map[string]string) beads.Bead {
+		return beads.Bead{
+			ID: id, Type: session.BeadType, Title: "worker",
+			Labels: []string{session.LabelSession}, CreatedAt: created, Metadata: meta,
+		}
+	}
+	candidateFor := func(bead beads.Bead) startCandidate {
+		return startCandidate{info: sessiontest.SeedBead(t, bead)}
+	}
+
+	const sustainedTicks = 50
+	starvedRewake := candidateFor(beadWithMeta("ga-rewake-sustained-starved", base.Add(-6*time.Hour), map[string]string{
+		"template": "worker", "last_woke_at": base.Add(-6 * time.Hour).Format(time.RFC3339),
+	}))
+
+	for tick := 0; tick < sustainedTicks; tick++ {
+		// A fresh batch of above-budget pending-creates every tick, simulating
+		// sustained arrival rather than one static snapshot -- the candidate
+		// set a real tick would re-derive from current session state each
+		// time it runs.
+		cands := []startCandidate{starvedRewake}
+		for i := 0; i < config.DefaultMaxWakesPerTick+2; i++ {
+			id := "ga-wisp-tick" + string(rune('0'+tick%10)) + "-" + string(rune('a'+i))
+			cands = append(cands, candidateFor(beadWithMeta(id, base, map[string]string{
+				"template": "worker", "pending_create_claim": "true", "state": "creating",
+			})))
+		}
+
+		sortCandidatesByWakeFairness(cands)
+		applyRewakeFairnessFloor(cands, config.DefaultMaxWakesPerTick)
+
+		starvedRank := -1
+		for i, c := range cands {
+			if c.info.ID == "ga-rewake-sustained-starved" {
+				starvedRank = i
+				break
+			}
+		}
+		if starvedRank < 0 {
+			t.Fatalf("tick %d: starved re-wake candidate went missing", tick)
+		}
+		if starvedRank >= config.DefaultMaxWakesPerTick {
+			t.Fatalf("tick %d: starved re-wake landed at rank %d, outside the %d-wide budget -- "+
+				"wait is unbounded, not merely deferred one tick", tick, starvedRank, config.DefaultMaxWakesPerTick)
 		}
 	}
 }

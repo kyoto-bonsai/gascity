@@ -216,15 +216,25 @@ func wakeFairnessTime(c startCandidate) time.Time {
 // Pending-creates sort ahead of every re-wake as a primary key (ga-r6lc7g): a
 // pending-create candidate is racing a hard wall-clock lease expiry
 // (pendingCreateLeaseExpiredForRollbackInfo) that a re-wake candidate does not
-// carry, so under a budget-constrained tick a re-wake losing this tick's slot
-// just waits for the next one, while a pending-create losing it can roll back
-// and lose the session entirely. Within each tier the existing
-// least-recently-woken ordering is unchanged -- this only changes which tier
-// goes first, never the relative order inside a tier. This helps a tick that
-// DOES run choose better among its ready candidates; it cannot by itself
-// rescue a lease that expires because no tick ran at all during its window
-// (the ga-r6lc7g finding was degraded tick CADENCE, ~24min against a 10min
-// lease -- a separate, not-yet-fixed problem, probably upstream per ga-0re4hh).
+// carry, while a pending-create losing its tick's slot can roll back and lose
+// the session entirely. Within each tier the existing least-recently-woken
+// ordering is unchanged -- this only changes which tier goes first, never the
+// relative order inside a tier. This helps a tick that DOES run choose better
+// among its ready candidates; it cannot by itself rescue a lease that expires
+// because no tick ran at all during its window (the ga-r6lc7g finding was
+// degraded tick CADENCE, ~24min against a 10min lease -- a separate,
+// not-yet-fixed problem, probably upstream per ga-0re4hh).
+//
+// This function alone is unconditional categorical priority with no fairness
+// floor: sustained pending-create arrival at or above the per-tick wake
+// budget would starve the re-wake tier indefinitely rather than merely defer
+// it to "the next tick" (ga-8nuqlp found and pinned this with
+// TestSortCandidatesByWakeFairness_RewakeStarvedBySustainedPendingCreates).
+// The floor is applyRewakeFairnessFloor, called right after this function at
+// its one call site -- a SELECTION constraint ("at least one of the first
+// budget candidates is a re-wake") a comparator's total order cannot express,
+// so it runs as a post-sort permutation rather than a change here. See its
+// own doc comment for the exact guarantee (ga-yjbz92).
 func sortCandidatesByWakeFairness(candidates []startCandidate) {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		iPending, jPending := candidates[i].info.PendingCreateClaim, candidates[j].info.PendingCreateClaim
@@ -233,6 +243,49 @@ func sortCandidatesByWakeFairness(candidates []startCandidate) {
 		}
 		return wakeFairnessTime(candidates[i]).Before(wakeFairnessTime(candidates[j]))
 	})
+}
+
+// applyRewakeFairnessFloor is the fairness floor for the re-wake tier
+// (ga-8nuqlp FULL, ga-yjbz92): sortCandidatesByWakeFairness's categorical
+// pending-create-first ordering has no floor of its own, so sustained
+// pending-create arrival at or above budget can starve every re-wake
+// indefinitely. budget is the number of wake slots left for THIS ready list
+// -- the caller's remaining per-tick budget, not a per-wave constant, since
+// sortCandidatesByWakeFairness runs once per dependency wave and multiple
+// waves can share one tick's budget.
+//
+// A reserved slot is a SELECTION constraint ("at least one of the first
+// budget candidates is a re-wake, when one exists"), not an ordering one --
+// a comparator yields a total order and cannot express it (ga-8nuqlp officer
+// ruling, section 4). So this runs as a post-sort PERMUTATION over
+// (ready, budget) instead of changing sortCandidatesByWakeFairness itself: a
+// pure reordering, unit-testable in isolation, that leaves the live start
+// path, budget accounting, deferred_by_wake_budget logging and the lease
+// refresh at the call site byte-identical.
+//
+// No-op when there is nothing to do: budget outside (0, len(ready)), or a
+// re-wake already holds one of the first budget slots.
+func applyRewakeFairnessFloor(ready []startCandidate, budget int) {
+	if budget <= 0 || budget >= len(ready) {
+		return
+	}
+	for i := 0; i < budget; i++ {
+		if !ready[i].info.PendingCreateClaim {
+			return
+		}
+	}
+	// sortCandidatesByWakeFairness already put every pending-create ahead of
+	// every re-wake and sorted the re-wake tier oldest-first, so the first
+	// non-pending-create found scanning past the budget is the OLDEST starved
+	// re-wake -- exactly the one the floor exists to serve.
+	for i := budget; i < len(ready); i++ {
+		if !ready[i].info.PendingCreateClaim {
+			rewake := ready[i]
+			copy(ready[budget:i+1], ready[budget-1:i])
+			ready[budget-1] = rewake
+			return
+		}
+	}
 }
 
 // maxEnumeratedCandidateSummaries caps the per-tick candidate-set trace field
@@ -3024,6 +3077,12 @@ func executePlannedStartsTraced(
 		// every tick. Sorting within the dependency wave is safe: every
 		// candidate here already has its dependencies satisfied.
 		sortCandidatesByWakeFairness(ready)
+		// Fairness floor (ga-8nuqlp FULL, ga-yjbz92): reserve a re-wake slot
+		// when this wave's remaining budget would otherwise go entirely to
+		// pending-creates. budget is what's left of THIS tick, not maxWakes
+		// itself -- earlier waves in the same tick may have already spent
+		// some of it.
+		applyRewakeFairnessFloor(ready, maxWakes-wakeCount)
 		for offset := 0; offset < len(ready); {
 			if wakeCount >= maxWakes {
 				for _, candidate := range ready[offset:] {
