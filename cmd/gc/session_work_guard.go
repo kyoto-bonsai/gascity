@@ -92,6 +92,18 @@ func closeSessionInfoIfUnassigned(
 // backstop already use for the same field pair) — an unattached/unknown
 // store ref fails closed rather than guessing at the primary store.
 //
+// ga-81we34: resolution goes through resolveTriggerBeadStore, which
+// normalizes via normalizeIdleClaimStoreRef (idle_nudge.go) instead of a
+// raw rigStores[storeRef] lookup. Production writes this field as "",
+// "city", or "rig:<name>" (SessionRequest.WorkStoreRef's own documented
+// shape) — never as a bare rig name — but rigStores (city_runtime.go
+// rigBeadStores()) is keyed by bare rig name with the city entry deleted.
+// A raw lookup on "city" or "rig:<name>" therefore always missed, silently
+// skipping every such wisp; the escaped defect's own live count found 2 of
+// 4 closed-trigger candidates on this exact spelling. Reusing the
+// normalizer (not a second switch) is what keeps this from drifting from
+// idle-claim resolution again.
+//
 // Empty TriggerBeadID, an unresolvable store ref, or a not-found bead all
 // report (false, nil): a wisp with no known trigger, or one whose trigger
 // cannot be located, is never eligible for retirement on this signal alone.
@@ -104,15 +116,8 @@ func triggerBeadClosedInfo(store beads.Store, rigStores map[string]beads.Store, 
 	if triggerID == "" {
 		return false, nil
 	}
-	target := store
-	if storeRef := strings.TrimSpace(info.TriggerBeadStoreRef); storeRef != "" {
-		rs, ok := rigStores[storeRef]
-		if !ok || rs == nil {
-			return false, nil
-		}
-		target = rs
-	}
-	if target == nil {
+	target, resolved := resolveTriggerBeadStore(info.TriggerBeadStoreRef, store, rigStores)
+	if !resolved || target == nil {
 		return false, nil
 	}
 	b, err := target.Get(triggerID)
@@ -123,6 +128,40 @@ func triggerBeadClosedInfo(store beads.Store, rigStores map[string]beads.Store, 
 		return false, err
 	}
 	return b.Status == "closed", nil
+}
+
+// resolveTriggerBeadStore resolves a TriggerBeadStoreRef spelling to the
+// beads.Store it names, sharing exactly one normalization path
+// (normalizeIdleClaimStoreRef) with idle-claim resolution so the two can
+// never drift apart again (ga-81we34). "" and any ref that normalizes to
+// "city" (also covers "city:<name>" and class refs) resolve to primary;
+// "rig:<name>" (including a normalized bare rig name) resolves to
+// rigStores[<name>] — rigStores itself is keyed by bare rig name, never by
+// "rig:<name>" or "city" (city_runtime.go rigBeadStores() deletes the city
+// entry), so the "rig:" prefix is stripped before the lookup. Anything else
+// (an unrecognized ref shape) fails closed: (nil, false).
+//
+// Split out from triggerBeadClosedInfo (rather than inlined) so
+// sweepClosedTriggerWispSessions can independently ask "would this ref have
+// resolved at all" for its skip-observability log, without a second Get
+// call or a second copy of this switch.
+func resolveTriggerBeadStore(storeRef string, primary beads.Store, rigStores map[string]beads.Store) (beads.Store, bool) {
+	storeRef = strings.TrimSpace(storeRef)
+	if storeRef == "" {
+		return primary, true
+	}
+	switch normalized := normalizeIdleClaimStoreRef(storeRef); {
+	case normalized == "city":
+		return primary, true
+	case strings.HasPrefix(normalized, "rig:"):
+		rs, ok := rigStores[strings.TrimPrefix(normalized, "rig:")]
+		if !ok || rs == nil {
+			return nil, false
+		}
+		return rs, true
+	default:
+		return nil, false
+	}
 }
 
 // closeSessionBeadIfReachableStoreUnassigned closes a session bead only when

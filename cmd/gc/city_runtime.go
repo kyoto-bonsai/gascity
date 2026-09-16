@@ -3376,6 +3376,15 @@ func sweepClosedTriggerWispSessions(
 	}
 	startupTimeout := cfg.Session.StartupTimeoutDuration()
 	var closed []string
+	// ga-81we34 item 3: an unresolved trigger store ref is a silent-skip
+	// class distinct from "trigger genuinely still open" -- the escaped
+	// defect this bead fixes shipped exactly because that distinction was
+	// invisible for 5 weeks. Aggregated (one line per tick, only when
+	// non-zero), not per-candidate: this sweep can see dozens of ordinary
+	// still-open triggers every tick, and per-candidate logging of THOSE
+	// would itself be the noise incident.
+	unresolvedSkips := 0
+	unresolvedRefs := map[string]bool{}
 	for _, info := range sessionBeads.OpenInfos() {
 		if info.Closed {
 			continue
@@ -3400,6 +3409,12 @@ func sweepClosedTriggerWispSessions(
 			continue
 		}
 		if !triggerClosed {
+			if ref := strings.TrimSpace(info.TriggerBeadStoreRef); ref != "" {
+				if _, resolved := resolveTriggerBeadStore(ref, store, rigStores); !resolved {
+					unresolvedSkips++
+					unresolvedRefs[ref] = true
+				}
+			}
 			continue
 		}
 		processNames := config.AgentProcessNames(cfg, *agentCfg, exec.LookPath)
@@ -3425,6 +3440,14 @@ func sweepClosedTriggerWispSessions(
 				Payload:   api.SessionWispRetiredPayloadJSON(info.ID, strings.TrimSpace(info.TriggerBeadID), template),
 			})
 		}
+	}
+	if unresolvedSkips > 0 {
+		refs := make([]string, 0, len(unresolvedRefs))
+		for ref := range unresolvedRefs {
+			refs = append(refs, ref)
+		}
+		sort.Strings(refs)
+		fmt.Fprintf(stderr, "session wisp retire: skipped %d candidate(s) with an unresolved trigger store ref: %s\n", unresolvedSkips, strings.Join(refs, ", ")) //nolint:errcheck
 	}
 	return closed
 }

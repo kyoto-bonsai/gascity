@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -357,6 +359,69 @@ func TestSweepClosedTriggerWispSessions_RetiresWispWithTriggerInRigStore(t *test
 	}
 }
 
+// TestSweepClosedTriggerWispSessions_RetiresWispWithTriggerViaCityRef pins
+// ga-81we34: production writes "city" (not "") for city-scope work, and a
+// raw rigStores["city"] lookup always missed since rigBeadStores() deletes
+// the city entry from that map. An explicit "city" ref must resolve to the
+// primary store exactly like the empty-ref default does.
+func TestSweepClosedTriggerWispSessions_RetiresWispWithTriggerViaCityRef(t *testing.T) {
+	primary := beads.NewMemStore()
+	trigger, err := primary.Create(beads.Bead{Title: "city molecule step", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create primary trigger: %v", err)
+	}
+	if err := primary.Close(trigger.ID); err != nil {
+		t.Fatalf("Close primary trigger: %v", err)
+	}
+
+	bead := ephemeralWispBead("wisp-city-1", trigger.ID)
+	bead.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "city"
+	sess, err := primary.Create(bead)
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	closed := sweepClosedTriggerWispSessions(
+		"", primary, nil, newSessionBeadSnapshot([]beads.Bead{sess}), wispCfg(),
+		runtime.NewFake(), false, nil, nil,
+	)
+	if len(closed) != 1 || closed[0] != sess.ID {
+		t.Fatalf("closed = %v, want [%s]: an explicit \"city\" store ref must resolve to the primary store", closed, sess.ID)
+	}
+}
+
+// TestSweepClosedTriggerWispSessions_RetiresWispWithTriggerViaRigColonRef
+// pins ga-81we34's other production spelling: build_desired_state.go writes
+// "rig:<name>" (SessionRequest.WorkStoreRef's own documented shape), not a
+// bare rig name. rigStores is keyed by bare name, so this only resolves
+// once the "rig:" prefix is stripped before the lookup.
+func TestSweepClosedTriggerWispSessions_RetiresWispWithTriggerViaRigColonRef(t *testing.T) {
+	primary := beads.NewMemStore()
+	rig := beads.NewMemStore()
+	trigger, err := rig.Create(beads.Bead{Title: "rig molecule step", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create rig trigger: %v", err)
+	}
+	if err := rig.Close(trigger.ID); err != nil {
+		t.Fatalf("Close rig trigger: %v", err)
+	}
+
+	bead := ephemeralWispBead("wisp-rig-colon-1", trigger.ID)
+	bead.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "rig:myrig"
+	sess, err := primary.Create(bead)
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	closed := sweepClosedTriggerWispSessions(
+		"", primary, map[string]beads.Store{"myrig": rig}, newSessionBeadSnapshot([]beads.Bead{sess}), wispCfg(),
+		runtime.NewFake(), false, nil, nil,
+	)
+	if len(closed) != 1 || closed[0] != sess.ID {
+		t.Fatalf("closed = %v, want [%s]: a \"rig:<name>\" store ref must resolve to rigStores[<name>]", closed, sess.ID)
+	}
+}
+
 func TestSweepClosedTriggerWispSessions_SkipsWispWithUnknownStoreRef(t *testing.T) {
 	primary := beads.NewMemStore()
 	rig := beads.NewMemStore()
@@ -371,12 +436,45 @@ func TestSweepClosedTriggerWispSessions_SkipsWispWithUnknownStoreRef(t *testing.
 	}
 
 	// rigStores does NOT contain "notattached".
+	var stderr bytes.Buffer
 	closed := sweepClosedTriggerWispSessions(
 		"", primary, map[string]beads.Store{"myrig": rig}, newSessionBeadSnapshot([]beads.Bead{sess}), wispCfg(),
-		runtime.NewFake(), false, nil, nil,
+		runtime.NewFake(), false, nil, &stderr,
 	)
 	if len(closed) != 0 {
 		t.Fatalf("closed = %v, want none: an unattached/unknown store ref must fail closed", closed)
+	}
+	// ga-81we34 item 3: an unresolved-ref skip must be surfaced, once,
+	// aggregated -- this is what would have made the 5-week silent no-op
+	// visible on day one.
+	if got := stderr.String(); !strings.Contains(got, "skipped 1 candidate") || !strings.Contains(got, "notattached") {
+		t.Fatalf("stderr = %q, want an aggregated unresolved-ref skip line naming %q", got, "notattached")
+	}
+}
+
+// TestSweepClosedTriggerWispSessions_SkipsWispWithGarbageColonStoreRef pins
+// the last of ga-81we34's named spellings: a colon-form ref that doesn't
+// match "city"/"city:*"/a class ref/"rig:*" must still fail closed --
+// normalizeIdleClaimStoreRef's default arm returns it unchanged, which
+// resolveTriggerBeadStore's own switch has no case for.
+func TestSweepClosedTriggerWispSessions_SkipsWispWithGarbageColonStoreRef(t *testing.T) {
+	primary := beads.NewMemStore()
+	trigger, _ := primary.Create(beads.Bead{Title: "molecule step", Status: "open"})
+	_ = primary.Close(trigger.ID)
+
+	bead := ephemeralWispBead("wisp-garbage-1", trigger.ID)
+	bead.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "weird:ref"
+	sess, err := primary.Create(bead)
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+
+	closed := sweepClosedTriggerWispSessions(
+		"", primary, nil, newSessionBeadSnapshot([]beads.Bead{sess}), wispCfg(),
+		runtime.NewFake(), false, nil, nil,
+	)
+	if len(closed) != 0 {
+		t.Fatalf("closed = %v, want none: an unrecognized colon-form store ref must fail closed", closed)
 	}
 }
 
@@ -493,6 +591,15 @@ func TestTriggerBeadClosedInfo(t *testing.T) {
 		{"unresolvable trigger id", "ga-nonexistent", "", false, false},
 		{"closed trigger in attached rig store", rigClosedTrigger.ID, "myrig", true, false},
 		{"unknown store ref fails closed", rigClosedTrigger.ID, "notattached", false, false},
+		// ga-81we34: production's actual written spellings. A raw
+		// rigStores[storeRef] lookup on any of the first three here always
+		// missed (rigStores never contains "city" or "rig:<name>" --
+		// rigBeadStores() deletes the city entry and keys the rest by bare
+		// rig name), silently skipping the wisp instead of retiring it.
+		{"closed trigger in primary store via city ref", closedTrigger.ID, "city", true, false},
+		{"closed trigger in primary store via city:<name> ref", closedTrigger.ID, "city:somename", true, false},
+		{"closed trigger in attached rig store via rig:<name> ref", rigClosedTrigger.ID, "rig:myrig", true, false},
+		{"garbage colon-form ref fails closed", rigClosedTrigger.ID, "weird:ref", false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
