@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -5100,109 +5101,111 @@ func TestNudgePollHelpersOpenOnceWhenQueueHasWork(t *testing.T) {
 	})
 }
 
+// closeCountingNudgeStore is an in-memory store that records CloseStore calls,
+// so tests can prove a handle opened by a timed-out bounded open is released.
+type closeCountingNudgeStore struct {
+	*beads.MemStore
+	closes *atomic.Int32
+}
+
+//nolint:unparam // error return mandated by the CloseStore interface
+func (s closeCountingNudgeStore) CloseStore() error {
+	s.closes.Add(1)
+	return nil
+}
+
 // installSlowNudgeStoreSeam swaps openNudgeBeadStore for a fake that blocks
-// for `delay` before returning a real in-memory store -- simulates a slow
-// Dolt open (ga-cssm95, 2026-09-15 recurrence) without touching Dolt at all.
-func installSlowNudgeStoreSeam(t *testing.T, delay time.Duration) {
+// for delay before returning an in-memory store, simulating a slow Dolt open
+// (ga-cssm95). It returns the count of CloseStore calls on returned handles.
+func installSlowNudgeStoreSeam(t *testing.T, delay time.Duration) *atomic.Int32 {
 	t.Helper()
-	backing := beads.NewMemStore()
+	closes := &atomic.Int32{}
 	prev := openNudgeBeadStore
 	openNudgeBeadStore = func(string) beads.NudgesStore {
 		time.Sleep(delay)
-		return beads.NudgesStore{Store: backing}
+		return beads.NudgesStore{Store: closeCountingNudgeStore{MemStore: beads.NewMemStore(), closes: closes}}
 	}
 	t.Cleanup(func() { openNudgeBeadStore = prev })
+	return closes
 }
 
-// TestOpenNudgeBeadStoreBounded_TimesOutOnSlowOpen pins the ga-cssm95
-// recurrence fix at the unit level: a slow openNudgeBeadStore must not be
-// allowed to block its caller past `timeout`, and a timed-out call must
-// return the zero-value store -- openNudgeBeadStore's OWN documented
-// contract for "the open didn't work" ("a nil store means do nothing"),
-// reused here rather than inventing a second failure shape.
+func setNudgeMaintenanceStoreOpenTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := nudgeMaintenanceStoreOpenTimeout
+	nudgeMaintenanceStoreOpenTimeout = d
+	t.Cleanup(func() { nudgeMaintenanceStoreOpenTimeout = prev })
+}
+
+// TestOpenNudgeBeadStoreBounded_TimesOutOnSlowOpen: a slow open must not block
+// the caller past timeout, must return the zero-value store (the documented
+// "do nothing" contract), and the handle the late open eventually produces
+// must be closed rather than leaked.
 func TestOpenNudgeBeadStoreBounded_TimesOutOnSlowOpen(t *testing.T) {
 	const timeout = 50 * time.Millisecond
-	installSlowNudgeStoreSeam(t, 2*time.Second) // far longer than timeout
+	const delay = 300 * time.Millisecond
+	closes := installSlowNudgeStoreSeam(t, delay)
 
 	t0 := time.Now()
 	store := openNudgeBeadStoreBounded(t.TempDir(), timeout)
 	elapsed := time.Since(t0)
 
 	if store.Store != nil {
-		t.Fatalf("timed-out open returned a non-nil store; want the zero value (nil-tolerant contract)")
+		t.Fatalf("timed-out open returned a non-nil store; want the zero value")
 	}
-	// Generous upper bound (10x) to stay non-flaky on a loaded box while still
-	// proving this returned near `timeout`, not near the 2s sleep.
-	if elapsed > timeout*10 {
-		t.Fatalf("openNudgeBeadStoreBounded took %v to return, want close to timeout=%v "+
-			"(it must not wait for the slow open)", elapsed, timeout)
+	if elapsed >= delay {
+		t.Fatalf("openNudgeBeadStoreBounded took %v, want it to return before the %v open finishes", elapsed, delay)
 	}
-	if elapsed < timeout {
-		t.Fatalf("openNudgeBeadStoreBounded returned in %v, faster than its own timeout=%v "+
-			"-- suspicious, the bound should be a floor not a shortcut", elapsed, timeout)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for closes.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := closes.Load(); got != 1 {
+		t.Fatalf("late-opened store CloseStore calls = %d, want 1 (timed-out open leaked its handle)", got)
 	}
 }
 
-// TestOpenNudgeBeadStoreBounded_ReturnsRealStoreWhenFast is the no-regression
-// edge: when the open completes well within budget, the bound must not
-// interfere -- the real store comes back, promptly.
+// TestOpenNudgeBeadStoreBounded_ReturnsRealStoreWhenFast: a fast open returns
+// the real store, and the bound never closes a store the caller received.
 func TestOpenNudgeBeadStoreBounded_ReturnsRealStoreWhenFast(t *testing.T) {
-	installSlowNudgeStoreSeam(t, 0)
+	closes := installSlowNudgeStoreSeam(t, 0)
 
-	t0 := time.Now()
-	store := openNudgeBeadStoreBounded(t.TempDir(), 8*time.Second)
-	elapsed := time.Since(t0)
+	store := openNudgeBeadStoreBounded(t.TempDir(), 2*time.Second)
 
 	if store.Store == nil {
 		t.Fatalf("fast open returned a nil store, want the real one")
 	}
-	if elapsed > time.Second {
-		t.Fatalf("fast open took %v to return through the bounded wrapper, want near-instant", elapsed)
+	time.Sleep(50 * time.Millisecond)
+	if got := closes.Load(); got != 0 {
+		t.Fatalf("CloseStore calls on a store handed to the caller = %d, want 0", got)
 	}
 }
 
-// TestNudgeMaintenanceStoreFrontForState_BoundedUnderSlowDoltOpen is the
-// load-bearing regression test for ga-cssm95's 2026-09-15 recurrence: a real
-// poll helper (claimDueQueuedNudgesMatching), called exactly as production
-// does, against a queue WITH work (so frontForState actually opens the
-// store, matching the production trigger condition) and a slow fake Dolt
-// open, must still return within a bounded time -- proving the caller who
-// holds the nudge queue flock while this runs cannot be pinned for minutes
-// by a slow store open. Before this fix, ensureOpen called openNudgeBeadStore
-// directly with no bound; this test would have blocked for the full fake
-// delay (verified by hand: reverting cmd_nudge.go's ensureOpen to call
-// openNudgeBeadStore directly makes this test take >=2s and fail the bound
-// assertion below).
+// TestNudgeMaintenanceStoreFrontForState_BoundedUnderSlowDoltOpen drives a real
+// poll helper, which runs frontForState inside the nudge-queue flock, against a
+// non-empty queue (so ensureOpen fires) and an open slower than the bound. The
+// open delay is well past maxElapsed, so calling openNudgeBeadStore unbounded
+// from ensureOpen fails this test.
 func TestNudgeMaintenanceStoreFrontForState_BoundedUnderSlowDoltOpen(t *testing.T) {
-	installSlowNudgeStoreSeam(t, 2*time.Second)
+	installSlowNudgeStoreSeam(t, 3*time.Second)
+	setNudgeMaintenanceStoreOpenTimeout(t, 100*time.Millisecond)
+
 	dir := t.TempDir()
 	now := time.Now()
-
-	// Seed a non-empty queue via the REAL flock'd path (not a shortcut), so
-	// nudgeQueueHasWork is true and frontForState actually calls ensureOpen --
-	// the exact production trigger this bug needed to fire.
 	item := newQueuedNudgeWithOptions("worker", "do work", "session", now, queuedNudgeOptions{ID: "n-slow-open"})
 	if err := enqueueQueuedNudge(dir, item); err != nil {
 		t.Fatalf("enqueueQueuedNudge: %v", err)
 	}
 
 	t0 := time.Now()
-	// claimDueQueuedNudgesMatching runs frontForState(state) INSIDE
-	// withNudgeQueueState's locked callback -- identical call shape to every
-	// other poll helper this bug affected.
 	if _, err := claimDueQueuedNudgesMatching(dir, now, func(queuedNudge) bool { return false }); err != nil {
 		t.Fatalf("claimDueQueuedNudgesMatching: %v", err)
 	}
 	elapsed := time.Since(t0)
 
-	// nudgeMaintenanceStoreOpenTimeout is 8s; allow headroom for the rest of
-	// the critical section (json marshal, atomic rewrite) without allowing
-	// anywhere near the 2s fake-Dolt delay to matter, let alone the "minutes"
-	// the real incident showed.
-	const maxElapsed = 3 * time.Second
+	const maxElapsed = time.Second
 	if elapsed > maxElapsed {
-		t.Fatalf("claimDueQueuedNudgesMatching (holding the flock) took %v against a 2s-slow store open, "+
-			"want < %v -- the maintenance-store open timeout did not bound the lock hold", elapsed, maxElapsed)
+		t.Fatalf("claimDueQueuedNudgesMatching (holding the flock) took %v against a 3s store open, want < %v", elapsed, maxElapsed)
 	}
 }
 

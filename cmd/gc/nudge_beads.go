@@ -38,14 +38,15 @@ var openNudgeBeadStore = func(cityPath string) beads.NudgesStore {
 // this fix landed) -- when the Dolt bead store is slow, an uncapped open
 // here pinned the flock for minutes and starved every 8s-bounded writer.
 //
-// Hardcoded to the SAME 8s value as internal/nudgequeue/state.go's
-// defaultLockWaitTimeout, deliberately not cross-package-referenced: that
-// constant is unexported (a different package, cmd/gc cannot see it without
-// exporting it, which this follow-on fix chose not to do to keep its diff
-// confined to cmd/gc -- the same package this whole holder-side lives in).
-// If defaultLockWaitTimeout's value ever changes, this one must change with
-// it by hand; that coupling is documented here and at the other end.
-const nudgeMaintenanceStoreOpenTimeout = 8 * time.Second
+// Must stay well below internal/nudgequeue/state.go's defaultLockWaitTimeout
+// (8s, unexported): a holder bounded at the writers' own wait still starves
+// any writer that arrives just after the holder takes the lock. 2s keeps the
+// same 4x ratio that constant's comment sizes against
+// nudgeEnqueueMaintenanceBudget. Skipping maintenance on a slow tick is safe
+// (nil store = do nothing); the next tick retries.
+//
+// A var, not a const, so tests can shorten it.
+var nudgeMaintenanceStoreOpenTimeout = 2 * time.Second
 
 // openNudgeBeadStoreBounded calls openNudgeBeadStore (the existing test seam
 // above) with a hard wall-clock bound. On timeout it returns the zero-value
@@ -55,19 +56,24 @@ const nudgeMaintenanceStoreOpenTimeout = 8 * time.Second
 // degrades to "nothing to do this tick" via the SAME nil-tolerant contract
 // every maintenance pass already respects, not a new failure shape.
 //
-// The losing goroutine is deliberately abandoned rather than canceled:
-// openNudgeBeadStore has no cancellation hook to call, and closing a store
-// handle out from under a goroutine that might still be using it would be
-// worse than leaving it to finish (or fail) on its own. The result channel
-// is buffered so that goroutine's eventual send never blocks on a caller
-// who stopped listening.
+// openNudgeBeadStore has no cancellation hook, so the open runs to completion
+// in the background. On timeout the caller never receives that store, so a
+// drainer closes it when it arrives; otherwise every slow tick leaks a
+// connection into the already-slow sql-server.
 func openNudgeBeadStoreBounded(cityPath string, timeout time.Duration) beads.NudgesStore {
 	result := make(chan beads.NudgesStore, 1)
 	go func() { result <- openNudgeBeadStore(cityPath) }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case store := <-result:
 		return store
-	case <-time.After(timeout):
+	case <-timer.C:
+		go func() {
+			if late := <-result; late.Store != nil {
+				_ = closeBeadStoreHandle(late.Store)
+			}
+		}()
 		return beads.NudgesStore{}
 	}
 }
