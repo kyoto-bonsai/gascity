@@ -298,6 +298,39 @@ type SessionLifecyclePayload struct {
 // IsEventPayload marks SessionLifecyclePayload as an events.Payload variant.
 func (SessionLifecyclePayload) IsEventPayload() {}
 
+// SessionWokePayload (ga-dbfydw) carries the RESOLVED provider/model identity
+// for a confirmed start, distinct from the request-time options.model (which
+// reads empty for any env/default-resolved seat — the gap this bead closes).
+// Fields are omitempty and left unset rather than a misleading zero value
+// when resolution did not run (should not happen for a genuine session.woke,
+// since commitStartResultTraced only reaches the emission site after a
+// confirmed start, but the type itself makes no assumption). Scalars only,
+// deliberately: never forward a raw env map here (internal/runtime/redact.go's
+// allow-list would treat most of it as presumptively secret, and even the
+// non-secret remainder is not this payload's business — see ResolutionSource
+// below for why a label is safe where the underlying source is not).
+type SessionWokePayload struct {
+	Provider    string `json:"provider,omitempty" doc:"Resolved provider name (e.g. claude, codex)."`
+	Model       string `json:"model,omitempty" doc:"Resolved model string actually launched, or empty if the provider's schema has no model option."`
+	ModelSource string `json:"model_source,omitempty" doc:"Which tier supplied Model: explicit, env, or default. Empty exactly when Model is empty."`
+}
+
+// IsEventPayload marks SessionWokePayload as an events.Payload variant.
+func (SessionWokePayload) IsEventPayload() {}
+
+// SessionWokePayloadJSON marshals a SessionWokePayload. All fields are
+// strings, so marshaling cannot fail; a nil-safe empty result on the
+// impossible error path is deliberate rather than propagated, mirroring
+// SessionLifecyclePayloadJSON.
+func SessionWokePayloadJSON(provider, model, modelSource string) json.RawMessage {
+	b, _ := json.Marshal(SessionWokePayload{
+		Provider:    provider,
+		Model:       model,
+		ModelSource: modelSource,
+	})
+	return b
+}
+
 // SessionLifecyclePayloadJSON builds the JSON wire form of a
 // SessionLifecyclePayload for attachment to an events.Event.Payload
 // field. Template and Reason are emitted only when non-empty.
@@ -644,13 +677,15 @@ func init() {
 	events.RegisterPayload(events.BeadDeleted, BeadEventPayload{})
 	events.RegisterPayload(events.BeadDeadAssigneeReopened, BeadDeadAssigneeReopenedPayload{})
 
-	// session.* / convoy.* / controller.* / city.* / order.* /
-	// provider.* — these events carry no structured payload today;
-	// their semantics are fully captured by the envelope's Actor,
-	// Subject, and Message fields. NoPayload registers an empty typed
-	// shape so the spec still emits a discriminated-union variant
-	// for the event type and the registry-coverage test passes.
-	events.RegisterPayload(events.SessionWoke, events.NoPayload{})
+	// convoy.* / controller.* / city.* / order.* / provider.* — these
+	// events carry no structured payload today; their semantics are
+	// fully captured by the envelope's Actor, Subject, and Message
+	// fields. NoPayload registers an empty typed shape so the spec
+	// still emits a discriminated-union variant for the event type
+	// and the registry-coverage test passes. session.woke is the one
+	// exception in this cluster now (ga-dbfydw): it carries the
+	// resolved provider/model identity, see SessionWokePayload.
+	events.RegisterPayload(events.SessionWoke, SessionWokePayload{})
 	events.RegisterPayload(events.SessionStopped, SessionLifecyclePayload{})
 	events.RegisterPayload(events.SessionCrashed, SessionLifecyclePayload{})
 	events.RegisterPayload(events.SessionDraining, events.NoPayload{})

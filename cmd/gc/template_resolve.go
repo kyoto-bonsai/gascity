@@ -141,6 +141,12 @@ type TemplateParams struct {
 	// MCPServers is the effective ACP session/new MCP server set for this
 	// concrete session context.
 	MCPServers []runtime.MCPServerConfig
+	// ResolvedModel and ResolvedModelSource (ga-dbfydw) carry the outcome of
+	// resolveSessionModel, computed by applySchemaOptionOverridesForLaunch at
+	// launch time. Empty until that has run. See resolveSessionModel's own doc
+	// comment for the resolution order and source vocabulary.
+	ResolvedModel       string
+	ResolvedModelSource string
 }
 
 // DisplayName returns the name to use for log messages and event subjects.

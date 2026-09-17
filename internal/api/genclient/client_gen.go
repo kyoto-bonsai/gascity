@@ -3779,6 +3779,8 @@ type SessionResponse struct {
 	Pool                   *string                 `json:"pool,omitempty"`
 	Provider               string                  `json:"provider"`
 	Reason                 *string                 `json:"reason,omitempty"`
+	ResolvedModel          *string                 `json:"resolved_model,omitempty"`
+	ResolvedModelSource    *string                 `json:"resolved_model_source,omitempty"`
 	Rig                    *string                 `json:"rig,omitempty"`
 	Running                bool                    `json:"running"`
 	SessionName            string                  `json:"session_name"`
@@ -4769,6 +4771,18 @@ type SessionWakeRefusedPayload struct {
 
 	// WakeRequest The wake_request metadata value that triggered this check (explicit).
 	WakeRequest string `json:"wake_request"`
+}
+
+// SessionWokePayload defines model for SessionWokePayload.
+type SessionWokePayload struct {
+	// Model Resolved model string actually launched, or empty if the provider's schema has no model option.
+	Model *string `json:"model,omitempty"`
+
+	// ModelSource Which tier supplied Model: explicit, env, or default. Empty exactly when Model is empty.
+	ModelSource *string `json:"model_source,omitempty"`
+
+	// Provider Resolved provider name (e.g. claude, codex).
+	Provider *string `json:"provider,omitempty"`
 }
 
 // SlingInputBody defines model for SlingInputBody.
@@ -6710,7 +6724,7 @@ type TypedEventStreamEnvelopeSessionWoke struct {
 	Actor            string                   `json:"actor"`
 	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
 	Message          *string                  `json:"message,omitempty"`
-	Payload          NoPayload                `json:"payload"`
+	Payload          SessionWokePayload       `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
@@ -8385,7 +8399,7 @@ type TypedTaggedEventStreamEnvelopeSessionWoke struct {
 	City             string                   `json:"city"`
 	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
 	Message          *string                  `json:"message,omitempty"`
-	Payload          NoPayload                `json:"payload"`
+	Payload          SessionWokePayload       `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
@@ -11306,6 +11320,32 @@ func (t *EventPayload) FromSessionWakeRefusedPayload(v SessionWakeRefusedPayload
 
 // MergeSessionWakeRefusedPayload performs a merge with any union data inside the EventPayload, using the provided SessionWakeRefusedPayload
 func (t *EventPayload) MergeSessionWakeRefusedPayload(v SessionWakeRefusedPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSessionWokePayload returns the union data inside the EventPayload as a SessionWokePayload
+func (t EventPayload) AsSessionWokePayload() (SessionWokePayload, error) {
+	var body SessionWokePayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSessionWokePayload overwrites any union data inside the EventPayload as the provided SessionWokePayload
+func (t *EventPayload) FromSessionWokePayload(v SessionWokePayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSessionWokePayload performs a merge with any union data inside the EventPayload, using the provided SessionWokePayload
+func (t *EventPayload) MergeSessionWokePayload(v SessionWokePayload) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err

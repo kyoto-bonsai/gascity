@@ -84,6 +84,11 @@ var infoKeyCodec = []infoKeySpec{
 		i.TransportMetadata = v
 		i.Transport = normalizeTransport(i.Provider, v)
 	}},
+	// resolved_model/resolved_model_source (ga-dbfydw): stamped once, atomically
+	// with the started_config_hash batch, at the same commit that fires
+	// session.woke -- never derived here, only projected.
+	{"resolved_model", func(i *Info, v string) { i.ResolvedModel = v }},
+	{"resolved_model_source", func(i *Info, v string) { i.ResolvedModelSource = v }},
 
 	// identity / pool / named-session cluster
 	{NamedSessionIdentityMetadata, func(i *Info, v string) { i.ConfiguredNamedIdentity = v }},

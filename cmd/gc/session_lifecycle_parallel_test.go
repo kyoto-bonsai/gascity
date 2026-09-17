@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
@@ -4867,6 +4868,123 @@ func TestCommitStartResult_SessionWokeEmittedOnlyAfterDurableCommit(t *testing.T
 		}
 		if len(woke) != 1 {
 			t.Fatalf("session.woke events = %d, want exactly 1 after the durable commit", len(woke))
+		}
+	})
+}
+
+// TestCommitStartResult_SessionWokeCarriesResolvedModel (ga-dbfydw) pins that
+// the resolved provider/model/source computed at launch time lands, from the
+// same commit, on BOTH the session.woke event payload and the bead's durable
+// metadata -- the two surfaces this bead asks to "agree on resolved
+// identity" by construction, since both are one read of tp.ResolvedModel/
+// tp.ResolvedModelSource.
+func TestCommitStartResult_SessionWokeCarriesResolvedModel(t *testing.T) {
+	resultWithModel := func(session *beads.Bead, providerName, model, source string) startResult {
+		var rp *config.ResolvedProvider
+		if providerName != "" {
+			rp = &config.ResolvedProvider{Name: providerName}
+		}
+		return startResult{
+			prepared: preparedStart{
+				candidate: startCandidate{
+					info: sessiontest.SeedBead(t, *session),
+					tp: TemplateParams{
+						SessionName:         "sky",
+						TemplateName:        "helper",
+						ResolvedProvider:    rp,
+						ResolvedModel:       model,
+						ResolvedModelSource: source,
+					},
+				},
+				coreHash: "core",
+				liveHash: "live",
+			},
+			outcome:  "success",
+			started:  time.Date(2026, 3, 18, 12, 0, 0, 0, time.UTC),
+			finished: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC),
+		}
+	}
+	sessionMeta := func() map[string]string {
+		return map[string]string{
+			"session_name": "sky",
+			"state":        "creating",
+		}
+	}
+	clk := &clock.Fake{Time: time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC)}
+
+	t.Run("resolved model and source land on the event payload and the bead metadata", func(t *testing.T) {
+		store := beads.NewMemStore()
+		session, err := store.Create(beads.Bead{
+			Title:    "helper",
+			Type:     sessionBeadType,
+			Labels:   []string{sessionBeadLabel},
+			Metadata: sessionMeta(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := events.NewFake()
+		if !commitStartResult(resultWithModel(&session, "claude", "claude-sonnet-5", ModelResolutionSourceDefault), sessionFrontDoor(store), clk, rec, 0, ioDiscard{}, ioDiscard{}) {
+			t.Fatal("commitStartResult returned false for successful start")
+		}
+		woke, err := rec.List(events.Filter{Type: events.SessionWoke})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(woke) != 1 {
+			t.Fatalf("session.woke events = %d, want exactly 1", len(woke))
+		}
+		var payload api.SessionWokePayload
+		if err := json.Unmarshal(woke[0].Payload, &payload); err != nil {
+			t.Fatalf("payload did not decode as SessionWokePayload: %v\nraw: %s", err, woke[0].Payload)
+		}
+		if payload.Provider != "claude" || payload.Model != "claude-sonnet-5" || payload.ModelSource != ModelResolutionSourceDefault {
+			t.Fatalf("payload = %+v, want provider=claude model=claude-sonnet-5 source=%s", payload, ModelResolutionSourceDefault)
+		}
+
+		updated, err := store.Get(session.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := updated.Metadata["resolved_model"]; got != "claude-sonnet-5" {
+			t.Fatalf("bead metadata resolved_model = %q, want claude-sonnet-5", got)
+		}
+		if got := updated.Metadata["resolved_model_source"]; got != ModelResolutionSourceDefault {
+			t.Fatalf("bead metadata resolved_model_source = %q, want %q", got, ModelResolutionSourceDefault)
+		}
+	})
+
+	t.Run("no resolved model -- payload omits it and no metadata is written", func(t *testing.T) {
+		store := beads.NewMemStore()
+		session, err := store.Create(beads.Bead{
+			Title:    "helper",
+			Type:     sessionBeadType,
+			Labels:   []string{sessionBeadLabel},
+			Metadata: sessionMeta(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := events.NewFake()
+		if !commitStartResult(resultWithModel(&session, "claude", "", ""), sessionFrontDoor(store), clk, rec, 0, ioDiscard{}, ioDiscard{}) {
+			t.Fatal("commitStartResult returned false for successful start")
+		}
+		woke, err := rec.List(events.Filter{Type: events.SessionWoke})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(woke) != 1 {
+			t.Fatalf("session.woke events = %d, want exactly 1", len(woke))
+		}
+		if strings.Contains(string(woke[0].Payload), `"model"`) || strings.Contains(string(woke[0].Payload), `"model_source"`) {
+			t.Fatalf("payload = %s, want model/model_source omitted entirely when unresolved", woke[0].Payload)
+		}
+		updated, err := store.Get(session.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := updated.Metadata["resolved_model"]; ok {
+			t.Fatal("bead metadata resolved_model was written despite no resolution")
 		}
 	})
 }

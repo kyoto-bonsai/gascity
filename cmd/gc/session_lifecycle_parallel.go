@@ -1460,6 +1460,10 @@ func applySchemaOptionOverridesForLaunch(agentCfg *runtime.Config, tp *TemplateP
 	if len(args) > 0 {
 		agentCfg.Command = replaceSchemaFlags(agentCfg.Command, resolved.OptionsSchema, args)
 	}
+	// ga-dbfydw: the RAW overrides param, never fullOptions -- fullOptions
+	// already has EffectiveDefaults merged in, so checking it would report
+	// "explicit" even when nothing but the default tier ever fired.
+	tp.ResolvedModel, tp.ResolvedModelSource = resolveSessionModel(resolved, overrides, tp.Env)
 	if command, err := config.BuildProviderResumeCommand(resolved, overrides); err == nil && strings.TrimSpace(command) != "" {
 		dup := *resolved
 		dup.ResumeCommand = command
@@ -2412,6 +2416,16 @@ func commitStartResultTraced(
 	if storedMCPSnapshot != "" || info.MCPServersSnapshot != "" {
 		metadata[sessionpkg.MCPServersSnapshotMetadataKey] = storedMCPSnapshot
 	}
+	// ga-dbfydw: stamped in the SAME atomic batch that fires session.woke below,
+	// so the durable bead metadata (surfaced via sessionResponse) and the event
+	// payload can never disagree -- both are one read of tp.ResolvedModel/
+	// tp.ResolvedModelSource, written and emitted from one commit. Empty when
+	// resolution found no model option (provider schema has none); never
+	// written as a stale guess.
+	if tp.ResolvedModel != "" {
+		metadata["resolved_model"] = tp.ResolvedModel
+		metadata["resolved_model_source"] = tp.ResolvedModelSource
+	}
 	if err := sessionpkg.PersistRuntimeMCPServersSnapshot(result.prepared.cfg.Env["GC_CITY_PATH"], info.ID, result.prepared.cfg.MCPServers); err != nil {
 		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		fmt.Fprintf(stderr, "session reconciler: storing runtime MCP snapshot for %s: %v\n", name, err) //nolint:errcheck
@@ -2473,11 +2487,18 @@ func commitStartResultTraced(
 	// whose commit then fails — a fact the store never recorded, since the
 	// failure paths above report the start as failed and retry (ga-kmoj9c).
 	fmt.Fprintf(stdout, "Woke session '%s'\n", tp.DisplayName()) //nolint:errcheck
+	// ga-dbfydw: scalars only, never tp.Env itself -- see SessionWokePayload's
+	// own doc comment for why.
+	wokeProvider := ""
+	if tp.ResolvedProvider != nil {
+		wokeProvider = tp.ResolvedProvider.Name
+	}
 	rec.Record(events.Event{
 		Type:      events.SessionWoke,
 		Actor:     "gc",
 		Subject:   tp.DisplayName(),
 		SessionID: info.ID,
+		Payload:   api.SessionWokePayloadJSON(wokeProvider, tp.ResolvedModel, tp.ResolvedModelSource),
 	})
 	telemetry.RecordAgentStart(context.Background(), name, tp.DisplayName(), nil)
 	if trace != nil {

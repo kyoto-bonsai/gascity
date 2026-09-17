@@ -2772,6 +2772,12 @@ export const zSessionWakeRefusedPayload = z.object({
     wake_request: z.string()
 });
 
+export const zSessionWokePayload = z.object({
+    model: z.string().optional(),
+    model_source: z.string().optional(),
+    provider: z.string().optional()
+});
+
 export const zSlingInputBody = z.object({
     attached_bead_id: z.string().optional(),
     bead: z.string().optional(),
@@ -3027,6 +3033,8 @@ export const zSessionResponse = z.object({
     pool: z.string().optional(),
     provider: z.string(),
     reason: z.string().optional(),
+    resolved_model: z.string().optional(),
+    resolved_model_source: z.string().optional(),
     rig: z.string().optional(),
     running: z.boolean(),
     session_name: z.string(),
@@ -3350,6 +3358,7 @@ export const zEventPayload = z.union([
     zSessionSubmitSucceededPayload,
     zSessionUnknownStatePayload,
     zSessionWakeRefusedPayload,
+    zSessionWokePayload,
     zStorageBindingOutcomePayload,
     zStoreDiskCriticalPayload,
     zStoreDiskWarnPayload,
@@ -4992,7 +5001,7 @@ export const zTypedEventStreamEnvelopeSessionWoke = z.object({
     actor: z.string(),
     depends_on_step_ids: z.array(z.string()).optional(),
     message: z.string().optional(),
-    payload: zNoPayload,
+    payload: zSessionWokePayload,
     run_id: z.string().optional(),
     seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
     session_id: z.string().optional(),
@@ -6975,7 +6984,7 @@ export const zTypedTaggedEventStreamEnvelopeSessionWoke = z.object({
     city: z.string(),
     depends_on_step_ids: z.array(z.string()).optional(),
     message: z.string().optional(),
-    payload: zNoPayload,
+    payload: zSessionWokePayload,
     run_id: z.string().optional(),
     seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
     session_id: z.string().optional(),

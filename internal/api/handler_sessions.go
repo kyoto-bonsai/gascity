@@ -57,6 +57,18 @@ type sessionResponse struct {
 	ContextPct    *int   `json:"context_pct,omitempty"`
 	ContextWindow *int   `json:"context_window,omitempty"`
 
+	// ResolvedModel and ResolvedModelSource (ga-dbfydw) are the model actually
+	// launched, from the same option-resolution the started provider command
+	// used — unlike Model above, which is read back best-effort from the
+	// provider's own transcript log and so stays empty during creating/
+	// start-pending and until the provider has produced output. Both are
+	// empty when no launch has resolved a model yet (start-pending, or the
+	// bead never reached a confirmed start). ResolvedModelSource is one of
+	// "explicit", "env", or "default" — see the main package's
+	// resolveSessionModel for the precedence.
+	ResolvedModel       string `json:"resolved_model,omitempty"`
+	ResolvedModelSource string `json:"resolved_model_source,omitempty"`
+
 	// Activity indicates session turn state: "idle", "in-turn", or omitted.
 	Activity string `json:"activity,omitempty"`
 
@@ -95,18 +107,20 @@ func sessionToResponse(info session.Info, cfg *config.City) sessionResponse {
 	}
 	rig, _ := config.ParseQualifiedName(info.Template)
 	r := sessionResponse{
-		ID:          info.ID,
-		Template:    info.Template,
-		State:       string(info.State),
-		Title:       info.Title,
-		Alias:       info.Alias,
-		Provider:    provider,
-		DisplayName: displayName,
-		SessionName: info.SessionName,
-		WorkDir:     info.WorkDir,
-		CreatedAt:   info.CreatedAt.Format(time.RFC3339),
-		Attached:    info.Attached,
-		Rig:         rig,
+		ID:                  info.ID,
+		Template:            info.Template,
+		State:               string(info.State),
+		Title:               info.Title,
+		Alias:               info.Alias,
+		Provider:            provider,
+		DisplayName:         displayName,
+		SessionName:         info.SessionName,
+		WorkDir:             info.WorkDir,
+		CreatedAt:           info.CreatedAt.Format(time.RFC3339),
+		Attached:            info.Attached,
+		Rig:                 rig,
+		ResolvedModel:       info.ResolvedModel,
+		ResolvedModelSource: info.ResolvedModelSource,
 	}
 	// Populate pool and agent_kind from config lookup. The pool field is
 	// the agent's base name (e.g., "polecat"), useful for dashboard type

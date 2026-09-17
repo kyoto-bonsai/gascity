@@ -2691,6 +2691,9 @@
             "$ref": "#/components/schemas/SessionWakeRefusedPayload"
           },
           {
+            "$ref": "#/components/schemas/SessionWokePayload"
+          },
+          {
             "$ref": "#/components/schemas/StorageBindingOutcomePayload"
           },
           {
@@ -7901,6 +7904,12 @@
           "reason": {
             "type": "string"
           },
+          "resolved_model": {
+            "type": "string"
+          },
+          "resolved_model_source": {
+            "type": "string"
+          },
           "rig": {
             "type": "string"
           },
@@ -11059,6 +11068,24 @@
           "wake_request",
           "attempts"
         ],
+        "type": "object"
+      },
+      "SessionWokePayload": {
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "description": "Resolved model string actually launched, or empty if the provider's schema has no model option.",
+            "type": "string"
+          },
+          "model_source": {
+            "description": "Which tier supplied Model: explicit, env, or default. Empty exactly when Model is empty.",
+            "type": "string"
+          },
+          "provider": {
+            "description": "Resolved provider name (e.g. claude, codex).",
+            "type": "string"
+          }
+        },
         "type": "object"
       },
       "SlingInputBody": {
@@ -17677,7 +17704,7 @@
             "type": "string"
           },
           "payload": {
-            "$ref": "#/components/schemas/NoPayload"
+            "$ref": "#/components/schemas/SessionWokePayload"
           },
           "run_id": {
             "type": "string"
@@ -24168,7 +24195,7 @@
             "type": "string"
           },
           "payload": {
-            "$ref": "#/components/schemas/NoPayload"
+            "$ref": "#/components/schemas/SessionWokePayload"
           },
           "run_id": {
             "type": "string"
