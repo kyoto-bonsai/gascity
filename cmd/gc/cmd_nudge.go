@@ -728,6 +728,7 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 	sessStore := cliSessionStore(store.Store, target.cfg, target.cityPath)
 	var missingSince time.Time
 	var lastFreeOS time.Time
+	binary := captureNudgePollerBinary()
 	for {
 		// Each tick that observes a changed beads.json re-parses the whole-file
 		// store, leaving several hundred MB of transient garbage. The soft
@@ -793,9 +794,58 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 			if recErr := recordNudgeDispatchSkips(target.cityPath, map[string]int64{skipReason: 1}); recErr != nil {
 				fmt.Fprintf(stderr, "gc nudge poll: recording dispatch skip counter: %v\n", recErr) //nolint:errcheck
 			}
+		} else if binary.replaced() {
+			// Pollers outlive supervisor restarts, so after a gc install they
+			// would keep running the old image indefinitely. Exit only with no
+			// due work queued; the next nudge relaunches a poller on the new
+			// binary.
+			fmt.Fprintf(stderr, "gc nudge poll: %s was replaced on disk; exiting so a poller relaunches on the new binary\n", binary.path) //nolint:errcheck
+			return 0
 		}
 		time.Sleep(interval)
 	}
+}
+
+// nudgePollerBinary records the file the poller was launched from so the poll
+// loop can notice a reinstall. path is argv[0] resolved to an absolute path,
+// which for an installed gc is the PATH symlink that installers repoint.
+type nudgePollerBinary struct {
+	path string
+	info os.FileInfo
+}
+
+func captureNudgePollerBinary() nudgePollerBinary {
+	path := os.Args[0]
+	if !filepath.IsAbs(path) {
+		resolved, err := exec.LookPath(path)
+		if err != nil {
+			return nudgePollerBinary{}
+		}
+		path = resolved
+	}
+	return newNudgePollerBinary(path)
+}
+
+func newNudgePollerBinary(path string) nudgePollerBinary {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nudgePollerBinary{}
+	}
+	return nudgePollerBinary{path: path, info: info}
+}
+
+// replaced reports whether path now resolves to a different file than at
+// launch. An unreadable path is not treated as replaced: a missing file mid-
+// swap must not make every poller exit at once.
+func (b nudgePollerBinary) replaced() bool {
+	if b.info == nil {
+		return false
+	}
+	cur, err := os.Stat(b.path)
+	if err != nil {
+		return false
+	}
+	return !os.SameFile(b.info, cur)
 }
 
 // nudgePollTargetHasDueWork reports whether the queue currently holds work

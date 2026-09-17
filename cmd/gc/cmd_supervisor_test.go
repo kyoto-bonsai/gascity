@@ -6846,3 +6846,79 @@ func TestRunSupervisorNoWarningForLowAPIPort(t *testing.T) {
 		t.Errorf("stdout = %q, want API listening message for low port", stdout.String())
 	}
 }
+
+func stubSupervisorInstalledServiceEnv(t *testing.T, env map[string]string) {
+	t.Helper()
+	prev := supervisorInstalledServiceEnv
+	supervisorInstalledServiceEnv = func() map[string]string { return env }
+	t.Cleanup(func() { supervisorInstalledServiceEnv = prev })
+}
+
+func TestBuildSupervisorServiceDataPreservesInstalledServiceEnv(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	stubSupervisorInstalledServiceEnv(t, map[string]string{
+		"CLAUDE_CONFIG_DIR": "/pinned/by/rotator",
+		"NOT_ALLOWLISTED":   "must-not-persist",
+	})
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+	got := supervisorServiceEnvMap(data.ExtraEnv)
+	if got["CLAUDE_CONFIG_DIR"] != "/pinned/by/rotator" {
+		t.Fatalf("ExtraEnv[CLAUDE_CONFIG_DIR] = %q, want the installed service file's value", got["CLAUDE_CONFIG_DIR"])
+	}
+	if _, ok := got["NOT_ALLOWLISTED"]; ok {
+		t.Fatalf("installed service file carried a non-allowlisted key forward: NOT_ALLOWLISTED")
+	}
+}
+
+func TestBuildSupervisorServiceDataPrefersOSEnvOverInstalledServiceEnv(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("CLAUDE_CONFIG_DIR", "/from/shell")
+	stubSupervisorInstalledServiceEnv(t, map[string]string{"CLAUDE_CONFIG_DIR": "/pinned/by/rotator"})
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+	if got := supervisorServiceEnvMap(data.ExtraEnv)["CLAUDE_CONFIG_DIR"]; got != "/from/shell" {
+		t.Fatalf("ExtraEnv[CLAUDE_CONFIG_DIR] = %q, want the invoking shell's value to win", got)
+	}
+}
+
+func TestLaunchdServiceEnvParsesEnvironmentVariables(t *testing.T) {
+	plist := []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.gascity.supervisor</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>CLAUDE_CONFIG_DIR</key>
+		<string>/pinned/slot</string>
+		<key>GC_HOME</key>
+		<string>/home/x/.gc</string>
+	</dict>
+</dict>
+</plist>`)
+	env := launchdServiceEnv(plist)
+	if env["CLAUDE_CONFIG_DIR"] != "/pinned/slot" || env["GC_HOME"] != "/home/x/.gc" {
+		t.Fatalf("launchdServiceEnv = %#v", env)
+	}
+	if home, ok := launchdSupervisorHome(plist); !ok || home != "/home/x/.gc" {
+		t.Fatalf("launchdSupervisorHome = %q, %v", home, ok)
+	}
+	if launchdServiceEnv([]byte("not a plist")) != nil {
+		t.Fatalf("launchdServiceEnv on garbage should be nil")
+	}
+}

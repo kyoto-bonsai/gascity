@@ -5489,3 +5489,52 @@ func TestResolveNudgePollInterval(t *testing.T) {
 		}
 	})
 }
+
+func TestNudgePollerBinaryReplacedAfterSymlinkRepoint(t *testing.T) {
+	dir := t.TempDir()
+	oldImg := filepath.Join(dir, "gc-old")
+	newImg := filepath.Join(dir, "gc-new")
+	for _, p := range []string{oldImg, newImg} {
+		if err := os.WriteFile(p, []byte(p), 0o755); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	link := filepath.Join(dir, "gc")
+	if err := os.Symlink(oldImg, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	bin := newNudgePollerBinary(link)
+	if bin.replaced() {
+		t.Fatalf("replaced() = true before any repoint")
+	}
+
+	tmp := link + ".tmp"
+	if err := os.Symlink(newImg, tmp); err != nil {
+		t.Fatalf("Symlink tmp: %v", err)
+	}
+	if err := os.Rename(tmp, link); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if !bin.replaced() {
+		t.Fatalf("replaced() = false after the symlink was repointed to a different image")
+	}
+}
+
+func TestNudgePollerBinaryMissingPathIsNotReplaced(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "gc")
+	if err := os.WriteFile(img, []byte("x"), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	bin := newNudgePollerBinary(img)
+	if err := os.Remove(img); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if bin.replaced() {
+		t.Fatalf("replaced() = true for a momentarily missing binary; want false so a mid-swap gap does not stop every poller")
+	}
+	if (nudgePollerBinary{}).replaced() {
+		t.Fatalf("zero-value nudgePollerBinary reported replaced")
+	}
+}

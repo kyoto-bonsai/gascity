@@ -63,6 +63,19 @@ var (
 		val := strings.TrimSuffix(string(out), "\n")
 		return strings.TrimSuffix(val, "\r")
 	}
+	// supervisorInstalledServiceEnv returns the EnvironmentVariables of the
+	// currently installed launchd plist. Returns nil on non-Darwin or when the
+	// plist is missing or unparseable.
+	supervisorInstalledServiceEnv = func() map[string]string {
+		if supervisorRuntimeGOOS != "darwin" {
+			return nil
+		}
+		data, err := os.ReadFile(supervisorLaunchdPlistPath())
+		if err != nil {
+			return nil
+		}
+		return launchdServiceEnv(data)
+	}
 	supervisorSystemctlRun = func(args ...string) error {
 		return exec.Command("systemctl", args...).Run()
 	}
@@ -1206,6 +1219,23 @@ func supervisorServiceExtraEnv() []supervisorServiceEnvVar {
 			env[key] = val
 		}
 	}
+	// Last tier: values already in the installed service file. Regenerating
+	// from a shell that lacks a key must not erase a value another tool wrote
+	// into the service file (e.g. an account rotator's CLAUDE_CONFIG_DIR pin);
+	// dropping it re-pins every spawned session to the invoking shell's
+	// config and can trigger that tool to restart the supervisor.
+	for key, val := range supervisorInstalledServiceEnv() {
+		if val == "" {
+			continue
+		}
+		if _, ok := env[key]; ok {
+			continue
+		}
+		if !shouldPersistSupervisorEnv(key) && !explicitEnvKeySet[key] {
+			continue
+		}
+		env[key] = val
+	}
 	// This process is a Gas City-owned recursive child. Assign the canonical
 	// fixed value after every inherited, explicit, secrets-file, and launchctl
 	// tier so none can re-enable product metrics in the service process.
@@ -1553,14 +1583,21 @@ type plistValue struct {
 }
 
 func launchdSupervisorHome(data []byte) (string, bool) {
+	gcHome := launchdServiceEnv(data)["GC_HOME"]
+	if gcHome == "" {
+		return "", false
+	}
+	return filepath.Clean(gcHome), true
+}
+
+// launchdServiceEnv returns the text values of a launchd plist's
+// EnvironmentVariables dict, or nil when the plist has none or does not parse.
+func launchdServiceEnv(data []byte) map[string]string {
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	for {
 		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) {
-			return "", false
-		}
 		if err != nil {
-			return "", false
+			return nil
 		}
 		start, ok := tok.(xml.StartElement)
 		if !ok || start.Name.Local != "dict" {
@@ -1568,17 +1605,17 @@ func launchdSupervisorHome(data []byte) (string, bool) {
 		}
 		root, err := parsePlistDict(dec)
 		if err != nil {
-			return "", false
+			return nil
 		}
 		env, ok := root["EnvironmentVariables"]
 		if !ok || env.dict == nil {
-			return "", false
+			return nil
 		}
-		gcHome, ok := env.dict["GC_HOME"]
-		if !ok || gcHome.text == "" {
-			return "", false
+		out := make(map[string]string, len(env.dict))
+		for key, val := range env.dict {
+			out[key] = val.text
 		}
-		return filepath.Clean(gcHome.text), true
+		return out
 	}
 }
 
