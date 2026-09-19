@@ -2122,10 +2122,22 @@ func TestSlingLaunchFormula(t *testing.T) {
 
 type fakeBeadRouter struct {
 	routed []RouteRequest
+	store  beads.Store
+	cfg    *config.City
 }
 
 func (r *fakeBeadRouter) Route(_ context.Context, req RouteRequest) error {
 	r.routed = append(r.routed, req)
+	if r.store == nil {
+		return nil
+	}
+	routedTo := req.Target
+	if r.cfg != nil {
+		routedTo = agentutil.NormalizePoolRouteTarget(r.cfg, routedTo)
+	}
+	if err := r.store.SetMetadata(req.BeadID, beadmeta.RoutedToMetadataKey, routedTo); err != nil {
+		return fmt.Errorf("setting %s on %s: %w", beadmeta.RoutedToMetadataKey, req.BeadID, err)
+	}
 	return nil
 }
 
@@ -4377,6 +4389,103 @@ func TestDoSlingForceSkipsCrossRig(t *testing.T) {
 	}, deps, nil)
 	if err != nil {
 		t.Fatalf("DoSling with --force should not error on cross-rig: %v", err)
+	}
+}
+
+func bareFamilyPoolVisibilitySetup(t *testing.T, assignee string) (SlingOpts, SlingDeps, beads.Bead) {
+	t.Helper()
+	target := config.Agent{Name: "persona-x", MaxActiveSessions: intPtr(4)}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test"},
+		Agents:    []config.Agent{target},
+	}
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	deps.Router = &fakeBeadRouter{store: deps.Store, cfg: cfg}
+	bead, err := deps.Store.Create(beads.Bead{
+		Title:    "pool work",
+		Type:     "task",
+		Status:   "open",
+		Assignee: assignee,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	opts := SlingOpts{Target: target, BeadOrFormula: bead.ID, NoFormula: true}
+	return opts, deps, bead
+}
+
+func requireSlingedBead(t *testing.T, store beads.Store, beadID, wantAssignee string) beads.Bead {
+	t.Helper()
+	got, err := store.Get(beadID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", beadID, err)
+	}
+	if got.Assignee != wantAssignee {
+		t.Fatalf("Assignee = %q, want %q", got.Assignee, wantAssignee)
+	}
+	if got.Metadata[beadmeta.RoutedToMetadataKey] != "persona-x" {
+		t.Fatalf("%s = %q, want persona-x", beadmeta.RoutedToMetadataKey, got.Metadata[beadmeta.RoutedToMetadataKey])
+	}
+	return got
+}
+
+func TestSlingOpenAssignedBareFamilyPoolVisible(t *testing.T) {
+	opts, deps, bead := bareFamilyPoolVisibilitySetup(t, "persona-x")
+
+	if _, err := DoSling(opts, deps, deps.Store); err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	got := requireSlingedBead(t, deps.Store, bead.ID, "")
+	if got.Status != "open" {
+		t.Fatalf("Status = %q, want open", got.Status)
+	}
+	ready, err := deps.Store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if !slices.ContainsFunc(ready, func(candidate beads.Bead) bool { return candidate.ID == bead.ID }) {
+		t.Fatalf("Ready() = %#v, want routed unassigned bead %s visible to the pool", ready, bead.ID)
+	}
+}
+
+func TestSlingAlreadyRoutedBareFamilyAssigneePoolVisible(t *testing.T) {
+	opts, deps, bead := bareFamilyPoolVisibilitySetup(t, "persona-x")
+	if err := deps.Store.SetMetadata(bead.ID, beadmeta.RoutedToMetadataKey, "persona-x"); err != nil {
+		t.Fatalf("SetMetadata(%s): %v", beadmeta.RoutedToMetadataKey, err)
+	}
+
+	if _, err := DoSling(opts, deps, deps.Store); err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	got := requireSlingedBead(t, deps.Store, bead.ID, "")
+	if got.Status != "open" {
+		t.Fatalf("Status = %q, want open", got.Status)
+	}
+}
+
+func TestSlingNamedOrInstanceAssigneeNotPoolVisible(t *testing.T) {
+	for _, assignee := range []string{"persona-tomoko", "persona-x-2-pool"} {
+		t.Run(assignee, func(t *testing.T) {
+			opts, deps, bead := bareFamilyPoolVisibilitySetup(t, assignee)
+
+			if _, err := DoSling(opts, deps, deps.Store); err != nil {
+				t.Fatalf("DoSling: %v", err)
+			}
+			requireSlingedBead(t, deps.Store, bead.ID, assignee)
+		})
+	}
+}
+
+func TestSlingRawSessionIdOrRigQualifiedAssigneeNotPoolVisible(t *testing.T) {
+	for _, assignee := range []string{"ga-lbvi5e", "rig/persona-x"} {
+		t.Run(assignee, func(t *testing.T) {
+			opts, deps, bead := bareFamilyPoolVisibilitySetup(t, assignee)
+
+			if _, err := DoSling(opts, deps, deps.Store); err != nil {
+				t.Fatalf("DoSling: %v", err)
+			}
+			requireSlingedBead(t, deps.Store, bead.ID, assignee)
+		})
 	}
 }
 

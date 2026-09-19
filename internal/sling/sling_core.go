@@ -141,6 +141,11 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 	// Pre-flight idempotency check.
 	if shouldCheckBeadState(opts) {
 		if resolveIdempotentShortCircuit(opts, a, deps, querier, &result) {
+			if shouldClearBareFamilyAssignee(opts) {
+				if err := clearBareFamilyAssignee(opts.BeadOrFormula, opts.Target, deps); err != nil {
+					return result, fmt.Errorf("clearing bare-family assignee on %s: %w", opts.BeadOrFormula, err)
+				}
+			}
 			return result, nil
 		}
 	}
@@ -174,6 +179,12 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 			result.Method = "on-formula"
 		}
 		return result, nil
+	}
+
+	if shouldClearBareFamilyAssignee(opts) {
+		if err := clearBareFamilyAssignee(opts.BeadOrFormula, opts.Target, deps); err != nil {
+			return result, fmt.Errorf("clearing bare-family assignee on %s: %w", opts.BeadOrFormula, err)
+		}
 	}
 
 	if opts.ScopeKind != "" && !opts.IsFormula && opts.OnFormula == "" && (opts.NoFormula || a.EffectiveDefaultSlingFormula() == "") {
@@ -379,6 +390,14 @@ func shouldValidateBuiltInRouteStoreReachable(opts SlingOpts, deps SlingDeps) bo
 // !IsFormula guard, mirroring the auto-convoy block. Dry-run never mutates.
 func shouldReopenForReassign(opts SlingOpts) bool {
 	return opts.Reassign && !opts.IsFormula && !opts.DryRun
+}
+
+// shouldClearBareFamilyAssignee reports whether routing an existing open bead
+// may clear an assignee that is only the target's multi-session family name.
+// Dry-run never mutates, and standalone formula launches do not name a target
+// bead. Singleton/named-session agents keep their explicit assignment.
+func shouldClearBareFamilyAssignee(opts SlingOpts) bool {
+	return !opts.IsFormula && !opts.DryRun && opts.Target.SupportsMultipleSessions()
 }
 
 func validateExistingBead(beadID string, deps SlingDeps) error {
@@ -2471,4 +2490,55 @@ func reopenForReassignInStore(store beads.Store, beadID string, b beads.Bead) er
 		return nil
 	}
 	return store.Update(beadID, update)
+}
+
+// clearBareFamilyAssignee makes an already-open bead visible to a pool demand
+// query when its assignee is only the same bare family that gc.routed_to will
+// name. That assignment is not a concrete owner; leaving it in place keeps the
+// bead invisible to --unassigned pool probes after routing. Concrete owners
+// (named sessions, slot/session ids, rig-qualified assignees, foreign agents)
+// are deliberately preserved.
+func clearBareFamilyAssignee(beadID string, target config.Agent, deps SlingDeps) error {
+	targetIdentity := strings.TrimSpace(agentutil.RoutedToIdentity(&target))
+	if targetIdentity == "" {
+		return nil
+	}
+	if deps.Store != nil {
+		b, err := deps.Store.Get(beadID)
+		if err == nil {
+			return clearBareFamilyAssigneeInStore(deps.Store, beadID, b, targetIdentity)
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			return fmt.Errorf("reading %s from primary store: %w", beadID, err)
+		}
+	}
+	if deps.SourceWorkflowStores == nil {
+		return nil
+	}
+	stores, err := deps.SourceWorkflowStores()
+	if err != nil {
+		return fmt.Errorf("listing source-workflow stores: %w", err)
+	}
+	for _, info := range stores {
+		if info.Store == nil {
+			continue
+		}
+		b, err := info.Store.Get(beadID)
+		if err != nil {
+			if errors.Is(err, beads.ErrNotFound) {
+				continue
+			}
+			return fmt.Errorf("reading %s from store %q: %w", beadID, strings.TrimSpace(info.StoreRef), err)
+		}
+		return clearBareFamilyAssigneeInStore(info.Store, beadID, b, targetIdentity)
+	}
+	return nil
+}
+
+func clearBareFamilyAssigneeInStore(store beads.Store, beadID string, b beads.Bead, targetIdentity string) error {
+	if b.Status != "open" || strings.TrimSpace(b.Assignee) != targetIdentity {
+		return nil
+	}
+	empty := ""
+	return store.Update(beadID, beads.UpdateOpts{Assignee: &empty})
 }
