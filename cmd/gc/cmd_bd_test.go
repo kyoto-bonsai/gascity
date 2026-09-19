@@ -173,8 +173,14 @@ func TestResolveBdScopeTarget(t *testing.T) {
 
 	origProbe := bdBeadExists
 	defer func() { bdBeadExists = origProbe }()
-	bdBeadExists = func(_ string, _ *config.City, _ execStoreTarget, beadID string) bool {
-		return beadID == "projectwrenunity-0xk" || beadID == "projectwrenunity-abc"
+	bdBeadExists = func(_ string, _ *config.City, target execStoreTarget, beadID string) bool {
+		if beadID == "projectwrenunity-0xk" || beadID == "projectwrenunity-abc" {
+			return true
+		}
+		if target.ScopeKind == "city" && beadID == "ga-atnb76" {
+			return true
+		}
+		return target.RigName == "content-production" && beadID == "cp-wisp-nsm"
 	}
 	cityDir := filepath.Join(t.TempDir(), "city")
 	cfgForTest := func() *config.City {
@@ -182,6 +188,7 @@ func TestResolveBdScopeTarget(t *testing.T) {
 			Workspace: config.Workspace{Name: "gascity"},
 			Rigs: []config.Rig{
 				{Name: "wren", Path: filepath.Join("rigs", "wren"), Prefix: "projectwrenunity"},
+				{Name: "content-production", Path: filepath.Join("rigs", "content-production"), Prefix: "cp"},
 				{Name: "gascity", Path: filepath.Join("rigs", "gascity")},
 			},
 		}
@@ -226,6 +233,17 @@ func TestResolveBdScopeTarget(t *testing.T) {
 				ScopeKind: "rig",
 				Prefix:    "projectwrenunity",
 				RigName:   "wren",
+			},
+		},
+		{
+			name:    "update ignores ga-prefixed assignee flag value",
+			rigName: "",
+			args:    []string{"update", "cp-wisp-nsm", "-a", "ga-atnb76", "-s", "in_progress", "--force"},
+			want: execStoreTarget{
+				ScopeRoot: filepath.Join(cityDir, "rigs", "content-production"),
+				ScopeKind: "rig",
+				Prefix:    "cp",
+				RigName:   "content-production",
 			},
 		},
 		{

@@ -1070,9 +1070,10 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 	}
 
 	cityPrefix := config.EffectiveHQPrefix(cfg)
+	scopeCandidates := bdScopeIDCandidates(args)
 	if cityPrefix != "" {
-		for _, arg := range args {
-			if strings.HasPrefix(arg, "-") || beadPrefix(cfg, arg) != cityPrefix {
+		for _, arg := range scopeCandidates {
+			if beadPrefix(cfg, arg) != cityPrefix {
 				continue
 			}
 			if bdBeadExists(cityPath, cfg, cityTarget, arg) {
@@ -1085,10 +1086,7 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 	// actually exist in the resolved rig store. This keeps hyphenated flag
 	// values and other non-ID args from silently retargeting the command.
 	// Unbound rigs are skipped so we don't alias them to the city store.
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
+	for _, arg := range scopeCandidates {
 		if rig, ok := bdRigForArg(cfg, arg); ok {
 			if strings.TrimSpace(rig.Path) == "" {
 				continue
@@ -1149,6 +1147,69 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 		fmt.Fprintf(stderr, "gc bd: warning: GC_RIG=%q does not name a bound rig in this city; ignoring it and answering from the %s store instead (the same value via --rig would exit 1)\n", gcRigDiscarded, scopeLabel(target)) //nolint:errcheck // best-effort stderr
 	}
 	return target, nil
+}
+
+// bdScopeIDCandidates returns the bead IDs a bd invocation addresses for
+// store-scope auto-detection. Flag values such as `update <id> -a ga-session`
+// are not candidates; otherwise a live ga-* session bead can pin a rig update
+// to the city store before the positional rig bead is checked.
+func bdScopeIDCandidates(args []string) []string {
+	sub, subArgs, resolved := bdByIDSubcommand(args)
+	if !resolved {
+		return bdflags.Positionals(sub, subArgs)
+	}
+	if positionals := bdflags.Positionals(sub, subArgs); len(positionals) > 0 {
+		return positionals
+	}
+	return bdScopeIDFlagValues(sub, subArgs)
+}
+
+func bdScopeIDFlagValues(sub string, args []string) []string {
+	valueFlags := bdflags.ValueFlags(sub)
+	if len(valueFlags) == 0 {
+		return nil
+	}
+
+	var ids []string
+	positionalOnly := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if positionalOnly {
+			continue
+		}
+		if arg == "--" {
+			positionalOnly = true
+			continue
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			continue
+		}
+		name, inline, hasInline := strings.Cut(arg, "=")
+		if hasInline {
+			if valueFlags[name] && bdIDValuedFlags[name] {
+				ids = appendScopeIDParts(ids, inline)
+			}
+			continue
+		}
+		if !valueFlags[name] {
+			continue
+		}
+		if bdIDValuedFlags[name] && i+1 < len(args) {
+			ids = appendScopeIDParts(ids, args[i+1])
+		}
+		i++
+	}
+	return ids
+}
+
+func appendScopeIDParts(ids []string, value string) []string {
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			ids = append(ids, part)
+		}
+	}
+	return ids
 }
 
 // bdScopeDisclosureVerbs are the bd read-only passthrough verbs whose
