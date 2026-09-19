@@ -74,7 +74,7 @@ const (
 	// before the sweep deletes it. It is the ttl the deployed queue's
 	// retention sweeper runs with (cmd/gc's defaultQueuedNudgeTTL, also a
 	// queued nudge's deliver-by deadline).
-	nudgeQueueTerminalRetention = 24 * time.Hour
+	nudgeQueueTerminalRetention = 45 * time.Minute
 	// nudgeQueueCASAttempts bounds one contended state transition. A caller
 	// that loses this many revision races is contending with a writer that is
 	// not this queue, which is a fault rather than a retry.

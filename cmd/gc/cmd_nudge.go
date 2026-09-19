@@ -37,7 +37,9 @@ import (
 )
 
 const (
-	defaultQueuedNudgeTTL           = 24 * time.Hour
+	// Bound queued reminders to the longest normal session sleep window. Older
+	// nudges are dead-lettered instead of submitted after context has moved on.
+	defaultQueuedNudgeTTL           = 45 * time.Minute
 	defaultQueuedNudgeClaimTTL      = 2 * time.Minute
 	defaultQueuedNudgeRetryDelay    = 15 * time.Second
 	defaultQueuedNudgeMaxAttempts   = 5

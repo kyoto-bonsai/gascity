@@ -616,6 +616,57 @@ func TestDeliverSessionNudgeWithWorkerWaitIdleResumesClaudeSession(t *testing.T)
 	}
 }
 
+func TestNudgeWaitIdleSubmitsOnIdle(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	fake := runtime.NewFake()
+	if err := fake.Start(context.Background(), "sess-worker", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	fake.SetActivity("sess-worker", time.Now().Add(-defaultNudgePollQuiescence-time.Second))
+	fake.WaitForIdleErrors["sess-worker"] = nil
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionName: "sess-worker",
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := deliverSessionNudgeWithProvider(target, fake, nudgeDeliveryWaitIdle, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("deliverSessionNudgeWithProvider = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if calls := fake.CountCalls("WaitForIdle", "sess-worker"); calls != 1 {
+		t.Fatalf("WaitForIdle calls = %d, want 1", calls)
+	}
+	if calls := fake.CountCalls("NudgeNow", "sess-worker"); calls != 1 {
+		t.Fatalf("NudgeNow calls = %d, want 1", calls)
+	}
+	if calls := fake.CountCalls("Nudge", "sess-worker"); calls != 0 {
+		t.Fatalf("Nudge calls = %d, want 0 for wait-idle submit path", calls)
+	}
+
+	var delivered string
+	for _, call := range fake.SnapshotCalls() {
+		if call.Method == "NudgeNow" && call.Name == "sess-worker" {
+			delivered = call.Message
+		}
+	}
+	if !strings.Contains(delivered, "<system-reminder>") || !strings.Contains(delivered, "[session] check deploy status") {
+		t.Fatalf("delivered message = %q, want wait-idle system reminder with original message", delivered)
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending=%d inFlight=%d dead=%d, want all zero after live wait-idle submit", len(pending), len(inFlight), len(dead))
+	}
+}
+
 func TestDeliverSessionNudgeWithWorkerManagedNonRunningQueuesWakeForController(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()
@@ -3489,6 +3540,142 @@ func TestClaimDueQueuedNudgesClaimsOnceUntilAck(t *testing.T) {
 	}
 	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
 		t.Fatalf("after ack pending=%d inFlight=%d dead=%d, want all zero", len(pending), len(inFlight), len(dead))
+	}
+}
+
+func TestNudgeQueuedPastTTLDeadLettersNotSubmits(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	if err := fake.Start(context.Background(), "sess-worker", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	now := time.Now().UTC()
+	item := newQueuedNudgeWithOptions("worker", "stale deploy follow-up", "session", now.Add(-defaultQueuedNudgeTTL-time.Second), queuedNudgeOptions{
+		ID: "n-expired",
+	})
+	if err := enqueueQueuedNudgeWithStore(dir, store, item); err != nil {
+		t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
+	}
+
+	idleSince := now.Add(-defaultNudgePollQuiescence - time.Second)
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		sessionName: "sess-worker",
+	}
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, store.Store, store.Store, fake, defaultNudgePollQuiescence, worker.LiveObservation{
+		Running:      true,
+		LastActivity: &idleSince,
+	})
+	if err != nil {
+		t.Fatalf("tryDeliverQueuedNudgesByPoller: %v", err)
+	}
+	if delivered {
+		t.Fatal("tryDeliverQueuedNudgesByPoller delivered expired nudge, want dead-letter only")
+	}
+	if calls := fake.CountCalls("Nudge", "sess-worker"); calls != 0 {
+		t.Fatalf("Nudge calls = %d, want 0 for expired queue item", calls)
+	}
+	if calls := fake.CountCalls("NudgeNow", "sess-worker"); calls != 0 {
+		t.Fatalf("NudgeNow calls = %d, want 0 for expired queue item", calls)
+	}
+	if calls := fake.CountCalls("WaitForIdle", "sess-worker"); calls != 0 {
+		t.Fatalf("WaitForIdle calls = %d, want 0 when observation already proves idle", calls)
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 1 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 0/0/1", len(pending), len(inFlight), len(dead))
+	}
+	if dead[0].ID != "n-expired" {
+		t.Fatalf("dead ID = %q, want n-expired", dead[0].ID)
+	}
+	if dead[0].LastError != "expired" {
+		t.Fatalf("dead LastError = %q, want expired", dead[0].LastError)
+	}
+	if dead[0].DeadAt.IsZero() {
+		t.Fatal("dead nudge missing DeadAt timestamp")
+	}
+}
+
+func TestNudgeQueuedJustUnderTTLSubmits(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	if defaultQueuedNudgeTTL < 2700*time.Second {
+		t.Fatalf("defaultQueuedNudgeTTL = %s, want at least 2700s", defaultQueuedNudgeTTL)
+	}
+
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	if err := fake.Start(context.Background(), "sess-worker", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	now := time.Now().UTC()
+	item := newQueuedNudgeWithOptions("worker", "fresh deploy follow-up", "session", now.Add(-defaultQueuedNudgeTTL+time.Minute), queuedNudgeOptions{
+		ID: "n-fresh",
+	})
+	if err := enqueueQueuedNudgeWithStore(dir, store, item); err != nil {
+		t.Fatalf("enqueueQueuedNudgeWithStore: %v", err)
+	}
+
+	idleSince := now.Add(-defaultNudgePollQuiescence - time.Second)
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		sessionName: "sess-worker",
+	}
+	delivered, err := tryDeliverQueuedNudgesByPoller(target, store.Store, store.Store, fake, defaultNudgePollQuiescence, worker.LiveObservation{
+		Running:      true,
+		LastActivity: &idleSince,
+	})
+	if err != nil {
+		t.Fatalf("tryDeliverQueuedNudgesByPoller: %v", err)
+	}
+	if !delivered {
+		t.Fatal("tryDeliverQueuedNudgesByPoller = false, want just-under-TTL nudge submitted")
+	}
+	if calls := fake.CountCalls("Nudge", "sess-worker"); calls != 1 {
+		t.Fatalf("Nudge calls = %d, want 1", calls)
+	}
+
+	var deliveredMessage string
+	for _, call := range fake.SnapshotCalls() {
+		if call.Method == "Nudge" && call.Name == "sess-worker" {
+			deliveredMessage = call.Message
+		}
+	}
+	if !strings.Contains(deliveredMessage, "<system-reminder>") || !strings.Contains(deliveredMessage, "fresh deploy follow-up") {
+		t.Fatalf("delivered message = %q, want queued reminder wrapper", deliveredMessage)
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, "worker", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want all zero after ack", len(pending), len(inFlight), len(dead))
+	}
+}
+
+func TestNudgeDefaultDeliveryIsWaitIdle(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	cmd := newSessionNudgeCmd(&stdout, &stderr)
+	flag := cmd.Flags().Lookup("delivery")
+	if flag == nil {
+		t.Fatal("delivery flag is missing")
+	}
+	if flag.DefValue != string(nudgeDeliveryWaitIdle) {
+		t.Fatalf("delivery default = %q, want %q", flag.DefValue, nudgeDeliveryWaitIdle)
+	}
+	if got := flag.Value.String(); got != string(nudgeDeliveryWaitIdle) {
+		t.Fatalf("delivery flag value = %q, want %q", got, nudgeDeliveryWaitIdle)
 	}
 }
 
