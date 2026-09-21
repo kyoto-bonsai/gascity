@@ -307,6 +307,7 @@ type hookClaimJSONResult struct {
 	Awaiting             string   `json:"awaiting,omitempty"`
 	ContinuationAssigned []string `json:"continuation_assigned,omitempty"`
 	DrainAcknowledged    bool     `json:"drain_acknowledged,omitempty"`
+	ReadbackDegraded     bool     `json:"readback_degraded,omitempty"`
 }
 
 // hookClaimResult is the outcome of attempting a claim against one store's
@@ -673,6 +674,9 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 		claimActor := strings.TrimSpace(candidate.Assignee)
 		claimed, ok, err := ops.Claim(ctx, dir, opts.Env, candidate.ID, claimActor)
 		if err != nil {
+			if ok {
+				return reportCommittedHookClaimWithoutReadback(candidate, claimed, "ready_assignment", err, opts, ops, dir, stdout, stderr)
+			}
 			if !ok && (hookClaimBeadIsElsewhere(err) || hookClaimBindingRefusedTheClaim(err)) {
 				// The read federated and the write did not: the assigned tier
 				// reads city-wide, so a graph step in a relocated class store
@@ -691,11 +695,7 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 				claimsErrored = true
 				continue
 			}
-			if ok {
-				fmt.Fprintf(stderr, "gc hook --claim: claimed %s but loading canonical bead failed: %v\n", candidate.ID, err) //nolint:errcheck
-			} else {
-				fmt.Fprintf(stderr, "gc hook --claim: promoting ready assignment %s: %v\n", candidate.ID, err) //nolint:errcheck
-			}
+			fmt.Fprintf(stderr, "gc hook --claim: promoting ready assignment %s: %v\n", candidate.ID, err) //nolint:errcheck
 			// This session already owns the bead. Do not skip it and claim
 			// unrelated fresh work after an operational mutation failure.
 			return hookClaimResult{terminal: true, code: 1}
@@ -795,11 +795,7 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		claimed, ok, err := ops.Claim(ctx, dir, opts.Env, candidate.ID, opts.Assignee)
 		if err != nil {
 			if ok {
-				// The atomic mutation committed, but its canonical readback failed.
-				// Stop immediately: trying another candidate or draining would strand
-				// the assignment while falsely reporting idle work.
-				fmt.Fprintf(stderr, "gc hook --claim: claimed %s but loading canonical bead failed: %v\n", candidate.ID, err) //nolint:errcheck
-				return hookClaimResult{terminal: true, code: 1}
+				return reportCommittedHookClaimWithoutReadback(candidate, claimed, "claimed", err, opts, ops, dir, stdout, stderr)
 			}
 			// A single unclaimable candidate (a routed id whose bead was deleted,
 			// one that no longer resolves in the store this context can reach, or a
@@ -875,6 +871,54 @@ func mergeHookClaimCandidateMetadata(candidate, claimed beads.Bead) beads.Bead {
 	maps.Copy(metadata, claimed.Metadata)
 	claimed.Metadata = metadata
 	return claimed
+}
+
+// reportCommittedHookClaimWithoutReadback delivers the mutation's ownership
+// receipt even when the later canonical Get fails. The CAS already committed;
+// withholding this receipt parks work that the caller believes it never took.
+// Canonical-dependent stamps and continuation preassignment are skipped because
+// their inputs could be stale. A failed receipt write compensates by releasing
+// the just-minted claim through the same store binding.
+func reportCommittedHookClaimWithoutReadback(candidate, claimed beads.Bead, reason string, readbackErr error, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) hookClaimResult {
+	expectedAssignee := opts.Assignee
+	if reason == "ready_assignment" {
+		expectedAssignee = candidate.Assignee
+	}
+	projectionMatchesID := claimed.ID == "" || claimed.ID == candidate.ID
+	projectionOwnedByActor := hookClaimHasIdentity(claimed.Assignee, []string{expectedAssignee})
+	readyPromoted := reason != "ready_assignment" || strings.EqualFold(claimed.Status, "in_progress")
+	if !projectionMatchesID || !projectionOwnedByActor || !readyPromoted {
+		cause := fmt.Sprintf("claim of %s committed, but mutation projection id=%q status=%q assignee=%q cannot establish this session's ownership; canonical readback failed: %v",
+			candidate.ID, claimed.ID, claimed.Status, claimed.Assignee, readbackErr)
+		return hookClaimResult{terminal: true, code: unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, cause,
+			beads.Bead{ID: candidate.ID, Assignee: expectedAssignee}, opts, ops, dir, stderr)}
+	}
+	if claimed.ID == "" {
+		claimed.ID = candidate.ID
+	}
+	if ops.claimWindowSpent() {
+		cause := fmt.Sprintf("claim of %s landed after the claim window closed; canonical readback also failed: %v", claimed.ID, readbackErr)
+		return hookClaimResult{terminal: true, code: unwindUndeliveredHookClaim(hookClaimReleaseReasonStraddled, cause, claimed, opts, ops, dir, stderr)}
+	}
+	result := hookClaimJSONResult{
+		SchemaVersion:    "1",
+		OK:               true,
+		Command:          hookClaimCommandName,
+		Action:           "work",
+		Reason:           reason,
+		BeadID:           claimed.ID,
+		Assignee:         claimed.Assignee,
+		Route:            hookClaimRoute(candidate),
+		Awaiting:         candidate.Metadata[beadmeta.AwaitingMetadataKey],
+		ReadbackDegraded: true,
+	}
+	if writeErr := writeHookClaimResultLine(result, opts.JSON, stdout); writeErr != nil {
+		cause := fmt.Sprintf("writing degraded claim receipt for %s: %v (canonical readback: %v)", claimed.ID, writeErr, readbackErr)
+		return hookClaimResult{terminal: true, code: unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, cause, claimed, opts, ops, dir, stderr)}
+	}
+	warnHookClaimAwaitingParked(result, stderr)
+	fmt.Fprintf(stderr, "gc hook --claim: claimed %s; canonical bead readback failed (%v); work receipt delivered with readback_degraded=true, canonical-dependent enrichment skipped\n", claimed.ID, readbackErr) //nolint:errcheck
+	return hookClaimResult{terminal: true, code: 0}
 }
 
 // hookCandidateClaimable reports whether a work-query candidate is eligible for a

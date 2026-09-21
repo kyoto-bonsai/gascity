@@ -51,15 +51,16 @@ func TestHookClaimWithBdStoreReloadsCanonicalBeadAfterPartialMutation(t *testing
 	}
 }
 
-func TestDoHookClaimStopsAfterCommittedClaimReadbackFailure(t *testing.T) {
+func TestDoHookClaimReportsCommittedClaimWhenReadbackFails(t *testing.T) {
 	runner := func(string, string) (string, error) {
 		return `[
-			{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker"}},
+			{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"group-1"}},
 			{"id":"work-2","status":"open","metadata":{"gc.routed_to":"worker"}}
 		]`, nil
 	}
 	var attempts []string
 	drained := false
+	enriched := false
 	ops := hookClaimOps{
 		Runner: runner,
 		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
@@ -68,6 +69,14 @@ func TestDoHookClaimStopsAfterCommittedClaimReadbackFailure(t *testing.T) {
 		},
 		DrainAck: func(io.Writer) error {
 			drained = true
+			return nil
+		},
+		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+			enriched = true
+			return nil, nil
+		},
+		StampWorkMeta: func(context.Context, string, []string, string, string, map[string]string) error {
+			enriched = true
 			return nil
 		},
 	}
@@ -80,8 +89,8 @@ func TestDoHookClaimStopsAfterCommittedClaimReadbackFailure(t *testing.T) {
 		JSON:         true,
 	}, ops, &stdout, &stderr)
 
-	if code != 1 {
-		t.Fatalf("doHookClaim = %d, want 1", code)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if got := strings.Join(attempts, ","); got != "work-1" {
 		t.Fatalf("claim attempts = %q, want only committed work-1", got)
@@ -89,11 +98,90 @@ func TestDoHookClaimStopsAfterCommittedClaimReadbackFailure(t *testing.T) {
 	if drained {
 		t.Fatal("drain acknowledged after committed claim readback failure")
 	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout = %q, want empty", stdout.String())
+	if enriched {
+		t.Fatal("canonical-dependent enrichment ran after readback failure")
 	}
-	if !strings.Contains(stderr.String(), "claimed work-1 but loading canonical bead failed") {
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decoding claim receipt: %v; stdout=%q", err, stdout.String())
+	}
+	if !result.OK || result.Action != "work" || result.BeadID != "work-1" || result.Assignee != "worker-1" || !result.ReadbackDegraded {
+		t.Fatalf("result = %+v, want a degraded work receipt for the committed claim", result)
+	}
+	if !strings.Contains(stderr.String(), "claimed work-1; canonical bead readback failed") {
 		t.Fatalf("stderr = %q, want committed-claim diagnostic", stderr.String())
+	}
+}
+
+func TestDoHookClaimReportsCommittedReadyAssignmentWhenReadbackFails(t *testing.T) {
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) {
+			return `[{"id":"work-1","status":"open","assignee":"worker-1","metadata":{"gc.routed_to":"worker"}}]`, nil
+		},
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee}, true, errors.New("canonical read failed")
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee: "worker-1", IdentityCandidates: []string{"worker-1"}, RouteTargets: []string{"worker"}, JSON: true,
+	}, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decoding claim receipt: %v; stdout=%q", err, stdout.String())
+	}
+	if !result.OK || result.Action != "work" || result.BeadID != "work-1" || result.Reason != "ready_assignment" || !result.ReadbackDegraded {
+		t.Fatalf("result = %+v, want a degraded ready-assignment receipt", result)
+	}
+}
+
+func TestDoHookClaimReleasesDegradedClaimWhenReceiptCannotBeWritten(t *testing.T) {
+	var released string
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) {
+			return `[{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker"}}]`, nil
+		},
+		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee}, true, errors.New("canonical read failed")
+		},
+		Release: func(_ context.Context, _ string, _ []string, beadID, assignee string) (bool, error) {
+			released = beadID + ":" + assignee
+			return true, nil
+		},
+	}
+	var stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee: "worker-1", RouteTargets: []string{"worker"}, JSON: true,
+	}, ops, brokenPipeWriter{}, &stderr)
+	if code != 1 || released != "work-1:worker-1" {
+		t.Fatalf("code=%d released=%q, want failed delivery followed by release; stderr=%s", code, released, stderr.String())
+	}
+}
+
+func TestDoHookClaimDoesNotReportForeignOwnerFromDegradedMutation(t *testing.T) {
+	var releasedAssignee string
+	ops := hookClaimOps{
+		Runner: func(string, string) (string, error) {
+			return `[{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker"}}]`, nil
+		},
+		Claim: func(_ context.Context, _ string, _ []string, beadID, _ string) (beads.Bead, bool, error) {
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: "other-worker"}, true, errors.New("canonical read failed")
+		},
+		Release: func(_ context.Context, _ string, _ []string, _, assignee string) (bool, error) {
+			releasedAssignee = assignee
+			return false, nil
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("query", "/rig", hookClaimOptions{
+		Assignee: "worker-1", RouteTargets: []string{"worker"}, JSON: true,
+	}, ops, &stdout, &stderr)
+	if code != 1 || stdout.Len() != 0 || releasedAssignee != "worker-1" {
+		t.Fatalf("code=%d stdout=%q release actor=%q, want no foreign work receipt and guarded release; stderr=%s",
+			code, stdout.String(), releasedAssignee, stderr.String())
 	}
 }
 

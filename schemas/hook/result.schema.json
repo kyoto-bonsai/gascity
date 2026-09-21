@@ -67,6 +67,10 @@
     },
     "drain_acknowledged": {
       "type": "boolean"
+    },
+    "readback_degraded": {
+      "type": "boolean",
+      "description": "The claim mutation committed, but the canonical bead readback failed. Canonical-dependent enrichment was skipped."
     }
   },
   "allOf": [
