@@ -876,9 +876,10 @@ func mergeHookClaimCandidateMetadata(candidate, claimed beads.Bead) beads.Bead {
 // reportCommittedHookClaimWithoutReadback delivers the mutation's ownership
 // receipt even when the later canonical Get fails. The CAS already committed;
 // withholding this receipt parks work that the caller believes it never took.
-// Canonical-dependent stamps and continuation preassignment are skipped because
-// their inputs could be stale. A failed receipt write compensates by releasing
-// the just-minted claim through the same store binding.
+// Canonical-dependent work metadata, lifecycle emission, and continuation
+// preassignment are skipped because their inputs could be stale. The session's
+// current-claim stamp needs only the confirmed ID and still runs. A failed
+// receipt write clears that stamp before releasing the just-minted claim.
 func reportCommittedHookClaimWithoutReadback(candidate, claimed beads.Bead, reason string, readbackErr error, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) hookClaimResult {
 	expectedAssignee := opts.Assignee
 	if reason == "ready_assignment" {
@@ -912,8 +913,10 @@ func reportCommittedHookClaimWithoutReadback(candidate, claimed beads.Bead, reas
 		Awaiting:         candidate.Metadata[beadmeta.AwaitingMetadataKey],
 		ReadbackDegraded: true,
 	}
+	stampHookSessionCurrentClaim(claimed, opts, ops, stderr)
 	if writeErr := writeHookClaimResultLine(result, opts.JSON, stdout); writeErr != nil {
 		cause := fmt.Sprintf("writing degraded claim receipt for %s: %v (canonical readback: %v)", claimed.ID, writeErr, readbackErr)
+		clearHookSessionCurrentClaim(opts, ops, stderr)
 		return hookClaimResult{terminal: true, code: unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, cause, claimed, opts, ops, dir, stderr)}
 	}
 	warnHookClaimAwaitingParked(result, stderr)

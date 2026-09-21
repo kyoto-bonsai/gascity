@@ -61,8 +61,16 @@ func TestDoHookClaimReportsCommittedClaimWhenReadbackFails(t *testing.T) {
 	var attempts []string
 	drained := false
 	enriched := false
+	sessionClaim := "previous-work"
 	ops := hookClaimOps{
 		Runner: runner,
+		StampSessionClaim: func(sessionID, beadID string) error {
+			if sessionID != "session-1" {
+				t.Fatalf("session stamp target = %q, want session-1", sessionID)
+			}
+			sessionClaim = beadID
+			return nil
+		},
 		Claim: func(_ context.Context, _ string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
 			attempts = append(attempts, beadID)
 			return beads.Bead{ID: beadID, Assignee: assignee}, true, errors.New("canonical read failed")
@@ -84,6 +92,7 @@ func TestDoHookClaimReportsCommittedClaimWhenReadbackFails(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := doHookClaim("query", "/rig", hookClaimOptions{
 		Assignee:     "worker-1",
+		Env:          []string{"GC_SESSION_ID=session-1"},
 		RouteTargets: []string{"worker"},
 		DrainAck:     true,
 		JSON:         true,
@@ -101,6 +110,9 @@ func TestDoHookClaimReportsCommittedClaimWhenReadbackFails(t *testing.T) {
 	if enriched {
 		t.Fatal("canonical-dependent enrichment ran after readback failure")
 	}
+	if sessionClaim != "work-1" {
+		t.Fatalf("session current claim = %q, want delivered work-1", sessionClaim)
+	}
 	var result hookClaimJSONResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		t.Fatalf("decoding claim receipt: %v; stdout=%q", err, stdout.String())
@@ -114,7 +126,15 @@ func TestDoHookClaimReportsCommittedClaimWhenReadbackFails(t *testing.T) {
 }
 
 func TestDoHookClaimReportsCommittedReadyAssignmentWhenReadbackFails(t *testing.T) {
+	sessionClaim := ""
 	ops := hookClaimOps{
+		StampSessionClaim: func(sessionID, beadID string) error {
+			if sessionID != "session-1" {
+				t.Fatalf("session stamp target = %q, want session-1", sessionID)
+			}
+			sessionClaim = beadID
+			return nil
+		},
 		Runner: func(string, string) (string, error) {
 			return `[{"id":"work-1","status":"open","assignee":"worker-1","metadata":{"gc.routed_to":"worker"}}]`, nil
 		},
@@ -124,7 +144,7 @@ func TestDoHookClaimReportsCommittedReadyAssignmentWhenReadbackFails(t *testing.
 	}
 	var stdout, stderr bytes.Buffer
 	code := doHookClaim("query", "/rig", hookClaimOptions{
-		Assignee: "worker-1", IdentityCandidates: []string{"worker-1"}, RouteTargets: []string{"worker"}, JSON: true,
+		Assignee: "worker-1", IdentityCandidates: []string{"worker-1"}, RouteTargets: []string{"worker"}, Env: []string{"GC_SESSION_ID=session-1"}, JSON: true,
 	}, ops, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
@@ -136,11 +156,19 @@ func TestDoHookClaimReportsCommittedReadyAssignmentWhenReadbackFails(t *testing.
 	if !result.OK || result.Action != "work" || result.BeadID != "work-1" || result.Reason != "ready_assignment" || !result.ReadbackDegraded {
 		t.Fatalf("result = %+v, want a degraded ready-assignment receipt", result)
 	}
+	if sessionClaim != "work-1" {
+		t.Fatalf("session current claim = %q, want delivered work-1", sessionClaim)
+	}
 }
 
 func TestDoHookClaimReleasesDegradedClaimWhenReceiptCannotBeWritten(t *testing.T) {
 	var released string
+	var order []string
 	ops := hookClaimOps{
+		StampSessionClaim: func(_, beadID string) error {
+			order = append(order, "stamp:"+beadID)
+			return nil
+		},
 		Runner: func(string, string) (string, error) {
 			return `[{"id":"work-1","status":"open","metadata":{"gc.routed_to":"worker"}}]`, nil
 		},
@@ -148,16 +176,20 @@ func TestDoHookClaimReleasesDegradedClaimWhenReceiptCannotBeWritten(t *testing.T
 			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee}, true, errors.New("canonical read failed")
 		},
 		Release: func(_ context.Context, _ string, _ []string, beadID, assignee string) (bool, error) {
+			order = append(order, "release:"+beadID)
 			released = beadID + ":" + assignee
 			return true, nil
 		},
 	}
 	var stderr bytes.Buffer
 	code := doHookClaim("query", "/rig", hookClaimOptions{
-		Assignee: "worker-1", RouteTargets: []string{"worker"}, JSON: true,
+		Assignee: "worker-1", RouteTargets: []string{"worker"}, Env: []string{"GC_SESSION_ID=session-1"}, JSON: true,
 	}, ops, brokenPipeWriter{}, &stderr)
 	if code != 1 || released != "work-1:worker-1" {
 		t.Fatalf("code=%d released=%q, want failed delivery followed by release; stderr=%s", code, released, stderr.String())
+	}
+	if got := strings.Join(order, ","); got != "stamp:work-1,stamp:,release:work-1" {
+		t.Fatalf("compensation order = %q, want stamp, clear, release", got)
 	}
 }
 
