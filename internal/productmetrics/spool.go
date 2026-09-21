@@ -212,7 +212,13 @@ func (service *Service) RecordOnce(permit RecordingPermit, commandID CommandID) 
 	if !ok {
 		return RecordDropped
 	}
-	lockContext, cancel := context.WithTimeout(context.Background(), remaining)
+	lockWait := remaining
+	// Only frozen-clock package fixtures set this override; production keeps
+	// the remaining decision budget as the real lock wait.
+	if service.deps.recordLockWaitOverride > 0 {
+		lockWait = service.deps.recordLockWaitOverride
+	}
+	lockContext, cancel := context.WithTimeout(context.Background(), lockWait)
 	defer cancel()
 	lock, err := root.acquireLock(lockContext, stateLockName)
 	if err != nil {

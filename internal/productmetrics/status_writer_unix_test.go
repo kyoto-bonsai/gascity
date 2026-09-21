@@ -131,6 +131,10 @@ func TestRecordOnceQuotaPersistenceUncertaintySuppressesDiagnostics(t *testing.T
 func TestRecordOncePostReservationQueueFailurePersistsDiagnostics(t *testing.T) {
 	home, service, permit := newRecordServiceFixture(t, testEventIDThree)
 	defer func() { _ = permit.Close() }()
+	// This fixture freezes deps.now, but state.lock still uses a wall-clock
+	// context. Give that uncontended filesystem lock a bounded wait under
+	// parallel package load; production keeps its 50ms decision budget.
+	service.deps.recordLockWaitOverride = 2 * time.Second
 	root := mustOpenMutableRoot(t, home)
 	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
 		t.Fatal(err)

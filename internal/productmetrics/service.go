@@ -187,6 +187,7 @@ type serviceDependencies struct {
 	getenv                      func(string) string
 	newUUID                     func() (string, error)
 	now                         func() time.Time
+	recordLockWaitOverride      time.Duration
 	beforeRecordOperation       func(recordOperation)
 	verifyTTY                   func(io.Writer) bool
 	storageHooks                storageTestHooks
