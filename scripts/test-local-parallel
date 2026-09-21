@@ -424,6 +424,7 @@ run_fan_out() {
     GIT_CONFIG_GLOBAL="$gc_test_gitconfig" \
     LANG="${LANG:-C.UTF-8}" \
     TMPDIR="${TMPDIR:-/var/tmp}" \
+    LOCAL_TEST_LOG_DIR="$LOCAL_TEST_LOG_DIR" \
     OBSERVABLE_TEST_LOG="${OBSERVABLE_TEST_LOG-}" \
     OBSERVABLE_FAILURE_LINES="${OBSERVABLE_FAILURE_LINES-}" \
     GC_TEST_NO_SLICE="${GC_TEST_NO_SLICE-}" \
@@ -448,11 +449,11 @@ run_fan_out() {
     GOVCS="${GOVCS-}" \
     GOWORK="${GOWORK-}" \
     bash -lc "$command" >"$log" 2>&1; then
-    printf '0\n' > "$LOCAL_TEST_LOG_DIR/${safe_label}.exit"
+    printf "%s\n" 0 > "$LOCAL_TEST_LOG_DIR/${safe_label}.exit"
     echo "[$label] ok"
   else
     status=$?
-    printf '%s\n' "$status" > "$LOCAL_TEST_LOG_DIR/${safe_label}.exit"
+    printf "%s\n" "$status" > "$LOCAL_TEST_LOG_DIR/${safe_label}.exit"
     echo "[$label] failed with exit ${status}; log: ${log}" >&2
     sed -n '"'"'1,240p'"'"' "$log" >&2
     exit "$status"

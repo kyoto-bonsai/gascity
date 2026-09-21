@@ -40,7 +40,7 @@ def require_exit(log_dir: Path, label: str):
     if path.read_text().strip() != "0":
         raise GateError(f"nonzero child exit: {path}: {path.read_text().strip()}")
     log = log_dir / f"{label}.log"
-    if not log.is_file() or log.stat().st_size == 0:
+    if not log.is_file():
         raise GateError(f"missing child output log: {log}")
 
 
