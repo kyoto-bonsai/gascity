@@ -241,6 +241,150 @@ func TestWithState_WriterPrecedesFiftyBusyPollers(t *testing.T) {
 	}
 }
 
+// Fifty pollers have already decided to mutate and are queued at the gate
+// before the producer arrives. The first physical write must be the producer's
+// even though it joined last; this exercises priority before gate admission.
+func TestReadThenWrite_ProducerPrecedesBusyMaintenanceWriters(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := WithState(cityPath, func(*State) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var writes atomic.Int64
+	firstWrite := make(chan []byte, 1)
+	previousWrite := writeStateFile
+	writeStateFile = func(fs fsys.FS, path string, data []byte, perm os.FileMode) error {
+		if writes.Add(1) == 1 {
+			firstWrite <- append([]byte(nil), data...)
+		}
+		return previousWrite(fs, path, data, perm)
+	}
+	t.Cleanup(func() { writeStateFile = previousWrite })
+
+	gate, err := os.OpenFile(LockPath(cityPath)+".gate", os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close() //nolint:errcheck
+	if err := syscall.Flock(int(gate.Fd()), syscall.LOCK_SH); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(gate.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	const pollers = 50
+	var blockedScans sync.WaitGroup
+	blockedScans.Add(pollers)
+	var blockedCount atomic.Int64
+	maintenancePermit := make(chan struct{})
+	producerBlocked := make(chan struct{})
+	producerResume := make(chan struct{})
+	maintenanceYielded := make(chan struct{}, 1)
+	var producerOnce sync.Once
+	stateLockTestHook = func(mode stateLockMode, event stateLockEvent) {
+		switch {
+		case mode == stateMaintenanceLock && event == stateGateBlocked:
+			if blockedCount.Add(1) <= pollers {
+				blockedScans.Done()
+			}
+			<-maintenancePermit
+		case mode == stateProducerLock && event == stateGateBlocked:
+			producerOnce.Do(func() {
+				close(producerBlocked)
+				<-producerResume
+			})
+		case mode == stateMaintenanceLock && event == stateMaintenanceYield:
+			select {
+			case maintenanceYielded <- struct{}{}:
+			default:
+			}
+		}
+	}
+	t.Cleanup(func() { stateLockTestHook = nil })
+	var scans sync.WaitGroup
+	var pollerWG sync.WaitGroup
+	scans.Add(pollers)
+	proceed := make(chan struct{})
+	pollerErrors := make(chan error, pollers)
+	for i := 0; i < pollers; i++ {
+		pollerWG.Add(1)
+		go func(i int) {
+			defer pollerWG.Done()
+			pollerErrors <- ReadThenWrite(cityPath, func(State) bool {
+				scans.Done()
+				<-proceed
+				return true
+			}, func(State) error {
+				return fmt.Errorf("busy poller unexpectedly took read path")
+			}, func(state *State) error {
+				state.Pending = append(state.Pending, Item{ID: fmt.Sprintf("busy-poller-%d", i)})
+				return nil
+			})
+		}(i)
+	}
+	scans.Wait()
+	close(proceed)
+	blockedScans.Wait()
+	intentDir := writerIntentDir(cityPath)
+	entries, err := os.ReadDir(intentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".maintenance-") && strings.HasSuffix(entry.Name(), ".active") {
+			active++
+		}
+	}
+	if active != pollers {
+		t.Fatalf("queued maintenance intents = %d, want %d", active, pollers)
+	}
+
+	producerDone := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		producerDone <- WithState(cityPath, func(state *State) error {
+			state.Pending = append(state.Pending, Item{ID: "producer"})
+			return nil
+		})
+	}()
+	<-producerBlocked
+	if err := syscall.Flock(int(gate.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	// Pause the producer after its first failed gate attempt and admit one
+	// already queued maintenance writer. It must yield without committing.
+	go func() { maintenancePermit <- struct{}{} }()
+	select {
+	case <-maintenanceYielded:
+	case data := <-firstWrite:
+		t.Fatalf("maintenance overtook pending producer: first physical write %s", data)
+	case <-time.After(5 * time.Second):
+		t.Fatal("maintenance writer never resolved gate admission")
+	}
+	close(producerResume)
+	if err := <-producerDone; err != nil {
+		t.Fatalf("producer timed out behind busy pollers: %v", err)
+	}
+	t.Logf("producer commit behind %d queued mutating pollers: %s", pollers, time.Since(start))
+	close(maintenancePermit)
+	pollerWG.Wait()
+	close(pollerErrors)
+	for err := range pollerErrors {
+		if err != nil {
+			t.Fatalf("busy poller failed: %v", err)
+		}
+	}
+	if got := writes.Load(); got != pollers+1 {
+		t.Fatalf("physical state writes = %d, want %d", got, pollers+1)
+	}
+	var first State
+	if err := json.Unmarshal(<-firstWrite, &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Pending) != 1 || first.Pending[0].ID != "producer" {
+		t.Fatalf("first physical write = %+v, want producer only", first.Pending)
+	}
+}
+
 func TestReadThenWriteReloadsAfterSharedLockRelease(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := WithState(cityPath, func(state *State) error {

@@ -37,15 +37,25 @@ shared-lock snapshot or assumes the candidate still exists after the gap.
 This gives the scan a valid linearization point and avoids lost updates.
 
 A writer publishes a flock-protected marker in `writer-intents/` before trying
-the lock. Readers check for active markers before and after acquiring their
-shared flock; they back off while any writer is queued. An abandoned marker
-has no flock holder and is removed by a reader. A stable `state.lock.gate` is
+the lock. Direct producer writes publish `.producer-*.active`; maintenance
+upgrades publish `.maintenance-*.active`. Readers back off while either kind is
+queued. Maintenance writers back off while a producer is queued, checking both
+before and after gate admission. This gives a producer priority even when it
+joins an already busy set of mutating pollers. An abandoned marker has no
+flock holder and is removed by the next scan. A stable `state.lock.gate` is
 the turnstile. A reader briefly takes its shared lock while acquiring shared
 `state.lock`, then releases the gate. A writer holds the gate exclusively from
 before acquiring exclusive `state.lock` through commit. Both waits use the
 original bounded deadline; the gate path does not change the 8-second writer
 failure contract. Old binaries ignore the gate but still use exclusive
 `state.lock`, so mixed-version state updates remain serialized during rollout.
+
+The busy-load regression parks 50 maintenance upgrades after their shared
+scan, then publishes a producer intent while the gate is held. It pauses the
+producer after a failed gate attempt and admits one already queued maintenance
+writer. That writer must yield without a state write; after the producer
+resumes, its commit is the first physical write. The assertion uses write
+order and count, with no latency threshold.
 
 ## Poller files
 

@@ -12,12 +12,30 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 )
 
+type stateLockMode uint8
+
+const (
+	stateReadLock stateLockMode = iota
+	stateMaintenanceLock
+	stateProducerLock
+)
+
+type stateLockEvent uint8
+
+const (
+	stateGateBlocked stateLockEvent = iota
+	stateMaintenanceYield
+)
+
+// stateLockTestHook lets serial tests pause exact admission boundaries.
+var stateLockTestHook func(stateLockMode, stateLockEvent)
+
 // lockState uses a short reader turnstile before the state flock. A writer
 // holds the turnstile exclusively while waiting for and holding the state
 // lock. A durable, flock-protected intent marker makes queued writers visible
 // before they reach the gate, so a stream of readers cannot starve them.
 // Readers release the turnstile as soon as they hold LOCK_SH on state.lock.
-func lockState(cityPath string, write bool, waitTimeout time.Duration, clk clock.Clock) (func(), error) {
+func lockState(cityPath string, mode stateLockMode, waitTimeout time.Duration, clk clock.Clock) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(StatePath(cityPath)), 0o755); err != nil {
 		return nil, fmt.Errorf("creating nudge queue dir: %w", err)
 	}
@@ -35,10 +53,11 @@ func lockState(cityPath string, write bool, waitTimeout time.Duration, clk clock
 		_ = gate.Close()
 	}
 	deadline := clk.Now().Add(waitTimeout)
+	write := mode != stateReadLock
 	gateMode, stateMode := syscall.LOCK_SH, syscall.LOCK_SH
 	if write {
 		gateMode, stateMode = syscall.LOCK_EX, syscall.LOCK_EX
-		clearIntent, err := createWriterIntent(cityPath)
+		clearIntent, err := createWriterIntent(cityPath, mode)
 		if err != nil {
 			closeFiles()
 			return nil, err
@@ -46,10 +65,10 @@ func lockState(cityPath string, write bool, waitTimeout time.Duration, clk clock
 		defer clearIntent()
 	}
 	for {
-		if !write {
+		if mode != stateProducerLock {
 			// Check before and after locking: a writer can publish an intent
-			// while a reader is acquiring the two flocks.
-			active, err := activeWriterIntent(cityPath)
+			// while a reader or maintenance writer acquires the two flocks.
+			active, err := activeWriterIntent(cityPath, mode == stateMaintenanceLock)
 			if err != nil {
 				closeFiles()
 				return nil, err
@@ -63,17 +82,17 @@ func lockState(cityPath string, write bool, waitTimeout time.Duration, clk clock
 				continue
 			}
 		}
-		if err := waitFlock(gate, gateMode, deadline, waitTimeout, clk); err != nil {
+		if err := waitFlock(gate, gateMode, deadline, waitTimeout, clk, mode, true); err != nil {
 			closeFiles()
 			return nil, err
 		}
-		if err := waitFlock(state, stateMode, deadline, waitTimeout, clk); err != nil {
+		if err := waitFlock(state, stateMode, deadline, waitTimeout, clk, mode, false); err != nil {
 			_ = syscall.Flock(int(gate.Fd()), syscall.LOCK_UN)
 			closeFiles()
 			return nil, err
 		}
-		if !write {
-			active, err := activeWriterIntent(cityPath)
+		if mode != stateProducerLock {
+			active, err := activeWriterIntent(cityPath, mode == stateMaintenanceLock)
 			if err != nil || active {
 				_ = syscall.Flock(int(state.Fd()), syscall.LOCK_UN)
 				_ = syscall.Flock(int(gate.Fd()), syscall.LOCK_UN)
@@ -81,9 +100,14 @@ func lockState(cityPath string, write bool, waitTimeout time.Duration, clk clock
 					closeFiles()
 					return nil, err
 				}
+				if mode == stateMaintenanceLock && stateLockTestHook != nil {
+					stateLockTestHook(mode, stateMaintenanceYield)
+				}
 				continue
 			}
-			_ = syscall.Flock(int(gate.Fd()), syscall.LOCK_UN)
+			if !write {
+				_ = syscall.Flock(int(gate.Fd()), syscall.LOCK_UN)
+			}
 		}
 		break
 	}
@@ -102,12 +126,16 @@ func writerIntentDir(cityPath string) string {
 
 // createWriterIntent publishes the marker only after taking its flock. A
 // crashed writer leaves an unlocked marker that readers can safely reap.
-func createWriterIntent(cityPath string) (func(), error) {
+func createWriterIntent(cityPath string, mode stateLockMode) (func(), error) {
 	dir := writerIntentDir(cityPath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating nudge writer intent dir: %w", err)
 	}
-	file, err := os.CreateTemp(dir, ".writer-")
+	prefix := ".producer-"
+	if mode == stateMaintenanceLock {
+		prefix = ".maintenance-"
+	}
+	file, err := os.CreateTemp(dir, prefix)
 	if err != nil {
 		return nil, fmt.Errorf("creating nudge writer intent: %w", err)
 	}
@@ -130,7 +158,7 @@ func createWriterIntent(cityPath string) (func(), error) {
 	}, nil
 }
 
-func activeWriterIntent(cityPath string) (bool, error) {
+func activeWriterIntent(cityPath string, producerOnly bool) (bool, error) {
 	dir := writerIntentDir(cityPath)
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -141,6 +169,9 @@ func activeWriterIntent(cityPath string) (bool, error) {
 	}
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".active") {
+			continue
+		}
+		if producerOnly && strings.HasPrefix(entry.Name(), ".maintenance-") {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
@@ -167,7 +198,7 @@ func activeWriterIntent(cityPath string) (bool, error) {
 	return false, nil
 }
 
-func waitFlock(file *os.File, mode int, deadline time.Time, waitTimeout time.Duration, clk clock.Clock) error {
+func waitFlock(file *os.File, mode int, deadline time.Time, waitTimeout time.Duration, clk clock.Clock, caller stateLockMode, gate bool) error {
 	for {
 		err := syscall.Flock(int(file.Fd()), mode|syscall.LOCK_NB)
 		if err == nil {
@@ -175,6 +206,9 @@ func waitFlock(file *os.File, mode int, deadline time.Time, waitTimeout time.Dur
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) {
 			return fmt.Errorf("locking nudge queue: %w", err)
+		}
+		if gate && stateLockTestHook != nil {
+			stateLockTestHook(caller, stateGateBlocked)
 		}
 		if !clk.Now().Before(deadline) {
 			return fmt.Errorf("locking nudge queue: timed out waiting %s for lock", waitTimeout)

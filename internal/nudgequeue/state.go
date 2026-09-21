@@ -136,7 +136,11 @@ var afterReadUnlock func()
 // polling LOCK_EX|LOCK_NB against clk until either the lock is acquired or
 // the budget elapses.
 func withStateBounded(cityPath string, waitTimeout time.Duration, clk clock.Clock, fn func(*State) error) error {
-	release, err := lockState(cityPath, true, waitTimeout, clk)
+	return withStateBoundedMode(cityPath, waitTimeout, clk, stateProducerLock, fn)
+}
+
+func withStateBoundedMode(cityPath string, waitTimeout time.Duration, clk clock.Clock, mode stateLockMode, fn func(*State) error) error {
+	release, err := lockState(cityPath, mode, waitTimeout, clk)
 	if err != nil {
 		return err
 	}
@@ -193,7 +197,7 @@ func withStateBounded(cityPath string, waitTimeout time.Duration, clk clock.Cloc
 // or a claim, it releases the shared lock and reruns write under an exclusive
 // lock against freshly loaded state. read must have no side effects.
 func ReadThenWrite(cityPath string, needsWrite func(State) bool, read func(State) error, write func(*State) error) error {
-	release, err := lockState(cityPath, false, defaultLockWaitTimeout, clock.Real{})
+	release, err := lockState(cityPath, stateReadLock, defaultLockWaitTimeout, clock.Real{})
 	if err != nil {
 		return err
 	}
@@ -211,7 +215,7 @@ func ReadThenWrite(cityPath string, needsWrite func(State) bool, read func(State
 	if afterReadUnlock != nil {
 		afterReadUnlock()
 	}
-	return WithState(cityPath, write)
+	return withStateBoundedMode(cityPath, defaultLockWaitTimeout, clock.Real{}, stateMaintenanceLock, write)
 }
 
 // LoadState reads the persisted queue state from disk.
