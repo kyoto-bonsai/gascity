@@ -359,15 +359,13 @@ func readRotationSources(ctx context.Context, path string, filter Filter, listed
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		if src.kind == sourceArchive {
-			// Any source whose exact seq window an already-read archive covers is
-			// redundant: for a stable archive it IS that archive, and for a rotating
-			// file it is the archive's not-yet-removed twin holding the same seqs
-			// (the crash window between archive rename and source removal makes such
-			// twins routine, and mergeEventsBySeq would drop every line anyway).
-			if _, ok := listedArchives[eventSeqWindow{first: src.firstSeq, last: src.lastSeq}]; ok {
-				continue
-			}
+		// Any source whose exact seq window the initial archive snapshot covers is
+		// redundant: for a stable archive it IS that archive, and for a rotating
+		// file it is the archive's not-yet-removed twin holding the same seqs
+		// (the crash window between archive rename and source removal makes such
+		// twins routine, and mergeEventsBySeq would drop every line anyway).
+		if _, ok := listedArchives[eventSeqWindow{first: src.firstSeq, last: src.lastSeq}]; ok {
+			continue
 		}
 		reader, err := openSegmentReader(src)
 		if err != nil {

@@ -422,6 +422,21 @@ func (h *harness) calls() [][]string {
 	return out
 }
 
+func (h *harness) waitForCalls(n int) {
+	h.t.Helper()
+	deadline := time.NewTimer(adapterWaitBudget)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for len(h.calls()) < n {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			h.t.Fatalf("stub recorded fewer than %d call(s) before deadline", n)
+		}
+	}
+}
+
 func (h *harness) prompts() []string {
 	h.t.Helper()
 	var out []string
@@ -495,7 +510,7 @@ func TestIdleSeparatedPromptsStaySeparate(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.start()
 	s.send("first prompt")
-	time.Sleep(2500 * time.Millisecond)
+	s.waitForTurns(1)
 	s.send("second prompt")
 	s.waitForTurns(2)
 	if _, code := s.closeAndWait(); code != 0 {
@@ -887,10 +902,12 @@ func TestInterruptMidTurnContinuesTheLoop(t *testing.T) {
 
 	h := newHarness(t, map[string]string{"STUB_SLEEP": "5", "STUB_SID": "sess_int"})
 	s := h.start()
+	s.waitForOutput("zcode-repl ready", adapterWaitBudget)
 	s.send("slow turn")
-	time.Sleep(3 * time.Second) // inside the stub's sleep
+	s.waitForOutput("zcode-repl turn in flight", adapterWaitBudget)
+	h.waitForCalls(1) // the sleeping stub has started, not merely the adapter
 	s.signal(syscall.SIGINT)
-	time.Sleep(2 * time.Second)
+	s.waitForOutput("zcode-repl error rc=", adapterWaitBudget)
 
 	if !s.alive() {
 		t.Fatalf("adapter exited on SIGINT; it must absorb it:\n%s", s.output())
@@ -962,9 +979,8 @@ func TestInterruptWhileIdleDoesNotExit(t *testing.T) {
 
 	h := newHarness(t, nil)
 	s := h.start()
-	time.Sleep(2 * time.Second) // idle, blocked in read
+	s.waitForOutput("zcode-repl ready", adapterWaitBudget)
 	s.signal(syscall.SIGINT)
-	time.Sleep(2 * time.Second)
 
 	if !s.alive() {
 		t.Fatalf("adapter exited on an idle SIGINT:\n%s", s.output())

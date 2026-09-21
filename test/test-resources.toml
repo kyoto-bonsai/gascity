@@ -10,20 +10,20 @@ version = 2
 [[audit_baseline]]
 scope = "all"
 resource = "subprocess"
-baseline_calls = 662
-baseline_files = 191
+baseline_calls = 664
+baseline_files = 192
 reported_calls = 495
 reported_files = 135
-owner_bead = "ga-cp3hwi"
+owner_bead = "ga-f27exc.2.1"
 invariant = "tracked test source totals remain visible as audit evidence"
-resource_owner = "ga-cp3hwi owns this point-in-time source census"
+resource_owner = "ga-f27exc.2.1 owns the two new tagged process boundary proofs and the 2026-10-01 review of this expanded audit"
 migration_target = "P0.4a"
 expires = "2026-10-01"
 
 [[audit_baseline]]
 scope = "all"
 resource = "fixed_sleep"
-baseline_calls = 481
+baseline_calls = 479
 baseline_files = 172
 reported_calls = 447
 reported_files = 157
@@ -64,7 +64,7 @@ expires = "2026-10-01"
 [[debt]]
 scope = "untagged"
 resource = "fixed_sleep"
-baseline_calls = 321
+baseline_calls = 319
 baseline_files = 121
 reported_calls = 295
 reported_files = 114
@@ -116,13 +116,13 @@ expires = "2026-10-01"
 [[debt]]
 scope = "untagged"
 resource = "http_test_server"
-baseline_calls = 318
+baseline_calls = 319
 baseline_files = 66
 reported_calls = 255
 reported_files = 56
-owner_bead = "ga-cp3hwi"
+owner_bead = "ga-f27exc.2.1"
 invariant = "untagged HTTP test server call/file totals cannot grow; reductions must lower this baseline"
-resource_owner = "each owning test closes its loopback server and removes duplicate server-backed coverage"
+resource_owner = "ga-f27exc.2.1 owns the added fail-if-contacted loopback proof; each owning test closes its server or removes duplicate coverage"
 migration_target = "P0.4c"
 expires = "2026-10-01"
 
@@ -390,7 +390,7 @@ expires = "2026-10-01"
 [[small_debt]]
 scope = "untagged"
 resource = "fixed_sleep"
-baseline_calls = 321
+baseline_calls = 319
 baseline_files = 121
 reported_calls = 287
 reported_files = 113
@@ -442,13 +442,13 @@ expires = "2026-10-01"
 [[small_debt]]
 scope = "untagged"
 resource = "http_test_server"
-baseline_calls = 318
+baseline_calls = 319
 baseline_files = 66
 reported_calls = 300
 reported_files = 66
-owner_bead = "ga-cp3hwi"
+owner_bead = "ga-f27exc.2.1"
 invariant = "untagged Small HTTP test server call/file totals cannot grow; reductions must lower this baseline"
-resource_owner = "non-Medium lexical owners move server-backed tests to exact Medium ownership or replace the listener"
+resource_owner = "ga-f27exc.2.1 owns the added fail-if-contacted loopback proof; non-Medium owners replace or classify retained listeners"
 migration_target = "P0.4c"
 expires = "2026-10-01"
 

@@ -109,7 +109,11 @@ func TestResolveNearestExistingAncestorSymlinkedAncestor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := filepath.Join(realParent, "missing", "gc-home")
+	resolvedParent, err := filepath.EvalSymlinks(realParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(resolvedParent, "missing", "gc-home")
 	if got != want {
 		t.Fatalf("ResolveNearestExistingAncestor(%q) = %q, want %q", target, got, want)
 	}

@@ -73,6 +73,7 @@ session-model
 startup-health-episodes
 dolt-server
 fork-rate
+binary-immutability
 dolt-noms-size
 dolt-journal-size
 dolt-config

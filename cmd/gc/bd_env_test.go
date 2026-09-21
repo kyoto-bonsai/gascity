@@ -1094,12 +1094,13 @@ func TestManagedLocalDoltHostRecognizesIPv6LoopbackAndWildcard(t *testing.T) {
 	}
 }
 
-func reachableNonLoopbackHost(t *testing.T) string {
+func reachableRemoteClassifiedHost(t *testing.T) string {
 	t.Helper()
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		t.Fatal(err)
 	}
+	var candidates []string
 	for _, addr := range addrs {
 		var ip net.IP
 		switch typed := addr.(type) {
@@ -1114,23 +1115,42 @@ func reachableNonLoopbackHost(t *testing.T) string {
 		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
 			continue
 		}
-		listener, err := net.Listen("tcp", net.JoinHostPort(ip.String(), "0"))
+		candidates = append(candidates, ip.String())
+	}
+	// A DNS alias classified as remote still exercises the canonical managed
+	// target and real TCP liveness paths on hosts with no self-dialable LAN IP.
+	const alias = "localhost."
+	if managedLocalDoltHost(alias) {
+		t.Fatal("localhost. is now classified local; this fixture cannot prove the remote-host branch")
+	}
+	for _, host := range append(candidates, alias) {
+		listener, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 		if err != nil {
 			continue
 		}
 		// Binding a LAN/VPN address does not imply this host can connect back
 		// to it (for example, macOS can route the dial through a blocked VPN).
 		// These tests need a reachable managed endpoint, not just a bound FD.
-		conn, dialErr := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+		conn, dialErr := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)), 2*time.Second)
 		if dialErr != nil {
+			_ = listener.Close()
+			continue
+		}
+		if !conn.RemoteAddr().(*net.TCPAddr).IP.Equal(listener.Addr().(*net.TCPAddr).IP) {
+			_ = conn.Close()
 			_ = listener.Close()
 			continue
 		}
 		_ = conn.Close()
 		_ = listener.Close()
-		return ip.String()
+		if host == alias {
+			t.Log("managed host fixture: remote-classified localhost. alias over owned loopback TCP listener")
+		} else {
+			t.Logf("managed host fixture: reachable nonloopback IPv4 %s", host)
+		}
+		return host
 	}
-	t.Skip("no bindable and reachable non-loopback IPv4 address")
+	t.Skip("no self-dialable nonloopback IPv4 or remote-classified localhost. alias")
 	return ""
 }
 
@@ -2303,7 +2323,7 @@ func TestBdRuntimeEnvLocalHostNoHostKey(t *testing.T) {
 func TestBdRuntimeEnvManagedCityProjectsHostOverride(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 	t.Setenv("GC_DOLT", "skip")
-	host := reachableNonLoopbackHost(t)
+	host := reachableRemoteClassifiedHost(t)
 	t.Setenv("GC_DOLT_HOST", host)
 	t.Setenv("GC_DOLT_PORT", "9999")
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale.example.com")
@@ -2973,7 +2993,7 @@ dolt.auto-start: false
 }
 
 func TestBdRuntimeEnvForRigInheritedManagedCityProjectsHostOverride(t *testing.T) {
-	host := reachableNonLoopbackHost(t)
+	host := reachableRemoteClassifiedHost(t)
 	t.Setenv("GC_DOLT_HOST", host)
 	t.Setenv("GC_DOLT_PORT", "9999")
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale.example.com")

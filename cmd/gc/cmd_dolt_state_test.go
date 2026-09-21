@@ -1477,7 +1477,8 @@ esac
 }
 
 func TestDoltStatePreflightCleanCmdRemovesSocketsButPreservesDoltInternals(t *testing.T) {
-	if _, err := exec.LookPath("lsof"); err != nil {
+	realLsof, err := exec.LookPath("lsof")
+	if err != nil {
 		t.Skip("lsof not installed")
 	}
 	cityPath := t.TempDir()
@@ -1515,6 +1516,24 @@ func TestDoltStatePreflightCleanCmdRemovesSocketsButPreservesDoltInternals(t *te
 	if _, err := os.Stat(socketPath); err != nil {
 		t.Fatalf("stale socket precondition missing: %v", err)
 	}
+	// The production discovery scans global /tmp. Keep this integration's
+	// cleanup inspection confined to the disposable socket it owns.
+	previousDiscovery := staleManagedDoltSocketPathsFn
+	staleManagedDoltSocketPathsFn = func() []string { return []string{socketPath} }
+	t.Cleanup(func() { staleManagedDoltSocketPathsFn = previousDiscovery })
+	if conn, err := net.DialTimeout("unix", socketPath, time.Second); err == nil {
+		_ = conn.Close()
+		t.Fatal("stale socket holder remains dialable after Wait")
+	}
+	// macOS lsof can time out while enumerating unrelated host processes.
+	// The exited holder proves this exact test socket has no owner; route only
+	// this query to a bounded negative answer and delegate every other path.
+	fixtureDir := t.TempDir()
+	lsofFixture := fmt.Sprintf("#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = %q ]; then exit 1; fi\nexec %q \"$@\"\n", socketPath, realLsof)
+	if err := os.WriteFile(filepath.Join(fixtureDir, "lsof"), []byte(lsofFixture), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fixtureDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"dolt-state", "preflight-clean", "--city", cityPath}, &stdout, &stderr)

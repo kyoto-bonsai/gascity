@@ -633,6 +633,12 @@ func (r *FileRecorder) ListTail(ctx context.Context, filter Filter, limit int) (
 	return full, nil
 }
 
+// ListActiveTail returns only events in the active file. It does not fill a
+// short result from archived history, even when ListTail would do so.
+func (r *FileRecorder) ListActiveTail(ctx context.Context, filter Filter, limit int) ([]Event, error) {
+	return ReadActiveTail(ctx, r.path, filter, limit)
+}
+
 // ExhaustiveTail marks FileRecorder as an [ExhaustiveTailProvider]: ListTail
 // above always resolves a short result against the complete retained history
 // (active file + archives + any in-flight rotation segment), never just a

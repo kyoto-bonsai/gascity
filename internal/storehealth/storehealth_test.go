@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -287,11 +288,68 @@ func (r *recordingProvider) ListTail(ctx context.Context, filter events.Filter, 
 // ListTail, so LastMaintenance must fall back to the unbounded List path
 // rather than a type assertion panicking or silently returning nothing.
 type providerWithoutTail struct {
-	*events.Fake
+	events.Provider
 }
 
-func (p *providerWithoutTail) List(ctx context.Context, filter events.Filter) ([]events.Event, error) {
-	return p.Fake.List(ctx, filter)
+type activeMaintenanceProvider struct {
+	events.Provider
+	t            *testing.T
+	result       []events.Event
+	err          error
+	activeCalls  int
+	historyCalls int
+}
+
+func (p *activeMaintenanceProvider) ListActiveTail(_ context.Context, filter events.Filter, limit int) ([]events.Event, error) {
+	p.activeCalls++
+	if limit != 1 || filter.MaxScanBytes != lastMaintenanceScanWindowBytes {
+		p.t.Fatalf("active-tail request = (%d,%d), want (1,%d)", limit, filter.MaxScanBytes, lastMaintenanceScanWindowBytes)
+	}
+	if p.err != nil {
+		return nil, p.err
+	}
+	for _, event := range p.result {
+		if event.Type == filter.Type {
+			return []events.Event{event}, nil
+		}
+	}
+	return nil, nil
+}
+
+func (p *activeMaintenanceProvider) ListTail(context.Context, events.Filter, int) ([]events.Event, error) {
+	p.historyCalls++
+	return nil, errors.New("archived tail must not be read")
+}
+
+func (p *activeMaintenanceProvider) List(context.Context, events.Filter) ([]events.Event, error) {
+	p.historyCalls++
+	return nil, errors.New("history must not be read")
+}
+
+func TestLastMaintenancePrefersActiveTailWithoutHistoryFallback(t *testing.T) {
+	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		result []events.Event
+		err    error
+		want   time.Time
+		status string
+	}{
+		{name: "active result", result: []events.Event{{Type: events.StoreMaintenanceDone, Ts: ts}}, want: ts, status: "success"},
+		{name: "empty active file"},
+		{name: "active read error", err: errors.New("active read failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &activeMaintenanceProvider{Provider: events.NewFake(), t: t, result: tc.result, err: tc.err}
+			got, status := LastMaintenance(provider)
+			if !got.Equal(tc.want) || status != tc.status {
+				t.Fatalf("LastMaintenance = (%v,%q), want (%v,%q)", got, status, tc.want, tc.status)
+			}
+			if provider.activeCalls != 2 || provider.historyCalls != 0 {
+				t.Fatalf("calls = active %d, history %d; want active 2, history 0", provider.activeCalls, provider.historyCalls)
+			}
+		})
+	}
 }
 
 // TestLastMaintenanceUsesTailProviderFastPath is the regression for #4418:
@@ -321,7 +379,10 @@ func TestLastMaintenanceUsesTailProviderFastPath(t *testing.T) {
 // provider that does not implement events.TailProvider (e.g. an exec-script
 // provider) must still get a correct answer via the existing List path.
 func TestLastMaintenanceFallsBackWithoutTailProvider(t *testing.T) {
-	pwt := &providerWithoutTail{Fake: events.NewFake()}
+	pwt := &providerWithoutTail{Provider: events.NewFake()}
+	if _, ok := any(pwt).(events.TailProvider); ok {
+		t.Fatal("fixture unexpectedly implements TailProvider")
+	}
 	payload, _ := json.Marshal(events.StoreMaintenanceFailedPayload{Stage: "gc"})
 	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 	pwt.Record(events.Event{Type: events.StoreMaintenanceFailed, Ts: ts, Payload: payload})
@@ -365,16 +426,9 @@ func writeArchivedEvents(t *testing.T, path string, evts []events.Event) {
 	}
 }
 
-// TestLastMaintenanceDoesNotReadRotatedArchives pins accepted, documented
-// behavior rather than a bug: FileRecorder.ListTail scans the active
-// events.jsonl only, so a maintenance event that has aged into a rotated
-// .gz archive is reported as absent. The old unbounded List path did read
-// archives; taking the archive-aware fall-through here (as
-// fetchEventPageAscending does) would restore the full scan #4418 removed,
-// and LastGCAt is display-only in every consumer. If this test starts
-// failing because LastMaintenance grew a fall-through, that is a
-// deliberate re-trade — update the comment on
-// lastMaintenanceScanWindowBytes with it, do not just delete the test.
+// LastMaintenance uses FileRecorder's active-only capability even though its
+// public ListTail is exhaustive across archives. Archived-only maintenance
+// remains absent from this bounded display value.
 func TestLastMaintenanceDoesNotReadRotatedArchives(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "events.jsonl")

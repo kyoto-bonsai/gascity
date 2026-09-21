@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-var managedDoltPreflightCleanupFn = preflightManagedDoltCleanup
+var (
+	managedDoltPreflightCleanupFn = preflightManagedDoltCleanup
+	staleManagedDoltSocketPathsFn = staleManagedDoltSocketPaths
+)
 
 const (
 	managedDoltProcTimeout = 1500 * time.Millisecond
@@ -33,7 +36,7 @@ func preflightManagedDoltCleanup(_ string) error {
 var errManagedDoltOpenStateUnknown = errors.New("managed dolt open-file state unknown")
 
 func removeStaleManagedDoltSockets() error {
-	for _, path := range staleManagedDoltSocketPaths() {
+	for _, path := range staleManagedDoltSocketPathsFn() {
 		info, err := os.Lstat(path)
 		if err != nil {
 			if os.IsNotExist(err) {

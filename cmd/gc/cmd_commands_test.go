@@ -2899,6 +2899,15 @@ func TestPackCommandGroupMissRejectsUnknownSubcommands(t *testing.T) {
 
 func TestPackCommandProcessHelperIgnoresAmbientControlEnvironment(t *testing.T) {
 	cityPath := setupPackExitCity(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	// Doctor --fix must not arm this test executable: testscript.Main clones it
+	// for gc/bd when the helper below reexecutes, then removes those copies.
+	var doctorOut, doctorErr bytes.Buffer
+	_ = run([]string{"doctor", "--fix", "--city", cityPath}, &doctorOut, &doctorErr)
+	if !strings.Contains(doctorOut.String(), "binary-immutability") {
+		t.Fatalf("doctor --fix did not register binary-immutability: stdout=%q stderr=%q", doctorOut.String(), doctorErr.String())
+	}
 	marker := filepath.Join(t.TempDir(), "ambient-marker")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestPackCommandExitHelper$")
 	cmd.Dir = cityPath

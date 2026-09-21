@@ -49,7 +49,8 @@ func TestSupersededSetAsideIsInvisibleToEveryScanner(t *testing.T) {
 }
 
 // TestReadRotationSourcesSkipsRotatingTwinOfListedArchive: a rotating file
-// whose seq window an already-read archive covers holds the same events by
+// whose seq window an archive in the initial directory snapshot covers holds
+// the same events by
 // construction (seqs are globally unique), so decoding it is pure waste — and
 // the crash window between archive rename and source removal makes such twins
 // routine. The twin holds VALID JSONL for its {1,2} window on purpose: a
@@ -75,9 +76,27 @@ func TestReadRotationSourcesSkipsRotatingTwinOfListedArchive(t *testing.T) {
 	listed := map[eventSeqWindow]struct{}{{first: 1, last: 2}: {}}
 	events, err := readRotationSources(context.Background(), active, Filter{}, listed)
 	if err != nil {
-		t.Fatalf("readRotationSources opened the twin of an already-read archive: %v", err)
+		t.Fatalf("readRotationSources opened the twin of a listed archive: %v", err)
 	}
 	if len(events) != 0 {
 		t.Fatalf("got %d event(s) from a directory whose only source is a covered twin, want 0", len(events))
+	}
+}
+
+func TestReadRotationSourcesKeepsPartiallyOverlappingWindow(t *testing.T) {
+	dir := t.TempDir()
+	active := filepath.Join(dir, "events.jsonl")
+	twin := filepath.Join(dir, "events.jsonl.rotating-20260507T180000Z-seq-2-3")
+	data := `{"seq":2,"type":"bead.created"}` + "\n" + `{"seq":3,"type":"bead.created"}` + "\n"
+	if err := os.WriteFile(twin, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	listed := map[eventSeqWindow]struct{}{{first: 1, last: 2}: {}}
+	got, err := readRotationSources(context.Background(), active, Filter{}, listed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Seq != 2 || got[1].Seq != 3 {
+		t.Fatalf("partially overlapping rotation = %+v, want seqs [2 3]", got)
 	}
 }

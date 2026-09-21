@@ -204,6 +204,10 @@ func (m cleanupTestingM) Run() int {
 
 func TestMain(m *testing.M) {
 	maybeRunProductMetricsDirectChildEnvSpy()
+	// Doctor --fix tests must never arm immutable flags on their own test
+	// executable or a conventional gc install. Dedicated check tests inject
+	// explicit disposable targets and test default target discovery directly.
+	binaryImmutabilityCheckTargets = func() []string { return nil }
 
 	// testscript re-executes the test binary as "gc" or "bd" for each txtar
 	// command. On that path we must not create a new temp root — the parent

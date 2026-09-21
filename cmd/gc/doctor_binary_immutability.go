@@ -80,9 +80,11 @@ type binaryProtectionGap struct {
 	missingProng2 bool // PATH-visible name not immutable
 }
 
+var binaryImmutabilityCheckTargets = defaultGCBinaryTargets
+
 func newBinaryImmutabilityCheck() *binaryImmutabilityCheck {
 	return &binaryImmutabilityCheck{
-		targets:       defaultGCBinaryTargets,
+		targets:       binaryImmutabilityCheckTargets,
 		runningCommit: func() string { return commit },
 		selfPath:      func() string { p, _ := os.Executable(); return p },
 	}

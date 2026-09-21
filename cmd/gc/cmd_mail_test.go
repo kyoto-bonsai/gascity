@@ -3465,7 +3465,7 @@ func TestMailSendNotifyFlagNoLongerGatesNudgeAttempt(t *testing.T) {
 	t.Setenv("GC_MAIL", "")
 	t.Setenv("GC_SESSION_ID", "gc-does-not-match")
 	t.Setenv("GC_ALIAS", "sender")
-	_ = os.Unsetenv("GC_AGENT")
+	t.Setenv("GC_AGENT", "")
 
 	run := func(notify bool) mailActionResult {
 		t.Setenv("GC_CITY", setupMailNotifyTestCity(t))

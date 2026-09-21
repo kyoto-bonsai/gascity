@@ -63,11 +63,19 @@ func TestWithState_WriterSucceedsUnderPollerLoad(t *testing.T) {
 
 	const pollers = 50
 	stop := make(chan struct{})
+	entered := make(chan struct{}, pollers)
 	var wg sync.WaitGroup
+	var stopOnce sync.Once
+	stopPollers := func() {
+		stopOnce.Do(func() { close(stop) })
+		wg.Wait()
+	}
+	defer stopPollers()
 	for i := 0; i < pollers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			firstPass := true
 			for {
 				select {
 				case <-stop:
@@ -79,14 +87,27 @@ func TestWithState_WriterSucceedsUnderPollerLoad(t *testing.T) {
 				// finds nothing to change. Errors are intentionally ignored
 				// here (a real poller just retries on its own schedule);
 				// the test's actual assertion is on the writer below.
-				_ = WithState(cityPath, func(_ *State) error { return nil })
+				_ = WithState(cityPath, func(_ *State) error {
+					if firstPass {
+						firstPass = false
+						entered <- struct{}{}
+					}
+					return nil
+				})
 			}
 		}()
 	}
-	// Let the poller fleet reach steady-state contention before the writer
-	// joins, matching production where a writer arrives into an
-	// already-busy queue rather than racing pollers from a cold start.
-	time.Sleep(50 * time.Millisecond)
+	// Each poller must enter its first locked callback before the writer joins.
+	// This proves contention has begun without guessing a sleep budget.
+	readyDeadline := time.NewTimer(10 * time.Second)
+	defer readyDeadline.Stop()
+	for i := 0; i < pollers; i++ {
+		select {
+		case <-entered:
+		case <-readyDeadline.C:
+			t.Fatalf("only %d/%d pollers entered WithState before deadline", i, pollers)
+		}
+	}
 
 	const writeID = "real-write"
 	writeErr := WithState(cityPath, func(state *State) error {
@@ -94,8 +115,7 @@ func TestWithState_WriterSucceedsUnderPollerLoad(t *testing.T) {
 		return nil
 	})
 
-	close(stop)
-	wg.Wait()
+	stopPollers()
 
 	if writeErr != nil {
 		t.Fatalf("WithState (real write) failed under %d-poller no-op load: %v (ga-cssm95: a writer must not time out behind no-op reader/maintenance ticks)", pollers, writeErr)

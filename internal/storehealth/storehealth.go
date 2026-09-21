@@ -116,7 +116,7 @@ func WalkSize(path string) int64 {
 	return total
 }
 
-// lastMaintenanceScanWindowBytes bounds the TailProvider fast path in
+// lastMaintenanceScanWindowBytes bounds the active-tail fast path in
 // LastMaintenance: a rare/optional event type (store maintenance may never
 // have run) forces a full-file backward walk otherwise, at the same cost as
 // an unfiltered forward scan (#4418). "Not found within the window" is a
@@ -129,7 +129,7 @@ func WalkSize(path string) int64 {
 // scan.
 //
 // The window is not the only way this can miss, and not the dominant one.
-// FileRecorder.ListTail reads the ACTIVE events.jsonl only; it never opens
+// FileRecorder.ListActiveTail reads the ACTIVE events.jsonl only; it never opens
 // the sibling .gz archives that the old List path walked via ReadFiltered.
 // With rotation on by default at 256 MiB (defaultRotationMaxSize in
 // internal/events/recorder.go), a maintenance event that has aged into an
@@ -142,12 +142,11 @@ const lastMaintenanceScanWindowBytes = 8 * 1024 * 1024
 // Zero time and empty status when no events, provider is nil, or the
 // provider returns an error.
 //
-// When provider implements [events.TailProvider], this uses the bounded
-// backward-tail scan instead of the unbounded forward List — see
-// lastMaintenanceScanWindowBytes. Providers without a tail fast path (e.g.
-// an exec-script provider) fall back to the original unbounded List call.
+// ActiveTailProvider takes precedence, then TailProvider, then List. The
+// FileRecorder active-tail path is bounded and excludes rotated archives.
+// Providers without an active-tail capability retain their prior behavior.
 //
-// This caller takes a short ListTail result at face value. It deliberately
+// This caller takes a short active-tail result at face value. It deliberately
 // does NOT take the under-fill fall-through that fetchEventPageAscending
 // (internal/api/huma_handlers_events.go) uses, where a tail result shorter
 // than the requested limit cannot distinguish "log exhausted" from "active
@@ -165,6 +164,7 @@ func LastMaintenance(ep events.Provider) (time.Time, string) {
 		return time.Time{}, ""
 	}
 	tp, hasTail := ep.(events.TailProvider)
+	atp, hasActiveTail := ep.(events.ActiveTailProvider)
 	var (
 		latestTs     time.Time
 		latestStatus string
@@ -180,9 +180,12 @@ func LastMaintenance(ep events.Provider) (time.Time, string) {
 			evts []events.Event
 			err  error
 		)
-		if hasTail {
+		switch {
+		case hasActiveTail:
+			evts, err = atp.ListActiveTail(context.Background(), events.Filter{Type: spec.typ, MaxScanBytes: lastMaintenanceScanWindowBytes}, 1)
+		case hasTail:
 			evts, err = tp.ListTail(context.Background(), events.Filter{Type: spec.typ, MaxScanBytes: lastMaintenanceScanWindowBytes}, 1)
-		} else {
+		default:
 			evts, err = ep.List(context.Background(), events.Filter{Type: spec.typ})
 		}
 		if err != nil {

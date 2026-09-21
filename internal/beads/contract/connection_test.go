@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -314,7 +315,7 @@ func TestResolveDoltConnectionTargetInheritedManagedRigUsesCityRuntime(t *testin
 }
 
 func TestResolveDoltConnectionTargetInheritedManagedRig_EnvOverride(t *testing.T) {
-	host := reachableNonLoopbackHost(t)
+	host := reachableRemoteClassifiedHost(t)
 	t.Setenv(ManagedCityHostEnv, host)
 	fs := fsys.OSFS{}
 	city := t.TempDir()
@@ -439,7 +440,7 @@ func TestResolveDoltConnectionTargetRejectsManagedRuntimeStateWithDeadPID(t *tes
 }
 
 func TestResolveDoltConnectionTargetManagedCity_EnvOverrideSkipsLocalPID(t *testing.T) {
-	host := reachableNonLoopbackHost(t)
+	host := reachableRemoteClassifiedHost(t)
 	t.Setenv(ManagedCityHostEnv, host)
 	fs := fsys.OSFS{}
 	city := t.TempDir()
@@ -1058,7 +1059,7 @@ func writeReachableRuntimeStateOnHostWithPIDAndDataDir(t *testing.T, fs fsys.FS,
 		// rather than fail so the negative coverage on linux is preserved
 		// without forcing a macOS-only flake. Sibling tests that exercise
 		// the same env-override path against a routable host
-		// (reachableNonLoopbackHost) and a non-routable host (TEST-NET-1)
+		// (reachableRemoteClassifiedHost) and a non-routable host (TEST-NET-1)
 		// still run on every OS.
 		t.Skipf("cannot bind %s: %v (typical on darwin where 127.0.0.0/8 secondary loopback aliases aren't installed by default)", net.JoinHostPort(host, "0"), err)
 	}
@@ -1068,12 +1069,13 @@ func writeReachableRuntimeStateOnHostWithPIDAndDataDir(t *testing.T, fs fsys.FS,
 	return fmt.Sprintf("%d", port)
 }
 
-func reachableNonLoopbackHost(t *testing.T) string {
+func reachableRemoteClassifiedHost(t *testing.T) string {
 	t.Helper()
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		t.Fatal(err)
 	}
+	var candidates []string
 	for _, addr := range addrs {
 		var ip net.IP
 		switch typed := addr.(type) {
@@ -1088,22 +1090,39 @@ func reachableNonLoopbackHost(t *testing.T) string {
 		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
 			continue
 		}
-		listener, err := net.Listen("tcp", net.JoinHostPort(ip.String(), "0"))
+		candidates = append(candidates, ip.String())
+	}
+	const alias = "localhost."
+	if DoltHostIsLocal(alias) {
+		t.Fatal("localhost. is now classified local; this fixture cannot prove the remote-host branch")
+	}
+	for _, host := range append(candidates, alias) {
+		listener, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 		if err != nil {
 			continue
 		}
 		// A bound LAN/VPN address may not be reachable from this process. The
 		// managed-runtime fixture needs an address its own client can dial.
-		conn, dialErr := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+		conn, dialErr := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)), 2*time.Second)
 		if dialErr != nil {
+			_ = listener.Close()
+			continue
+		}
+		if !conn.RemoteAddr().(*net.TCPAddr).IP.Equal(listener.Addr().(*net.TCPAddr).IP) {
+			_ = conn.Close()
 			_ = listener.Close()
 			continue
 		}
 		_ = conn.Close()
 		_ = listener.Close()
-		return ip.String()
+		if host == alias {
+			t.Log("managed host fixture: remote-classified localhost. alias over owned loopback TCP listener")
+		} else {
+			t.Logf("managed host fixture: reachable nonloopback IPv4 %s", host)
+		}
+		return host
 	}
-	t.Skip("no bindable and reachable non-loopback IPv4 address")
+	t.Skip("no self-dialable nonloopback IPv4 or remote-classified localhost. alias")
 	return ""
 }
 

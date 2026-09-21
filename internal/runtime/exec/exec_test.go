@@ -1542,8 +1542,7 @@ func TestProvider_StartCancellationInterruptsForegroundChild(t *testing.T) {
 case "$1" in
   start)
     trap 'printf "%%s\n" interrupted > "%s"; exit 0' INT
-    : > "%s"
-    sleep 30
+    sh -c 'printf ready > "%s"; exec sleep 30'
     ;;
   *) exit 2 ;;
 esac

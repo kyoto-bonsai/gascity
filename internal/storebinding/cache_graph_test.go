@@ -173,16 +173,18 @@ func TestGraphCacheDetachesEveryReferenceField(t *testing.T) {
 	priority := 2
 	deferUntil := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	blocked := true
+	deferredIndefinitely := true
 	original := beads.Bead{
-		ID:           "gcg-1",
-		Title:        "detached",
-		Needs:        []string{"gcg-0"},
-		Labels:       []string{"storage"},
-		Metadata:     beads.StringMap{"plan_key": "wrapped"},
-		Dependencies: []beads.Dep{{IssueID: "gcg-1", DependsOnID: "gcg-0", Type: "blocks"}},
-		Priority:     &priority,
-		DeferUntil:   &deferUntil,
-		IsBlocked:    &blocked,
+		ID:                     "gcg-1",
+		Title:                  "detached",
+		Needs:                  []string{"gcg-0"},
+		Labels:                 []string{"storage"},
+		Metadata:               beads.StringMap{"plan_key": "wrapped"},
+		Dependencies:           []beads.Dep{{IssueID: "gcg-1", DependsOnID: "gcg-0", Type: "blocks"}},
+		Priority:               &priority,
+		DeferUntil:             &deferUntil,
+		IsBlocked:              &blocked,
+		IsDeferredIndefinitely: &deferredIndefinitely,
 	}
 	copied := deepCopyBead(original)
 
@@ -197,6 +199,7 @@ func TestGraphCacheDetachesEveryReferenceField(t *testing.T) {
 	*original.Priority = 99
 	*original.DeferUntil = deferUntil.Add(time.Hour)
 	*original.IsBlocked = false
+	*original.IsDeferredIndefinitely = false
 
 	if copied.Needs[0] != "gcg-0" {
 		t.Errorf("Needs was shared: %q", copied.Needs[0])
@@ -219,6 +222,9 @@ func TestGraphCacheDetachesEveryReferenceField(t *testing.T) {
 	if !*copied.IsBlocked {
 		t.Errorf("IsBlocked was shared: %v", *copied.IsBlocked)
 	}
+	if !*copied.IsDeferredIndefinitely {
+		t.Errorf("IsDeferredIndefinitely was shared: %v", *copied.IsDeferredIndefinitely)
+	}
 }
 
 // TestDeepCopyCoversEveryReferenceFieldOfABead is the completeness guard for
@@ -227,13 +233,14 @@ func TestGraphCacheDetachesEveryReferenceField(t *testing.T) {
 // covered by the detachment assertions.
 func TestDeepCopyCoversEveryReferenceFieldOfABead(t *testing.T) {
 	covered := map[string]bool{
-		"Needs":        true,
-		"Labels":       true,
-		"Metadata":     true,
-		"Dependencies": true,
-		"Priority":     true,
-		"DeferUntil":   true,
-		"IsBlocked":    true,
+		"Needs":                  true,
+		"Labels":                 true,
+		"Metadata":               true,
+		"Dependencies":           true,
+		"Priority":               true,
+		"DeferUntil":             true,
+		"IsBlocked":              true,
+		"IsDeferredIndefinitely": true,
 	}
 	beadType := reflect.TypeOf(beads.Bead{})
 	var reference []string

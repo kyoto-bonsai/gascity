@@ -571,6 +571,14 @@ type TailProvider interface {
 	ListTail(ctx context.Context, filter Filter, limit int) ([]Event, error)
 }
 
+// ActiveTailProvider is an optional bounded view of the active event file.
+// It never reads sibling archives or in-flight rotation segments. A short
+// result is final for the active file, including when no matching event exists.
+// Callers must pass a positive limit and may bound work with Filter.MaxScanBytes.
+type ActiveTailProvider interface {
+	ListActiveTail(ctx context.Context, filter Filter, limit int) ([]Event, error)
+}
+
 // InFlightProvider is an optional extension for providers whose plain List can
 // momentarily miss events stranded in an in-flight rotation file. When a
 // file-backed provider rotates, the just-rotated segment lives only in the
