@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"syscall"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/citylayout"
@@ -123,6 +122,12 @@ func WithState(cityPath string, fn func(*State) error) error {
 // non-blocking lock acquisition while waiting for its budget to expire.
 const nudgeQueueLockPollInterval = 10 * time.Millisecond
 
+// writeStateFile is replaceable by serial tests to count physical state writes.
+var writeStateFile = fsys.WriteFileAtomic
+
+// afterReadUnlock is a serial-test seam for the shared-to-exclusive gap.
+var afterReadUnlock func()
+
 // withStateBounded is WithState's bounded-wait implementation, callable
 // directly by a caller that needs a different timeout budget than
 // WithState's default -- e.g. the supervisor dispatch tick, which must keep
@@ -131,35 +136,11 @@ const nudgeQueueLockPollInterval = 10 * time.Millisecond
 // polling LOCK_EX|LOCK_NB against clk until either the lock is acquired or
 // the budget elapses.
 func withStateBounded(cityPath string, waitTimeout time.Duration, clk clock.Clock, fn func(*State) error) error {
-	dir := filepath.Dir(StatePath(cityPath))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("creating nudge queue dir: %w", err)
-	}
-
-	lockFile, err := os.OpenFile(LockPath(cityPath), os.O_CREATE|os.O_RDWR, 0o600)
+	release, err := lockState(cityPath, true, waitTimeout, clk)
 	if err != nil {
-		return fmt.Errorf("opening nudge queue lock: %w", err)
+		return err
 	}
-	defer lockFile.Close() //nolint:errcheck
-
-	deadline := clk.Now().Add(waitTimeout)
-	for {
-		lockErr := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if lockErr == nil {
-			break
-		}
-		if !errors.Is(lockErr, syscall.EWOULDBLOCK) {
-			return fmt.Errorf("locking nudge queue: %w", lockErr)
-		}
-		if !clk.Now().Before(deadline) {
-			return fmt.Errorf("locking nudge queue: timed out waiting %s for lock", waitTimeout)
-		}
-		// Deliberately real time while the deadline above is evaluated
-		// against clk: a caller passing a non-advancing clock.Fake against a
-		// held lock would poll here forever, never reaching its deadline.
-		time.Sleep(nudgeQueueLockPollInterval)
-	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	defer release()
 
 	state, err := LoadState(cityPath)
 	if err != nil {
@@ -202,10 +183,35 @@ func withStateBounded(cityPath string, waitTimeout time.Duration, clk clock.Cloc
 	if err != nil {
 		return fmt.Errorf("marshal nudge queue: %w", err)
 	}
-	if err := fsys.WriteFileAtomic(fsys.OSFS{}, StatePath(cityPath), append(data, '\n'), 0o644); err != nil {
+	if err := writeStateFile(fsys.OSFS{}, StatePath(cityPath), append(data, '\n'), 0o644); err != nil {
 		return fmt.Errorf("write nudge queue: %w", err)
 	}
 	return nil
+}
+
+// ReadThenWrite reads under a shared lock. When needsWrite finds maintenance
+// or a claim, it releases the shared lock and reruns write under an exclusive
+// lock against freshly loaded state. read must have no side effects.
+func ReadThenWrite(cityPath string, needsWrite func(State) bool, read func(State) error, write func(*State) error) error {
+	release, err := lockState(cityPath, false, defaultLockWaitTimeout, clock.Real{})
+	if err != nil {
+		return err
+	}
+	state, err := LoadState(cityPath)
+	if err != nil {
+		release()
+		return err
+	}
+	if !needsWrite(state) {
+		err = read(state)
+		release()
+		return err
+	}
+	release()
+	if afterReadUnlock != nil {
+		afterReadUnlock()
+	}
+	return WithState(cityPath, write)
 }
 
 // LoadState reads the persisted queue state from disk.

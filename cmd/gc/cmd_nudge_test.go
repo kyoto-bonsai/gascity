@@ -5048,14 +5048,13 @@ func TestNudgePollHelpersSkipDoltOpenOnEmptyQueue(t *testing.T) {
 	}
 }
 
-// TestNudgePollHelpersOpenOnceWhenQueueHasWork pins the no-regression edge: when
-// the queue is non-empty the maintenance passes (recover/prune/terminalize) must
-// still run against Dolt, so each helper opens the front-door store exactly once
-// per call and releases it (open == close, no leak, no double-open).
+// TestNudgePollHelpersOpenOnceWhenQueueHasWork distinguishes shared-lock scans
+// from mutating helpers on a nonempty but healthy queue. Scans need no bead
+// store; release and ack still open exactly once and close the handle.
 func TestNudgePollHelpersOpenOnceWhenQueueHasWork(t *testing.T) {
 	now := time.Now()
 
-	assertOneOpenOneClose := func(t *testing.T, name string, run func(dir string)) {
+	assertOpenCount := func(t *testing.T, name string, want int, run func(dir string)) {
 		t.Helper()
 		opens, closes := installCountingNudgeStoreSeam(t)
 		dir := t.TempDir()
@@ -5066,35 +5065,35 @@ func TestNudgePollHelpersOpenOnceWhenQueueHasWork(t *testing.T) {
 		// enqueue opened+closed its own store; measure deltas around the helper.
 		opensBefore, closesBefore := *opens, *closes
 		run(dir)
-		if got := *opens - opensBefore; got != 1 {
-			t.Fatalf("%s: opens delta=%d, want 1 (non-empty queue must open the front door exactly once)", name, got)
+		if got := *opens - opensBefore; got != want {
+			t.Fatalf("%s: opens delta=%d, want %d", name, got, want)
 		}
-		if got := *closes - closesBefore; got != 1 {
-			t.Fatalf("%s: closes delta=%d, want 1 (the opened store must be released)", name, got)
+		if got := *closes - closesBefore; got != want {
+			t.Fatalf("%s: closes delta=%d, want %d", name, got, want)
 		}
 	}
 
-	assertOneOpenOneClose(t, "claim", func(dir string) {
+	assertOpenCount(t, "claim", 0, func(dir string) {
 		if _, err := claimDueQueuedNudgesMatching(dir, now, func(queuedNudge) bool { return false }); err != nil {
 			t.Fatalf("claimDueQueuedNudgesMatching: %v", err)
 		}
 	})
-	assertOneOpenOneClose(t, "list", func(dir string) {
+	assertOpenCount(t, "list", 0, func(dir string) {
 		if _, _, _, err := listQueuedNudges(dir, "worker", now); err != nil {
 			t.Fatalf("listQueuedNudges: %v", err)
 		}
 	})
-	assertOneOpenOneClose(t, "listForTarget", func(dir string) {
+	assertOpenCount(t, "listForTarget", 0, func(dir string) {
 		if _, _, _, err := listQueuedNudgesForTarget(dir, nudgeTarget{cityPath: dir}, now); err != nil {
 			t.Fatalf("listQueuedNudgesForTarget: %v", err)
 		}
 	})
-	assertOneOpenOneClose(t, "release", func(dir string) {
+	assertOpenCount(t, "release", 1, func(dir string) {
 		if err := releaseQueuedNudgeClaims(dir, []string{"absent"}); err != nil {
 			t.Fatalf("releaseQueuedNudgeClaims: %v", err)
 		}
 	})
-	assertOneOpenOneClose(t, "ack", func(dir string) {
+	assertOpenCount(t, "ack", 1, func(dir string) {
 		if err := ackQueuedNudgesWithOutcome(dir, []string{"n-work"}, "injected", "", "test-boundary"); err != nil {
 			t.Fatalf("ackQueuedNudgesWithOutcome: %v", err)
 		}

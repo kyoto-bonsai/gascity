@@ -1,15 +1,19 @@
 package nudgequeue
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 // TestWithState_SkipsRewriteWhenUnchanged guards ga-cssm95: a no-op fn (the
@@ -60,14 +64,24 @@ func TestWithState_SkipsRewriteWhenUnchanged(t *testing.T) {
 // outright after the full 8s budget).
 func TestWithState_WriterSucceedsUnderPollerLoad(t *testing.T) {
 	cityPath := t.TempDir()
+	var writes atomic.Int64
+	previousWrite := writeStateFile
+	writeStateFile = func(fs fsys.FS, path string, data []byte, perm os.FileMode) error {
+		writes.Add(1)
+		return previousWrite(fs, path, data, perm)
+	}
+	t.Cleanup(func() { writeStateFile = previousWrite })
 
 	const pollers = 50
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	var firstTick sync.WaitGroup
+	firstTick.Add(pollers)
 	for i := 0; i < pollers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			first := true
 			for {
 				select {
 				case <-stop:
@@ -80,25 +94,33 @@ func TestWithState_WriterSucceedsUnderPollerLoad(t *testing.T) {
 				// here (a real poller just retries on its own schedule);
 				// the test's actual assertion is on the writer below.
 				_ = WithState(cityPath, func(_ *State) error { return nil })
+				if first {
+					firstTick.Done()
+					first = false
+				}
 			}
 		}()
 	}
-	// Let the poller fleet reach steady-state contention before the writer
-	// joins, matching production where a writer arrives into an
-	// already-busy queue rather than racing pollers from a cold start.
-	time.Sleep(50 * time.Millisecond)
+	// Every poller has completed a real locked tick before the writer starts.
+	firstTick.Wait()
 
 	const writeID = "real-write"
+	start := time.Now()
 	writeErr := WithState(cityPath, func(state *State) error {
 		state.Pending = append(state.Pending, Item{ID: writeID, Agent: "a", Source: "s", Message: "m"})
 		return nil
 	})
+	writerLatency := time.Since(start)
 
 	close(stop)
 	wg.Wait()
+	t.Logf("writer acquisition and commit under %d pollers: %s", pollers, writerLatency)
 
 	if writeErr != nil {
 		t.Fatalf("WithState (real write) failed under %d-poller no-op load: %v (ga-cssm95: a writer must not time out behind no-op reader/maintenance ticks)", pollers, writeErr)
+	}
+	if got := writes.Load(); got != 1 {
+		t.Fatalf("physical state writes = %d, want exactly the real writer's one write", got)
 	}
 
 	state, err := LoadState(cityPath)
@@ -114,6 +136,146 @@ func TestWithState_WriterSucceedsUnderPollerLoad(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("real write did not persist despite WithState reporting success")
+	}
+}
+
+// A writer that has entered the turnstile must commit before newly arriving
+// busy pollers. The assertion is on persisted order and write count, not on a
+// scheduler-dependent latency threshold.
+func TestWithState_WriterPrecedesFiftyBusyPollers(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := WithState(cityPath, func(*State) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	var writes atomic.Int64
+	firstWrite := make(chan []byte, 1)
+	previousWrite := writeStateFile
+	writeStateFile = func(fs fsys.FS, path string, data []byte, perm os.FileMode) error {
+		if writes.Add(1) == 1 {
+			firstWrite <- append([]byte(nil), data...)
+		}
+		return previousWrite(fs, path, data, perm)
+	}
+	t.Cleanup(func() { writeStateFile = previousWrite })
+	hold, err := os.OpenFile(LockPath(cityPath), os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold.Close() //nolint:errcheck
+	if err := syscall.Flock(int(hold.Fd()), syscall.LOCK_SH); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(hold.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	writerDone := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		writerDone <- WithState(cityPath, func(state *State) error {
+			state.Pending = append(state.Pending, Item{ID: "priority-writer"})
+			return nil
+		})
+	}()
+	gate, err := os.OpenFile(LockPath(cityPath)+".gate", os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Close() //nolint:errcheck
+	// Wait for the writer to hold the gate while our shared state lock keeps
+	// its commit pending; this makes the later poller arrival order explicit.
+	for {
+		err := syscall.Flock(int(gate.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+		if err == syscall.EWOULDBLOCK {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = syscall.Flock(int(gate.Fd()), syscall.LOCK_UN)
+		select {
+		case err := <-writerDone:
+			t.Fatalf("writer exited before gate contention: %v", err)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	const pollers = 50
+	var wg sync.WaitGroup
+	results := make(chan error, pollers)
+	for i := 0; i < pollers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results <- WithState(cityPath, func(state *State) error {
+				state.Pending = append(state.Pending, Item{ID: fmt.Sprintf("busy-poller-%d", i)})
+				return nil
+			})
+		}(i)
+	}
+	if err := syscall.Flock(int(hold.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writerDone; err != nil {
+		t.Fatalf("writer timed out behind busy pollers: %v", err)
+	}
+	t.Logf("priority writer commit under %d busy pollers: %s", pollers, time.Since(start))
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("busy poller write failed: %v", err)
+		}
+	}
+	if got := writes.Load(); got != pollers+1 {
+		t.Fatalf("physical state writes = %d, want %d", got, pollers+1)
+	}
+	var state State
+	if err := json.Unmarshal(<-firstWrite, &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Pending) != 1 {
+		t.Fatalf("first physical write contained %d items, want one", len(state.Pending))
+	}
+	if state.Pending[0].ID != "priority-writer" {
+		t.Fatalf("first persisted write = %q, want priority writer", state.Pending[0].ID)
+	}
+}
+
+func TestReadThenWriteReloadsAfterSharedLockRelease(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := WithState(cityPath, func(state *State) error {
+		state.Pending = append(state.Pending, Item{ID: "initial"})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var interveningErr error
+	afterReadUnlock = func() {
+		interveningErr = WithState(cityPath, func(state *State) error {
+			state.Pending = append(state.Pending, Item{ID: "intervening"})
+			return nil
+		})
+	}
+	t.Cleanup(func() { afterReadUnlock = nil })
+	readCalled := false
+	err := ReadThenWrite(cityPath, func(state State) bool {
+		return len(state.Pending) == 1
+	}, func(State) error {
+		readCalled = true
+		return nil
+	}, func(state *State) error {
+		if len(state.Pending) != 2 {
+			return fmt.Errorf("exclusive reload saw %d items, want intervening write", len(state.Pending))
+		}
+		state.Pending = append(state.Pending, Item{ID: "upgrade"})
+		return nil
+	})
+	if interveningErr != nil || err != nil || readCalled {
+		t.Fatalf("upgrade: intervening=%v write=%v readCalled=%v", interveningErr, err, readCalled)
+	}
+	state, err := LoadState(cityPath)
+	if err != nil || len(state.Pending) != 3 {
+		t.Fatalf("final state: count=%d err=%v", len(state.Pending), err)
 	}
 }
 

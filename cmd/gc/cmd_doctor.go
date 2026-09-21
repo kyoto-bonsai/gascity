@@ -182,6 +182,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// Core checks — always run.
 	register(&doctor.CityStructureCheck{})
 	register(&doctor.CityConfigCheck{})
+	register(newNudgePollerDirectoryCheck(cityPath))
 	for _, c := range v2DeprecationChecks() {
 		register(c)
 	}
