@@ -124,6 +124,7 @@ type CityRuntime struct {
 	mat                     maxSessionAgeTracker
 	adt                     assignedWorkDeferTracker
 	wg                      wispGC
+	orderMu                 sync.Mutex // serializes cadence dispatch with tick dispatch and reload
 	od                      orderDispatcher
 	retiredOrderDispatchers []orderDispatcher
 	orderSet                []orders.Order
@@ -813,6 +814,14 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	interval := cr.cfg.Daemon.PatrolIntervalDuration()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// Order firing must continue while a full session reconciliation is busy.
+	orderCtx, cancelOrders := context.WithCancel(ctx)
+	orderDone := make(chan struct{})
+	go cr.runOrderCadence(orderCtx, cityRoot, nil, orderDone)
+	defer func() {
+		cancelOrders()
+		<-orderDone
+	}()
 
 	// Start the supervisor nudge dispatcher when configured. The wake-socket
 	// listener feeds nudgeWakeCh on every producer enqueue, giving sub-second
@@ -1492,10 +1501,12 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 		cr.wispIndexMigrationApplied = true
 		cr.applyWispQueryIndexes(ctx)
 	}
-	cr.rescanOrderDispatcherIfDue(ctx, cityRoot, now)
 	cr.runOrderTrackingSweepWatchdog(now)
 	cr.runOrderTrackingRetentionWatchdog(now)
 	cr.runNudgeMailSweepWatchdog(now)
+	cr.orderMu.Lock()
+	defer cr.orderMu.Unlock()
+	cr.rescanOrderDispatcherIfDue(ctx, cityRoot, now)
 	if cr.od != nil {
 		cr.od.dispatch(ctx, cityRoot, now)
 	}
@@ -1984,7 +1995,9 @@ func (cr *CityRuntime) reloadConfigTraced(
 		appendWarning(warning)
 	}
 	if cr.configRev != "" && result.Revision == cr.configRev {
+		cr.orderMu.Lock()
 		ordersChanged, orderSummary, orderErr := cr.rescanOrderDispatcher(ctx, cityRoot, result.Cfg, "gc reload: order scan", time.Now())
+		cr.orderMu.Unlock()
 		if orderErr != nil {
 			err := fmt.Errorf("order reload: %w", orderErr)
 			fmt.Fprintf(cr.stderr, "%s: %v (keeping old orders)\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
@@ -2222,14 +2235,15 @@ func (cr *CityRuntime) reloadConfigTraced(
 
 	// Drain the outgoing dispatcher before replacing it so in-flight
 	// dispatchOne goroutines persist their tracking-bead outcomes against
-	// the store they were scheduled against. Reload runs on the same
-	// goroutine as tick, so no concurrent dispatch can create a new
-	// in-flight signal on this dispatcher while drain observes it. The
-	// reload budget is capped at reloadOrderDrainTimeout so a wedged exec
+	// the store they were scheduled against. orderMu prevents the
+	// independent cadence loop from launching new work while reload drains
+	// and replaces the dispatcher. The reload budget is
+	// capped at reloadOrderDrainTimeout so a wedged exec
 	// order cannot stall the tick loop; timed-out dispatchers are retained
 	// and drained again during shutdown.
 	// Deriving from ctx (the tick ctx) lets a shutdown racing with reload
 	// short-circuit the drain instead of waiting the full 1s.
+	cr.orderMu.Lock()
 	if cr.od != nil {
 		drainCtx, drainCancel := context.WithTimeout(ctx, reloadOrderDrainTimeout)
 		cr.drainOutgoingOrderDispatcher(drainCtx, cr.od)
@@ -2250,6 +2264,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 	cr.sp = nextSp
 	cr.dops = nextDops
 	cr.serviceStateMu.Unlock()
+	cr.orderMu.Unlock()
 	cr.demandSnapshot = nil
 
 	if cr.cs != nil {
