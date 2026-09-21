@@ -723,13 +723,7 @@ func contractPortReachable(host, port string) bool {
 	if strings.TrimSpace(port) == "" {
 		return false
 	}
-	address := net.JoinHostPort(host, port)
-	conn, err := net.DialTimeout("tcp", address, 250*time.Millisecond)
-	if err != nil {
-		// A busy host can miss the short probe even while the managed listener
-		// is healthy. Keep the usual fast path and bound one confirmation probe.
-		conn, err = net.DialTimeout("tcp", address, time.Second)
-	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 250*time.Millisecond)
 	if err != nil {
 		return false
 	}

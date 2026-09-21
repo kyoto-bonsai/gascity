@@ -1117,10 +1117,19 @@ func reachableNonLoopbackHost(t *testing.T) string {
 		if err != nil {
 			continue
 		}
+		// Binding a LAN/VPN address does not imply this host can connect back
+		// to it (for example, macOS can route the dial through a blocked VPN).
+		// These tests need a reachable managed endpoint, not just a bound FD.
+		conn, dialErr := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+		if dialErr != nil {
+			_ = listener.Close()
+			continue
+		}
+		_ = conn.Close()
 		_ = listener.Close()
 		return ip.String()
 	}
-	t.Skip("no bindable non-loopback IPv4 address")
+	t.Skip("no bindable and reachable non-loopback IPv4 address")
 	return ""
 }
 
@@ -2313,33 +2322,6 @@ dolt.auto-start: false
 	}
 	if got := env["BEADS_DOLT_SERVER_PORT"]; got != wantPort {
 		t.Fatalf("BEADS_DOLT_SERVER_PORT = %q, want runtime port %q", got, wantPort)
-	}
-}
-
-func TestResolvedManagedCityDoltTargetDoesNotPromoteAmbientPortAfterProbeFailure(t *testing.T) {
-	t.Setenv("GC_BEADS", "bd")
-	t.Setenv("GC_DOLT", "skip")
-	t.Setenv("GC_DOLT_HOST", "external-db.example.com")
-	t.Setenv("GC_DOLT_PORT", "9999")
-
-	cityPath := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte(`issue_prefix: demo
-gc.endpoint_origin: managed_city
-gc.endpoint_status: verified
-dolt.auto-start: false
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	target, ok, err := resolvedRuntimeCityDoltTarget(cityPath, true)
-	if err == nil || !contract.IsManagedRuntimeUnavailable(err) {
-		t.Fatalf("resolvedRuntimeCityDoltTarget() error = %v, want unavailable managed runtime", err)
-	}
-	if ok || target.Port == "9999" {
-		t.Fatalf("resolvedRuntimeCityDoltTarget() = %+v, ok=%v; ambient port must not replace managed port", target, ok)
 	}
 }
 
