@@ -183,7 +183,7 @@ func TestResolveTaskOptionOverridesReadsAssignedWorkBead(t *testing.T) {
 
 func TestResolveTaskOptionOverrides_InvalidValueIgnoredPerKey(t *testing.T) {
 	store := beads.NewMemStore()
-	candidate := newOptionSessionCandidate(t, store, map[string]string{"model": "definitely-not-a-choice", "effort": "high"}, nil)
+	candidate := newOptionSessionCandidate(t, store, map[string]string{"model": "not a single model token", "effort": "high"}, nil)
 
 	want := map[string]string{"effort": "high"}
 	if got := resolveTaskOptionOverrides(store, optionSchemaProvider(), taskWorkDirAssignees(candidate, &config.City{})...); !reflect.DeepEqual(got, want) {

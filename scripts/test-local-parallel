@@ -122,6 +122,7 @@ gotmpdir_val="$(go env GOTMPDIR)"
 goroot_val="$(go env GOROOT)"
 
 jobspecs=()
+gate_core_job_count=0
 
 add_job() {
   local label="$1"
@@ -230,6 +231,7 @@ case "$mode" in
     fi
     add_fsys_compile_job
     add_gate_unit_core_job
+    gate_core_job_count=${#jobspecs[@]}
     add_gate_cmd_gc_shards
     ;;
   fast)
@@ -271,8 +273,9 @@ fi
 # machine. Divide the outer budget across the concurrent jobs so each
 # claims only its fair share (see inner-parallelism.sh for the -p vs
 # -parallel scope caveat) (ga-04m84s).
+base_goflags="${GOFLAGS:-}"
 inner_p="$(gc_inner_parallelism "$local_jobs" "${#jobspecs[@]}")"
-export GOFLAGS="${GOFLAGS:+$GOFLAGS }-p=${inner_p}"
+export GOFLAGS="${base_goflags:+$base_goflags }-p=${inner_p}"
 
 cleanup_log_dir=1
 if [[ -n "${LOCAL_TEST_LOG_DIR:-}" ]]; then
@@ -462,8 +465,40 @@ run_fan_out() {
 }
 # No watchdog deadline here: each shard runner owns its own, sized to its own
 # go test budget. A second global one would only fire late and less precisely.
-gc_harness_run_supervised "${mode} fan-out" "" 0 -- run_fan_out
-status=$?
+if [[ "$mode" == gate ]]; then
+  gate_jobspecs=("${jobspecs[@]}")
+  gate_budget="$local_jobs"
+
+  # The multi-package sweep needs its package parallelism and must not share
+  # host process probes with cmd/gc. Run it before the cmd/gc shards, while
+  # retaining the same frozen inventory and per-package 15m deadline.
+  jobspecs=("${gate_jobspecs[@]:0:gate_core_job_count}")
+  local_jobs=1
+  phase_inner_p="$(gc_inner_parallelism "$gate_budget" 1)"
+  export GOFLAGS="${base_goflags:+$base_goflags }-p=${phase_inner_p}"
+  echo "gate: core phase jobs=${#jobspecs[@]} outer=${local_jobs} inner_p=${phase_inner_p}"
+  gc_harness_run_supervised "gate core fan-out" "" 0 -- run_fan_out
+  core_status=$?
+
+  jobspecs=("${gate_jobspecs[@]:gate_core_job_count}")
+  local_jobs=2
+  if (( gate_budget < local_jobs )); then
+    local_jobs="$gate_budget"
+  fi
+  phase_inner_p="$(gc_inner_parallelism "$gate_budget" "$local_jobs")"
+  export GOFLAGS="${base_goflags:+$base_goflags }-p=${phase_inner_p}"
+  echo "gate: cmd/gc phase jobs=${#jobspecs[@]} outer=${local_jobs} inner_p=${phase_inner_p}"
+  gc_harness_run_supervised "gate cmd/gc fan-out" "" 0 -- run_fan_out
+  shard_status=$?
+
+  status=0
+  if (( core_status != 0 || shard_status != 0 )); then
+    status=1
+  fi
+else
+  gc_harness_run_supervised "${mode} fan-out" "" 0 -- run_fan_out
+  status=$?
+fi
 set -e
 
 if [[ "$mode" == gate ]]; then

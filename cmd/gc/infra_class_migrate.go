@@ -1932,7 +1932,7 @@ func infraFormatEdgePayload(edge infraEdgePayload) string {
 // beadCopyDifference returns a human-readable description of the first field
 // that did not survive the copy, or "" when the copy is faithful.
 //
-// It witnesses every durable field of beads.Bead. The five it does not are named
+// It witnesses every durable field of beads.Bead. The fields it does not are named
 // individually, with the reason each cannot be a witness, in
 // beadCopyExemptFields, and TestBeadCopyDifferenceWitnessesEveryDurableField
 // guards that list against the struct by reflection so a field added to

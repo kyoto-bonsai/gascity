@@ -25,13 +25,13 @@ import (
 // here — never silently unwitnessed.
 //
 // The reasons matter as much as the names. An exemption is normally a promise that
-// a copy which changed this field is still a faithful copy, and two of these five
-// are only true because something else witnesses the same state.
-// IndefinitelyDeferred is the one exemption that does not carry that promise: the
-// destination cannot hold it, so the deferral genuinely does not cross. It is
-// exempt because comparing it would refuse every copy of a deferred infra row
-// without preserving anything — not because the copy stays faithful. Do not cite
-// it as precedent for exempting a field the destination could hold.
+// a copy which changed this field is still a faithful copy; the dependency
+// shorthand exemptions rely on a separate edge witness. The two
+// indefinite-deferral projections do not carry that promise: the destination
+// cannot persist them, so indefinite deferral genuinely does not cross this
+// migration. Comparing them would refuse every such copy without preserving
+// the deferral. Do not cite them as precedent for exempting a field the
+// destination could hold or call such a copy semantically faithful.
 var beadCopyExemptFields = map[string]string{
 	"Revision": "store-internal optimistic-concurrency token. Each store mints and bumps its own; the destination's row is a fresh create, so its revision is unrelated to the source's by construction.",
 	"ClaimFence": "store-internal ownership fence, maintained per store like Revision. " +
@@ -47,6 +47,9 @@ var beadCopyExemptFields = map[string]string{
 		"bead_json — so it is structurally absent from the destination and comparing it would refuse EVERY copy of a " +
 		"deferred infra row, identically on each retry. What does not cross is the deferral itself: the binding reads such " +
 		"a row as plainly open.",
+	"IsDeferredIndefinitely": "read-time tri-state of the source backend's raw deferred status, not persisted by the " +
+		"destination: its json:- tag excludes it from SQLiteStore bead_json. Comparing the source pointer would refuse " +
+		"a persisted destination row; the destination cannot reconstruct this source-only dispatchability signal.",
 }
 
 // infraEqualityFixture is a source row with every durable field populated to a
@@ -58,6 +61,7 @@ func infraEqualityFixture() beads.Bead {
 	deferred := created.Add(72 * time.Hour)
 	priority := 2
 	blocked := false
+	indefinite := true
 	return beads.Bead{
 		ID:           "gcg-41",
 		Title:        "session lifecycle",
@@ -84,7 +88,8 @@ func infraEqualityFixture() beads.Bead {
 		// Set so the exempt mutation below models the loss that actually
 		// happens — a source row carrying the marker against a destination that
 		// cannot hold it — rather than the destination inventing one.
-		IndefinitelyDeferred: true,
+		IndefinitelyDeferred:   true,
+		IsDeferredIndefinitely: &indefinite,
 	}
 }
 
@@ -141,7 +146,8 @@ func beadCopyExemptMutations() map[string]func(beads.Bead) beads.Bead {
 		// The fixture carries the marker, so clearing it here is the real loss:
 		// a destination that cannot hold what the source read produced. This is
 		// the mutation that must NOT be refused, or the migration wedges.
-		"IndefinitelyDeferred": func(b beads.Bead) beads.Bead { b.IndefinitelyDeferred = false; return b },
+		"IndefinitelyDeferred":   func(b beads.Bead) beads.Bead { b.IndefinitelyDeferred = false; return b },
+		"IsDeferredIndefinitely": func(b beads.Bead) beads.Bead { b.IsDeferredIndefinitely = nil; return b },
 	}
 }
 

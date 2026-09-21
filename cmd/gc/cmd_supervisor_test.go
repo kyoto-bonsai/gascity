@@ -4728,10 +4728,9 @@ func (hangingListProvider) ListRunning(string) ([]string, error) {
 
 func TestStopManagedCityBoundsForcedShutdownWhenRuntimeHangs(t *testing.T) {
 	cityPath := t.TempDir()
-	logFile := filepath.Join(t.TempDir(), "ops.log")
-	script := writeSpyScript(t, logFile)
-	t.Setenv("GC_BEADS", "exec:"+script)
-	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
+	// The bound under test is the runtime shutdown wait. An exec-backed bead
+	// provider adds an unrelated subprocess stop to the measured wall time.
+	t.Setenv("GC_BEADS", "file")
 
 	closer := &closerSpy{}
 	forceStop := &atomic.Bool{}
