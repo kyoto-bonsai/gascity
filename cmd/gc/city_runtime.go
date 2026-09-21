@@ -126,6 +126,7 @@ type CityRuntime struct {
 	wg                      wispGC
 	orderMu                 sync.Mutex // serializes cadence dispatch with tick dispatch and reload
 	od                      orderDispatcher
+	orderCadencePulses      <-chan time.Time // optional deterministic pulse source for coordination tests
 	retiredOrderDispatchers []orderDispatcher
 	orderSet                []orders.Order
 	orderSetSignature       string
@@ -668,6 +669,15 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	// Keep scheduled orders moving during route recovery and initial session
+	// reconciliation, both of which can block for minutes on a cold start.
+	orderCtx, cancelOrders := context.WithCancel(ctx)
+	orderDone := make(chan struct{})
+	go cr.runOrderCadence(orderCtx, cityRoot, cr.orderCadencePulses, orderDone)
+	defer func() {
+		cancelOrders()
+		<-orderDone
+	}()
 
 	// Recover ready work whose canonical pool route was lost or never written
 	// (gc.run_target set, gc.routed_to empty) before session reconciliation, so a
@@ -814,14 +824,6 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	interval := cr.cfg.Daemon.PatrolIntervalDuration()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	// Order firing must continue while a full session reconciliation is busy.
-	orderCtx, cancelOrders := context.WithCancel(ctx)
-	orderDone := make(chan struct{})
-	go cr.runOrderCadence(orderCtx, cityRoot, nil, orderDone)
-	defer func() {
-		cancelOrders()
-		<-orderDone
-	}()
 
 	// Start the supervisor nudge dispatcher when configured. The wake-socket
 	// listener feeds nudgeWakeCh on every producer enqueue, giving sub-second

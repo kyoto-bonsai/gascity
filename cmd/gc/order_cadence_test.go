@@ -3,10 +3,16 @@ package main
 import (
 	"context"
 	"io"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 func TestOrderCadenceCapacityTracksConfiguredCooldowns(t *testing.T) {
@@ -117,5 +123,89 @@ func TestOrderCadenceSerializesWithDispatcherReplacement(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("order cadence did not stop")
+	}
+}
+
+// A cold-start reconcile can take minutes, so the real run wiring must start
+// the cadence loop before entering it rather than only after marking ready.
+func TestCityRuntimeOrderCadenceFiresDuringStartupReconcile(t *testing.T) {
+	const deadline = 10 * time.Second
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pulses := make(chan time.Time)
+	dispatched := make(chan struct{}, 2)
+	reconcileEntered := make(chan struct{})
+	releaseReconcile := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseReconcile) }) }
+	defer release()
+	od := &recordingOrderDispatcher{onDispatch: func(context.Context, string, time.Time) {
+		dispatched <- struct{}{}
+	}}
+	cr, err := newCityRuntime(CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			close(reconcileEntered)
+			<-releaseReconcile
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:      newDrainOps(sp),
+		Rec:       events.Discard,
+		OnStarted: cancel,
+		Stdout:    io.Discard,
+		Stderr:    io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("building the city runtime: %v", err)
+	}
+	cr.od = od
+	cr.orderCadencePulses = pulses
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+	done := make(chan struct{})
+	go func() {
+		cr.run(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-reconcileEntered:
+	case <-time.After(deadline):
+		t.Fatal("startup reconcile was not entered")
+	}
+	select {
+	case <-dispatched: // the bounded pre-startup pass
+	case <-time.After(deadline):
+		t.Fatal("startup order pass did not dispatch")
+	}
+	select {
+	case pulses <- time.Now():
+	case <-time.After(deadline):
+		t.Fatal("cadence loop was not running during startup reconcile")
+	}
+	select {
+	case <-dispatched:
+	case <-time.After(deadline):
+		t.Fatal("cadence did not dispatch during startup reconcile")
+	}
+	cancel()
+	release()
+	select {
+	case <-done:
+	case <-time.After(deadline):
+		t.Fatal("runtime did not stop after startup reconcile was released")
 	}
 }
