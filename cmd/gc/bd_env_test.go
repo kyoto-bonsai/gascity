@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -1133,6 +1134,30 @@ func reachableNonLoopbackHost(t *testing.T) string {
 	return ""
 }
 
+// pinProviderFixturePortHolder keeps these provider-state tests independent of
+// host lsof latency. The fixture itself owns a live listener on this port; only
+// that exact LISTEN query is answered here. Other queries use the real lsof.
+func pinProviderFixturePortHolder(t *testing.T, port int) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
+	if err != nil {
+		t.Fatalf("provider fixture listener %d is not reachable: %v", port, err)
+	}
+	_ = conn.Close()
+
+	realLsof, lookupErr := exec.LookPath("lsof")
+	delegate := "exit 1"
+	if lookupErr == nil {
+		delegate = "exec " + shellSingleQuote(realLsof) + " \"$@\""
+	}
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$#\" -eq 4 ] && [ \"$1\" = '-nP' ] && [ \"$2\" = '-iTCP:%d' ] && [ \"$3\" = '-sTCP:LISTEN' ] && [ \"$4\" = '-t' ]; then\n  printf '%%s\\n' '%d'\n  exit 0\nfi\n%s\n", port, os.Getpid(), delegate)
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "lsof"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fixture lsof: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func TestResolvedRuntimeCityDoltTargetIgnoresIPv6LocalEnvOverride(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 	t.Setenv("GC_DOLT", "skip")
@@ -1337,6 +1362,7 @@ dolt.auto-start: false
 		t.Fatal(err)
 	}
 	port := writeReachableProviderManagedDoltState(t, cityPath)
+	pinProviderFixturePortHolder(t, port)
 
 	target, ok, err := resolvedRuntimeCityDoltTarget(cityPath, false)
 	if err == nil || !contract.IsManagedRuntimeUnavailable(err) {
@@ -1458,6 +1484,7 @@ dolt.auto-start: false
 	}
 
 	port := writeReachableProviderManagedDoltState(t, cityPath)
+	pinProviderFixturePortHolder(t, port)
 
 	// Make the dolt state dir read-only to force publishManagedDoltRuntimeStateFromState
 	// to fail — it cannot write dolt-state.json to the read-only directory.
@@ -2322,6 +2349,30 @@ dolt.auto-start: false
 	}
 	if got := env["BEADS_DOLT_SERVER_PORT"]; got != wantPort {
 		t.Fatalf("BEADS_DOLT_SERVER_PORT = %q, want runtime port %q", got, wantPort)
+	}
+}
+
+// Projection remains deterministic when the integration fixture cannot obtain
+// a dialable nonloopback interface on the test host.
+func TestManagedDoltTargetProjectionOverridesStaleAmbientPort(t *testing.T) {
+	target := contract.DoltConnectionTarget{Host: "192.0.2.10", Port: "45123"}
+	env := map[string]string{
+		"GC_DOLT_HOST":           "stale.example.com",
+		"GC_DOLT_PORT":           "9999",
+		"BEADS_DOLT_SERVER_HOST": "stale.example.com",
+		"BEADS_DOLT_SERVER_PORT": "9999",
+	}
+	applyCanonicalDoltTargetEnv(env, target)
+	mirrorBeadsDoltScopeEnv(env, target)
+	for _, key := range []string{"GC_DOLT_HOST", "BEADS_DOLT_SERVER_HOST"} {
+		if got := env[key]; got != target.Host {
+			t.Errorf("%s = %q, want resolved host %q", key, got, target.Host)
+		}
+	}
+	for _, key := range []string{"GC_DOLT_PORT", "BEADS_DOLT_SERVER_PORT"} {
+		if got := env[key]; got != target.Port {
+			t.Errorf("%s = %q, want resolved port %q", key, got, target.Port)
+		}
 	}
 }
 
