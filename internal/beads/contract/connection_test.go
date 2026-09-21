@@ -1092,10 +1092,18 @@ func reachableNonLoopbackHost(t *testing.T) string {
 		if err != nil {
 			continue
 		}
+		// A bound LAN/VPN address may not be reachable from this process. The
+		// managed-runtime fixture needs an address its own client can dial.
+		conn, dialErr := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+		if dialErr != nil {
+			_ = listener.Close()
+			continue
+		}
+		_ = conn.Close()
 		_ = listener.Close()
 		return ip.String()
 	}
-	t.Skip("no bindable non-loopback IPv4 address")
+	t.Skip("no bindable and reachable non-loopback IPv4 address")
 	return ""
 }
 
