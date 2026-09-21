@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-usage: scripts/test-local-parallel <fast|cmd-gc-process|integration|full>
+usage: scripts/test-local-parallel <gate|fast|cmd-gc-process|integration|full>
 
 Environment:
   LOCAL_TEST_JOBS        max concurrent jobs (default: CPU-and-memory-aware)
@@ -143,6 +143,21 @@ add_unit_core_job() {
     "GC_FAST_UNIT=1 go test -count=1 -timeout ${go_test_timeout} \$(go list ./... | grep -v '^github.com/gastownhall/gascity/cmd/gc$')"
 }
 
+# The release gate uses one checked package snapshot and one checked cmd/gc
+# discovery snapshot. Every job writes its own JSONL; the verifier reconciles
+# the planned inventory with terminal events after the fan-out completes.
+add_gate_unit_core_job() {
+  add_job "unit-core" 'GC_FAST_UNIT=1 OBSERVABLE_TEST_LOG="$LOCAL_TEST_LOG_DIR/unit-core.jsonl" scripts/go-test-observable unit-core -- -count=1 -timeout 15m $(cat "$LOCAL_TEST_LOG_DIR/noncmd.packages")'
+}
+
+add_gate_cmd_gc_shards() {
+  local i command
+  for i in $(seq 1 "$cmd_gc_total"); do
+    command="GC_FAST_UNIT=1 GO_TEST_COUNT=1 GO_TEST_TIMEOUT=15m GO_TEST_MANIFEST=\"\$LOCAL_TEST_LOG_DIR/cmdgc.manifest\" OBSERVABLE_TEST_LOG=\"\$LOCAL_TEST_LOG_DIR/cmdgc-${i}.jsonl\" ./scripts/test-go-test-shard ./cmd/gc ${i} ${cmd_gc_total}"
+    add_job "unit-cmd-gc-${i}-of-${cmd_gc_total}" "$command"
+  done
+}
+
 # Runs as a direct shell job rather than through a `go test` wrapper because a
 # Go _test.go file invoking exec.Command to run this script would itself add
 # one os/exec call to the resourcecensus subprocess census (both the untagged
@@ -208,6 +223,15 @@ add_integration_jobs() {
 }
 
 case "$mode" in
+  gate)
+    if (( local_jobs > 4 )) || (( cmd_gc_total != 12 )) || [[ "$go_test_timeout" != 15m ]]; then
+      echo "gate requires LOCAL_TEST_JOBS<=4, CMD_GC_PROCESS_TOTAL=12, and GO_TEST_TIMEOUT=15m" >&2
+      exit 1
+    fi
+    add_fsys_compile_job
+    add_gate_unit_core_job
+    add_gate_cmd_gc_shards
+    ;;
   fast)
     add_fsys_compile_job
     add_unit_core_job
@@ -257,7 +281,83 @@ if [[ -n "${LOCAL_TEST_LOG_DIR:-}" ]]; then
 else
   log_dir="$(mktemp -d "${TMPDIR:-/var/tmp}/gc-local-tests.XXXXXX")"
 fi
+if [[ "$mode" == gate ]]; then
+  cleanup_log_dir=0
+  mkdir -p "$log_dir"
+  log_dir="$(cd "$log_dir" && pwd)"
+  if [[ -n "$(find "$log_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "gate: evidence directory must be empty: $log_dir" >&2
+    exit 1
+  fi
+fi
 export LOCAL_TEST_LOG_DIR="$log_dir"
+
+prepare_gate_inventory() {
+  local module package_output list_output pkg line cmdgc
+  local -a packages=() noncmd=() tests=()
+  if ! module="$(go list -m 2>&1)" || [[ -z "$module" ]]; then
+    echo "gate: module discovery failed: $module" >&2
+    return 1
+  fi
+  cmdgc="$module/cmd/gc"
+  if ! package_output="$(go list ./... 2>&1)"; then
+    echo "gate: package discovery failed: $package_output" >&2
+    return 1
+  fi
+  while IFS= read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    if [[ "$pkg" == *[[:space:]]* ]]; then
+      echo "gate: invalid package entry: $pkg" >&2
+      return 1
+    fi
+    packages+=("$pkg")
+    [[ "$pkg" == "$cmdgc" ]] || noncmd+=("$pkg")
+  done <<< "$package_output"
+  if (( ${#packages[@]} == 0 || ${#noncmd[@]} == 0 )); then
+    echo "gate: empty package inventory" >&2
+    return 1
+  fi
+  local cmdgc_count=0
+  for pkg in "${packages[@]}"; do
+    if [[ "$pkg" == "$cmdgc" ]]; then
+      cmdgc_count=$((cmdgc_count + 1))
+    fi
+  done
+  if [[ "$(printf '%s\n' "${packages[@]}" | sort | uniq -d)" != "" ]] ||
+     (( cmdgc_count != 1 )); then
+    echo "gate: duplicate packages or cmd/gc package missing" >&2
+    return 1
+  fi
+  printf '%s\n' "${packages[@]}" > "$log_dir/all.packages"
+  printf '%s\n' "${noncmd[@]}" > "$log_dir/noncmd.packages"
+
+  if ! list_output="$(GC_FAST_UNIT=1 go test -list '^(Test|Example|Fuzz)' ./cmd/gc 2>&1)"; then
+    echo "gate: cmd/gc test discovery failed: $list_output" >&2
+    return 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      Example*|Fuzz*) echo "gate: unsupported runnable entry: $line" >&2; return 1 ;;
+      Test*)
+        if ! [[ "$line" =~ ^Test($|[A-Z0-9_][A-Za-z0-9_]*)$ ]]; then
+          echo "gate: invalid test entry: $line" >&2
+          return 1
+        fi
+        tests+=("$line")
+        ;;
+    esac
+  done <<< "$list_output"
+  if (( ${#tests[@]} == 0 )) || [[ "$(printf '%s\n' "${tests[@]}" | sort | uniq -d)" != "" ]]; then
+    echo "gate: empty or duplicate cmd/gc test discovery" >&2
+    return 1
+  fi
+  printf '%s\n' "${tests[@]}" > "$log_dir/cmdgc.manifest"
+  echo "gate: discovered ${#packages[@]} packages and ${#tests[@]} cmd/gc tests; inventory=$log_dir" >&2
+}
+
+if [[ "$mode" == gate ]]; then
+  prepare_gate_inventory
+fi
 export TEST_LOCAL_GOPATH="$gopath_val"
 export TEST_LOCAL_GOCACHE="$gocache_val"
 export TEST_LOCAL_GOMODCACHE="$gomodcache_val"
@@ -348,9 +448,11 @@ run_fan_out() {
     GOVCS="${GOVCS-}" \
     GOWORK="${GOWORK-}" \
     bash -lc "$command" >"$log" 2>&1; then
+    printf '0\n' > "$LOCAL_TEST_LOG_DIR/${safe_label}.exit"
     echo "[$label] ok"
   else
     status=$?
+    printf '%s\n' "$status" > "$LOCAL_TEST_LOG_DIR/${safe_label}.exit"
     echo "[$label] failed with exit ${status}; log: ${log}" >&2
     sed -n '"'"'1,240p'"'"' "$log" >&2
     exit "$status"
@@ -363,6 +465,12 @@ gc_harness_run_supervised "${mode} fan-out" "" 0 -- run_fan_out
 status=$?
 set -e
 
+if [[ "$mode" == gate ]]; then
+  if ! python3 scripts/verify-sharded-gate.py "$log_dir" "$cmd_gc_total"; then
+    status=1
+  fi
+fi
+
 if [[ "$status" -eq 0 ]]; then
   if [[ "$cleanup_log_dir" -eq 1 ]]; then
     rm -rf "$log_dir"
@@ -370,6 +478,9 @@ if [[ "$status" -eq 0 ]]; then
   echo "All ${mode} jobs passed"
 else
   echo "One or more ${mode} jobs failed; logs are in ${log_dir}" >&2
+fi
+if [[ "$mode" == gate ]]; then
+  echo "gate: evidence=$log_dir" >&2
 fi
 
 exit "$status"

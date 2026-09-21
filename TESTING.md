@@ -613,6 +613,16 @@ fast unit-only baseline; the integration contribution comes from the
 shard-specific `coverage.integration-*.txt` profiles and their matching
 Codecov flags.
 
+The default `make test` gate freezes package and `cmd/gc` test discovery,
+runs every non-`cmd/gc` package once, and partitions `cmd/gc` tests across
+twelve process-isolated shards. It rejects failed discovery, duplicate or
+missing tests, and runnable Example/Fuzz entries until the shard runner can
+include them. At most four heavy jobs run concurrently. Each test process
+uses the same 15-minute deadline and `-count=1`; no package is omitted.
+The runner keeps a separate JSONL, exit status, and job log for each shard
+and the non-`cmd/gc` sweep, then checks the terminal events against the
+frozen inventory. It prints the retained evidence directory on completion.
+
 ### Cross-category runners, timing, and resource isolation
 
 For broad local runs, prefer the repo's sharded wrappers over raw `go test`

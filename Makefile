@@ -463,13 +463,14 @@ test-ci-policy:
 ## test: run fast unit tests (skip integration-tagged and GC_FAST_UNIT-gated process tests)
 ## The skipped cmd/gc process-backed scenarios remain covered by
 ## `make test-cmd-gc-process` locally and the CI `cmd/gc process suite` job.
-## Bound package parallelism so subprocess-heavy packages do not starve each
-## other into false 5s probe/condition timeouts. Use -count=1 so pre-commit
-## reports actual test results instead of hanging after PASS while Go computes
-## cache input hashes over local working files.
-## Wrapped in $(TEST_ENV) — see comment above for why.
-test: test-fsys-darwin-compile
-	$(TEST_ENV) GOFLAGS="$(QUALITY_GATE_GOFLAGS)" GC_FAST_UNIT=1 scripts/go-test-observable test -- -p=4 -count=1 -timeout 15m ./...
+## The release gate keeps the fast inventory but partitions cmd/gc's large
+## package across twelve process-isolated shards. The shared runner freezes
+## package/test discovery, caps concurrent heavy jobs at four, records distinct
+## JSONL and exit artifacts, and checks every planned terminal result.
+## Each test process keeps the 15m budget and -count=1; TEST_ENV strips host
+## state before the runner starts.
+test:
+	$(TEST_ENV) GOFLAGS="$(QUALITY_GATE_GOFLAGS)" GC_FAST_UNIT=1 LOCAL_TEST_LOG_DIR="$${LOCAL_TEST_LOG_DIR-}" LOCAL_TEST_JOBS=4 CMD_GC_PROCESS_TOTAL=12 GO_TEST_TIMEOUT=15m ./scripts/test-local-parallel gate
 
 ## test-herdr-live: run the internal/runtime/herdr live journeys against a real
 ## herdr server. These drive panes, force agent-status reports and bounce the

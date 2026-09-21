@@ -73,6 +73,9 @@ while IFS='=' read -r name _; do
       ;;
   esac
 done < <(env)
+if [[ -n "${OBSERVABLE_TEST_LOG:-}" ]]; then
+  extra_env+=("OBSERVABLE_TEST_LOG=${OBSERVABLE_TEST_LOG}")
+fi
 
 run_in_test_env() {
   local base_env=(
@@ -123,7 +126,7 @@ run_go_test() {
 run_observable_go_test() {
   local timing_name="${GO_TEST_TIMING_NAME:-${test_pkg#./}-shard-${shard_index}-of-${shard_total}}"
   local observable_env=(
-    OBSERVABLE_TIMING_FILE="${GO_TEST_TIMING_FILE}"
+    OBSERVABLE_TIMING_FILE="${GO_TEST_TIMING_FILE:-}"
     OBSERVABLE_SHARD_ID="${timing_name}"
     OBSERVABLE_VARIANT="${GO_TEST_TIMING_VARIANT:-default}"
     OBSERVABLE_COMMIT_SHA="${GITHUB_SHA:-}"
@@ -256,7 +259,7 @@ if [[ "$watchdog_grace" != "off" ]]; then
 fi
 
 shard_label="${test_pkg#./} shard ${shard_index} of ${shard_total}"
-if [[ -n "${GO_TEST_TIMING_FILE:-}" ]]; then
+if [[ -n "${GO_TEST_TIMING_FILE:-}" || -n "${OBSERVABLE_TEST_LOG:-}" ]]; then
   gc_harness_run_supervised "$shard_label" "$watchdog_deadline" "$watchdog_quit_grace" -- \
     run_observable_go_test "${go_test_args[@]}" "$test_pkg" -run "$regex"
 else
