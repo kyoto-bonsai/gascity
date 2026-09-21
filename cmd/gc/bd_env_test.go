@@ -1469,7 +1469,8 @@ dolt.auto-start: false
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	writeReachableProviderManagedDoltState(t, cityPath)
+	port := writeReachableProviderManagedDoltState(t, cityPath)
+	installOwnedDoltPortLsofFixture(t, port)
 
 	target, ok, err := resolvedRuntimeCityDoltTarget(cityPath, true)
 	if err == nil {
@@ -3067,12 +3068,14 @@ func TestBdRuntimeEnvForRigFallsBackToManagedCityPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer func() { _ = ln.Close() }() //nolint:errcheck // test cleanup
+	serveOwnedDoltTestListener(t, ln)
+	port := ln.Addr().(*net.TCPAddr).Port
+	installOwnedDoltPortLsofFixture(t, port)
 
 	if err := writeDoltState(cityDir, doltRuntimeState{
 		Running:   true,
 		PID:       os.Getpid(),
-		Port:      ln.Addr().(*net.TCPAddr).Port,
+		Port:      port,
 		DataDir:   filepath.Join(cityDir, ".beads", "dolt"),
 		StartedAt: "2026-04-02T08:00:00Z",
 	}); err != nil {
@@ -3085,7 +3088,7 @@ func TestBdRuntimeEnvForRigFallsBackToManagedCityPort(t *testing.T) {
 	}
 
 	env := mustBdRuntimeEnvForRig(t, cityDir, &config.City{}, rigDir)
-	want := strings.TrimSpace(strings.TrimPrefix(ln.Addr().String(), "127.0.0.1:"))
+	want := strconv.Itoa(port)
 	if got := env["GC_DOLT_PORT"]; got != want {
 		t.Fatalf("GC_DOLT_PORT = %q, want %q", got, want)
 	}

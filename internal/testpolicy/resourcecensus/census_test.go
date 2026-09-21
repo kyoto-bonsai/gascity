@@ -1959,8 +1959,8 @@ func TestBootstrapPolicyOwnsHTTPTestServerDebt(t *testing.T) {
 
 	for _, rows := range [][]Baseline{bootstrapPolicy.Debt, bootstrapPolicy.SmallDebt} {
 		row := findRow(t, rows, ScopeUntagged, ResourceHTTPTestServer)
-		if row.OwnerBead != "ga-cp3hwi" || row.MigrationTarget != "P0.4c" {
-			t.Fatalf("HTTP test server owner = %q/%q, want ga-cp3hwi/P0.4c", row.OwnerBead, row.MigrationTarget)
+		if row.OwnerBead != "ga-f27exc.2.1" || row.MigrationTarget != "P0.4c" {
+			t.Fatalf("HTTP test server owner = %q/%q, want ga-f27exc.2.1/P0.4c", row.OwnerBead, row.MigrationTarget)
 		}
 	}
 }

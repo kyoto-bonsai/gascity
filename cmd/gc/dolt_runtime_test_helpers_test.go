@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -25,9 +26,7 @@ func writeReachableManagedDoltState(t *testing.T, cityPath string) int {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = ln.Close()
-	})
+	serveOwnedDoltTestListener(t, ln)
 
 	port := ln.Addr().(*net.TCPAddr).Port
 	if err := writeDoltState(cityPath, doltRuntimeState{
@@ -56,9 +55,7 @@ func writeReachableProviderManagedDoltState(t *testing.T, cityPath string) int {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = ln.Close()
-	})
+	serveOwnedDoltTestListener(t, ln)
 
 	port := ln.Addr().(*net.TCPAddr).Port
 	if err := writeDoltRuntimeStateFile(providerManagedDoltStatePath(cityPath), doltRuntimeState{
@@ -71,6 +68,75 @@ func writeReachableProviderManagedDoltState(t *testing.T, cityPath string) int {
 		t.Fatalf("write provider Dolt state: %v", err)
 	}
 	return port
+}
+
+// serveOwnedDoltTestListener drains the real TCP listener used by state
+// validity probes. Repeated self-dials must not fill an unserved accept queue.
+func serveOwnedDoltTestListener(t *testing.T, ln net.Listener) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				done <- err
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		if err := <-done; !errors.Is(err, net.ErrClosed) {
+			t.Errorf("owned Dolt listener accept: %v", err)
+		}
+	})
+}
+
+// installOwnedDoltPortLsofFixture makes only the disposable listener's PID
+// probe deterministic. Other lsof requests still use the real executable.
+func installOwnedDoltPortLsofFixture(t *testing.T, port int) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 2*time.Second)
+	if err != nil {
+		t.Fatalf("self-dial owned Dolt listener on port %d: %v", port, err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close self-dial to owned Dolt listener: %v", err)
+	}
+
+	realLsof, _ := exec.LookPath("lsof")
+	binDir := t.TempDir()
+	shim := fmt.Sprintf(`#!/bin/sh
+target=
+pid_only=
+for arg do
+  case "$arg" in
+    -iTCP:%d) target=1 ;;
+    -t) pid_only=1 ;;
+  esac
+done
+if [ "$target" = 1 ] && [ "$pid_only" = 1 ]; then
+  printf '%%s\n' '%d'
+  exit 0
+fi
+if [ -n "${GC_TEST_REAL_LSOF:-}" ]; then
+  exec "$GC_TEST_REAL_LSOF" "$@"
+fi
+exit 1
+`, port, os.Getpid())
+	shimPath := filepath.Join(binDir, "lsof")
+	if err := os.WriteFile(shimPath, []byte(shim), 0o755); err != nil {
+		t.Fatalf("write owned-port lsof fixture: %v", err)
+	}
+	t.Setenv("GC_TEST_REAL_LSOF", realLsof)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if selected, err := exec.LookPath("lsof"); err != nil || selected != shimPath {
+		t.Fatalf("owned-port lsof fixture selected %q, err %v; want %q", selected, err, shimPath)
+	}
+	if holder := findPortHolderPID(strconv.Itoa(port)); holder != os.Getpid() {
+		t.Fatalf("owned-port fixture holder PID = %d, want test PID %d", holder, os.Getpid())
+	}
 }
 
 //nolint:unused // exercised by native_dolt_rebind_integration_test.go
