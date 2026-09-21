@@ -1,5 +1,6 @@
 city-structure
 city-config
+nudge-poller-directory
 v2-formulas-dir
 v2-agent-format
 v2-import-format
@@ -73,6 +74,7 @@ session-model
 startup-health-episodes
 dolt-server
 fork-rate
+binary-immutability
 dolt-noms-size
 dolt-journal-size
 dolt-config
