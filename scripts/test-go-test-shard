@@ -180,20 +180,19 @@ if [[ ${GO_TEST_MANIFEST+x} == x ]]; then
       echo "invalid go test manifest entry in ${GO_TEST_MANIFEST} at line ${line_number}: ${line}" >&2
       exit 1
     fi
-    if (( manifest_test_count > 0 )); then
-      for existing in "${tests[@]}"; do
-        if [[ "$existing" == "$line" ]]; then
-          echo "duplicate go test manifest entry: ${line}" >&2
-          exit 1
-        fi
-      done
-    fi
     tests+=("$line")
     manifest_test_count=$((manifest_test_count + 1))
   done < "$GO_TEST_MANIFEST"
 
   if (( manifest_test_count == 0 )); then
     echo "go test manifest contains no tests: ${GO_TEST_MANIFEST}" >&2
+    exit 1
+  fi
+  # Bash 3.2 has no associative arrays. Validate the entire manifest once;
+  # comparing each line with every prior line takes minutes at gate scale.
+  duplicate="$(printf '%s\n' "${tests[@]}" | LC_ALL=C sort | uniq -d | sed -n '1p')"
+  if [[ -n "$duplicate" ]]; then
+    echo "duplicate go test manifest entry: ${duplicate}" >&2
     exit 1
   fi
 else
