@@ -15,6 +15,7 @@ cd $WORK/city
 chmod 755 $WORK/city/assets/ops/commands/status/run.sh
 chmod 755 $WORK/city/assets/ops/doctor/tooling/run.sh
 chmod 755 $WORK/city/assets/sidecar/doctor/rig-check/run.sh
+chmod 755 $WORK/city/.test-bin/bd
 
 # Config validates under the reconciled v2 layout.
 exec gc config show --validate
@@ -37,12 +38,23 @@ exec gc ops status alpha beta
 stdout 'ops status alpha beta'
 
 # Imported doctor checks flow into gc doctor, including rig imports.
+# Pin only the file-store preflight to a lightweight bd fixture; the imported
+# doctor checks and their result still run in gc.
+env BD_BIN=$WORK/city/.test-bin/bd
 exec gc doctor --fix
 stdout 'ops:tooling'
 stdout 'sidecar:rig-check'
 stdout 'passed'
 
 -- city/.gc/.keep --
+-- city/.test-bin/bd --
+#!/bin/sh
+if [ "$#" -eq 4 ] && [ "$1" = list ] && [ "$2" = --json ] && [ "$3" = --limit ] && [ "$4" = 1 ]; then
+  printf '[]\n'
+  exit 0
+fi
+echo "unexpected bd preflight args: $*" >&2
+exit 64
 -- city/.gc/site.toml --
 workspace_name = "testcity"
 

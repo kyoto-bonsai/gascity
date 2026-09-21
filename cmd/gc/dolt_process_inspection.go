@@ -303,26 +303,26 @@ func pathWithinOrSame(path, root string) bool {
 }
 
 func deletedDataInodeTargetsFromLsof(pid int) []string {
+	return deletedDataInodeTargetsFromLsofWithRunner(pid, lsofOutput)
+}
+
+func deletedDataInodeTargetsFromLsofWithRunner(pid int, run func(...string) ([]byte, error)) []string {
 	if _, err := exec.LookPath("lsof"); err != nil {
 		return nil
 	}
-	targets := deletedDataInodeTargetsFromFormattedLsof(pid)
+	out, err := run("-a", "-p", strconv.Itoa(pid), "+L1", "-Fnk")
+	var targets []string
+	if err == nil {
+		targets = deletedDataInodeTargetsFromFormattedLsofOutput(string(out))
+	}
 	if len(targets) > 0 {
 		return targets
 	}
-	out, err := lsofOutput("-p", strconv.Itoa(pid))
+	out, err = run("-p", strconv.Itoa(pid))
 	if err != nil {
 		return nil
 	}
 	return deletedDataInodeTargetsFromPlainLsofOutput(string(out))
-}
-
-func deletedDataInodeTargetsFromFormattedLsof(pid int) []string {
-	out, err := lsofOutput("-a", "-p", strconv.Itoa(pid), "+L1", "-Fnk")
-	if err != nil {
-		return nil
-	}
-	return deletedDataInodeTargetsFromFormattedLsofOutput(string(out))
 }
 
 func lsofOutput(args ...string) ([]byte, error) {

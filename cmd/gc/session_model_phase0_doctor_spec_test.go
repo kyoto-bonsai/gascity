@@ -380,6 +380,10 @@ provider = "file"
 
 func newPhase0DoctorCityWithConfig(t *testing.T, configText string) (string, *beads.FileStore) {
 	t.Helper()
+	// These assertions cover session-model findings over a file store. The
+	// external bd preflight has its own tests and can hide those findings when
+	// process startup consumes its deadline under the full suite.
+	withHealthyStorePreflight(t)
 
 	cityPath := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(configText), 0o644); err != nil {

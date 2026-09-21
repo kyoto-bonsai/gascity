@@ -112,12 +112,21 @@ dolt      123 user  cwd    DIR   1,4       96  42 /tmp/my city/.beads/dolt
 func TestDeletedDataInodeTargetsFromLsofParsesNameRecords(t *testing.T) {
 	binDir := t.TempDir()
 	lsofPath := filepath.Join(binDir, "lsof")
-	if err := os.WriteFile(lsofPath, []byte("#!/bin/sh\nprintf 'p123\\nn/private/var/folders/example/.beads/dolt/held.db (deleted)\\nn/private/var/folders/example/.beads/dolt/hq/.dolt/noms/LOCK (deleted)\\n'\n"), 0o755); err != nil {
+	// Satisfy the executable-discovery guard; the injected runner below
+	// supplies the response without launching this script.
+	if err := os.WriteFile(lsofPath, []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
 		t.Fatalf("WriteFile(lsof): %v", err)
 	}
 	t.Setenv("PATH", strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)))
 
-	targets := deletedDataInodeTargetsFromLsof(123)
+	// Keep the command selection and two-target parse assertions while the
+	// fixture supplies output without racing the production 2s lsof deadline.
+	targets := deletedDataInodeTargetsFromLsofWithRunner(123, func(args ...string) ([]byte, error) {
+		if got := strings.Join(args, " "); got != "-a -p 123 +L1 -Fnk" {
+			t.Fatalf("lsof args = %q, want formatted deleted-inode query", got)
+		}
+		return []byte("p123\nn/private/var/folders/example/.beads/dolt/held.db (deleted)\nn/private/var/folders/example/.beads/dolt/hq/.dolt/noms/LOCK (deleted)\n"), nil
+	})
 	if len(targets) != 2 {
 		t.Fatalf("deletedDataInodeTargetsFromLsof returned %d targets, want 2: %#v", len(targets), targets)
 	}

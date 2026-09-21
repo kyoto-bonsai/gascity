@@ -3,6 +3,7 @@
 package packman
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -31,14 +32,17 @@ func TestDefaultRunNetworkGitKillsDescendants(t *testing.T) {
 	wedged := wedgedGit(t)
 
 	restore := networkGitTimeout
-	networkGitTimeout = 300 * time.Millisecond
+	// The deadline starts before exec has launched the shim. The 300ms
+	// fixture bound can expire before its first foreground heartbeat when
+	// other test packages are running; keep the production bound unchanged.
+	networkGitTimeout = 5 * time.Second
 	t.Cleanup(func() { networkGitTimeout = restore })
 	restoreWait := networkGitWaitDelay
 	networkGitWaitDelay = time.Second
 	t.Cleanup(func() { networkGitWaitDelay = restoreWait })
 
-	if _, err := defaultRunNetworkGit("", wedged.URL, "", "clone", "--quiet", wedged.URL, t.TempDir()+"/dest"); err == nil {
-		t.Fatal("cloning a wedged remote succeeded, want a timeout error")
+	if _, err := defaultRunNetworkGit("", wedged.URL, "", "clone", "--quiet", wedged.URL, t.TempDir()+"/dest"); !errors.Is(err, errNetworkGitTimeout) {
+		t.Fatalf("cloning a wedged remote error = %v, want network git timeout", err)
 	}
 
 	size := processgrouptest.WaitForFileSize(t, wedged.HeartbeatPath)
