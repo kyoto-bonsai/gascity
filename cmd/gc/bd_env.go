@@ -1192,7 +1192,20 @@ func resolvedRuntimeCityDoltTargetContext(ctx context.Context, cityPath string, 
 	}
 
 	if target, ok := externalDoltEnvOverrideTarget(); ok {
-		return target, true, nil
+		if managedRuntimeErr == nil {
+			return target, true, nil
+		}
+		// A configured managed city owns its runtime port. A failed
+		// reachability probe must not promote an ambient GC_DOLT_PORT into an
+		// external target. Cities without managed lifecycle ownership retain
+		// their explicit external-env fallback.
+		owned, ownErr := managedDoltLifecycleOwned(cityPath)
+		if ownErr != nil {
+			return contract.DoltConnectionTarget{}, false, ownErr
+		}
+		if !owned {
+			return target, true, nil
+		}
 	}
 
 	if port := recoveredManagedDoltPort(); port != "" {

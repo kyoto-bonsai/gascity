@@ -90,17 +90,28 @@ func findPortHolderPIDFromLsof(port string) int {
 		return 0
 	}
 	out, err := lsofOutput("-nP", "-iTCP:"+port, "-sTCP:LISTEN", "-t")
-	if err == nil {
-		if pid := pidFromLsofPIDList(string(out)); pid > 0 {
-			return pid
-		}
+	// lsofOutput retains complete lines emitted before its deadline. A PID
+	// from the filtered LISTEN query remains usable if lsof times out later.
+	if pid := pidFromLsofPIDList(completeLsofOutput(out, err)); pid > 0 {
+		return pid
 	}
 
 	out, err = lsofOutput("-nP", "-iTCP:"+port, "-sTCP:LISTEN")
-	if err != nil {
-		return 0
+	return pidFromPlainPortLsofOutput(completeLsofOutput(out, err), port)
+}
+
+func completeLsofOutput(out []byte, err error) string {
+	result := string(out)
+	if err == nil {
+		return result
 	}
-	return pidFromPlainPortLsofOutput(string(out), port)
+	// A timed-out command can end mid-PID. Keep only newline-terminated
+	// records so a numeric prefix cannot be mistaken for another live PID.
+	end := strings.LastIndexByte(result, '\n')
+	if end < 0 {
+		return ""
+	}
+	return result[:end+1]
 }
 
 func pidFromLsofPIDList(output string) int {

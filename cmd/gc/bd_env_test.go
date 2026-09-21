@@ -2316,6 +2316,33 @@ dolt.auto-start: false
 	}
 }
 
+func TestResolvedManagedCityDoltTargetDoesNotPromoteAmbientPortAfterProbeFailure(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_DOLT_HOST", "external-db.example.com")
+	t.Setenv("GC_DOLT_PORT", "9999")
+
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte(`issue_prefix: demo
+gc.endpoint_origin: managed_city
+gc.endpoint_status: verified
+dolt.auto-start: false
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	target, ok, err := resolvedRuntimeCityDoltTarget(cityPath, true)
+	if err == nil || !contract.IsManagedRuntimeUnavailable(err) {
+		t.Fatalf("resolvedRuntimeCityDoltTarget() error = %v, want unavailable managed runtime", err)
+	}
+	if ok || target.Port == "9999" {
+		t.Fatalf("resolvedRuntimeCityDoltTarget() = %+v, ok=%v; ambient port must not replace managed port", target, ok)
+	}
+}
+
 func TestOpenStoreAtForCityUsesScopeLocalFileStore(t *testing.T) {
 	cityDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]

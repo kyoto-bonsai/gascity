@@ -1577,7 +1577,13 @@ func doltPortReachable(port string) bool {
 	if strings.TrimSpace(port) == "" {
 		return false
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 250*time.Millisecond)
+	address := net.JoinHostPort("127.0.0.1", port)
+	conn, err := net.DialTimeout("tcp", address, 250*time.Millisecond)
+	if err != nil {
+		// Confirm a failed short probe before discarding otherwise valid
+		// managed state on a loaded host.
+		conn, err = net.DialTimeout("tcp", address, time.Second)
+	}
 	if err != nil {
 		return false
 	}

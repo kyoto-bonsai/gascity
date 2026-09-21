@@ -5464,6 +5464,11 @@ printf 'timeout %%s\n' "$*" >> %s
 shift
 exec "$@"
 `, shellQuote(timeoutLogPath)))
+	// runtime.sh prefers gtimeout on macOS; route both supported names through
+	// this fixture so the bound and failure assertions stay host-independent.
+	if err := os.Symlink("timeout", filepath.Join(binDir, "gtimeout")); err != nil {
+		t.Fatalf("symlink fake gtimeout: %v", err)
+	}
 
 	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 		"GC_BACKUP_OFFSITE_PATH="+offsiteDir,
@@ -5527,6 +5532,9 @@ printf 'timeout %%s\n' "$*" >> %s
 shift
 exec "$@"
 `, shellQuote(timeoutLogPath)))
+			if err := os.Symlink("timeout", filepath.Join(binDir, "gtimeout")); err != nil {
+				t.Fatalf("symlink fake gtimeout: %v", err)
+			}
 
 			out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 				"GC_BACKUP_OFFSITE_PATH="+offsiteDir,

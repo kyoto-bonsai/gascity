@@ -66,6 +66,19 @@ dolt    %d user   12u  IPv4 0x1234      0t0  TCP *:3306 (LISTEN)
 	}
 }
 
+func TestCompleteLsofOutputKeepsOnlyFinishedRecordsOnError(t *testing.T) {
+	partial := []byte("123\n456")
+	if got := completeLsofOutput(partial, fmt.Errorf("deadline exceeded")); got != "123\n" {
+		t.Fatalf("completeLsofOutput(error) = %q, want only complete PID line", got)
+	}
+	if got := completeLsofOutput([]byte("456"), fmt.Errorf("deadline exceeded")); got != "" {
+		t.Fatalf("completeLsofOutput(error) = %q, want no partial PID", got)
+	}
+	if got := completeLsofOutput(partial, nil); got != string(partial) {
+		t.Fatalf("completeLsofOutput(success) = %q, want full output", got)
+	}
+}
+
 func TestProcessCWDFromLsofParsesNameRecord(t *testing.T) {
 	binDir := t.TempDir()
 	lsofPath := filepath.Join(binDir, "lsof")
