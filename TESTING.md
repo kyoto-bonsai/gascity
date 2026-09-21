@@ -500,8 +500,9 @@ build-tagged files; the live `cmd/gc+untagged` ratchets do not.
 the externally installed `bd` CLI; its process call remains visible in the
 all-source audit while staying outside untagged and Small debt.
 
-The 2026-09-21 increase is an expiring policy change under `ga-f27exc.2.1`,
-subject to independent council review by 2026-10-01. Two tagged subprocess
+The 2026-09-21 increase is an expiring policy change under `ga-f27exc.2.1`.
+Initial independent council review is required before gate acceptance;
+2026-10-01 is the expiry and re-review date. Two tagged subprocess
 calls were retained: `internal/runtime/tmux/tmux_test.go` checks that process
 arguments do not expose a secret, and `test/integration/e2e_mail_bodyfile_test.go`
 checks shell/body-file delivery through a real child. The untagged HTTP server

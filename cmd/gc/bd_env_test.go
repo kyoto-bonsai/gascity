@@ -1172,10 +1172,17 @@ func pinProviderFixturePortHolder(t *testing.T, port int) {
 	}
 	script := fmt.Sprintf("#!/bin/sh\nif [ \"$#\" -eq 4 ] && [ \"$1\" = '-nP' ] && [ \"$2\" = '-iTCP:%d' ] && [ \"$3\" = '-sTCP:LISTEN' ] && [ \"$4\" = '-t' ]; then\n  printf '%%s\\n' '%d'\n  exit 0\nfi\n%s\n", port, os.Getpid(), delegate)
 	binDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(binDir, "lsof"), []byte(script), 0o755); err != nil {
+	shimPath := filepath.Join(binDir, "lsof")
+	if err := os.WriteFile(shimPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fixture lsof: %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if selected, err := exec.LookPath("lsof"); err != nil || selected != shimPath {
+		t.Fatalf("fixture lsof selected %q, err %v; want %q", selected, err, shimPath)
+	}
+	if holder := findPortHolderPID(strconv.Itoa(port)); holder != os.Getpid() {
+		t.Fatalf("fixture holder PID = %d, want test PID %d", holder, os.Getpid())
+	}
 }
 
 func TestResolvedRuntimeCityDoltTargetIgnoresIPv6LocalEnvOverride(t *testing.T) {
@@ -1470,7 +1477,7 @@ dolt.auto-start: false
 		t.Fatal(err)
 	}
 	port := writeReachableProviderManagedDoltState(t, cityPath)
-	installOwnedDoltPortLsofFixture(t, port)
+	pinProviderFixturePortHolder(t, port)
 
 	target, ok, err := resolvedRuntimeCityDoltTarget(cityPath, true)
 	if err == nil {
@@ -3070,7 +3077,7 @@ func TestBdRuntimeEnvForRigFallsBackToManagedCityPort(t *testing.T) {
 	}
 	serveOwnedDoltTestListener(t, ln)
 	port := ln.Addr().(*net.TCPAddr).Port
-	installOwnedDoltPortLsofFixture(t, port)
+	pinProviderFixturePortHolder(t, port)
 
 	if err := writeDoltState(cityDir, doltRuntimeState{
 		Running:   true,
