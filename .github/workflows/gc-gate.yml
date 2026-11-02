@@ -260,7 +260,7 @@ jobs:
               done
             done ) &
           sampler=$!
-          in_cgroup make check BAZEL_FLAGS="$GATE_BAZEL_FLAGS --build_event_json_file=$RUNNER_TEMP/bep.json" 2>&1 | tee "$RUNNER_TEMP/make.log" || rc=$?
+          in_cgroup make -k check BAZEL_FLAGS="$GATE_BAZEL_FLAGS --build_event_json_file=$RUNNER_TEMP/bep.json" 2>&1 | tee "$RUNNER_TEMP/make.log" || rc=$?
           stop_sampler || true
           reap || true
           cgroup=0
@@ -323,14 +323,30 @@ jobs:
           runner_temp = os.environ.get("RUNNER_TEMP", "/tmp")
 
           make_failed_target = None
+          make_failures = None
+          make_failures_total = 0
           make_log_path = os.path.join(runner_temp, "make.log")
           if os.path.isfile(make_log_path):
-              make_error = re.compile(r"make: \*\*\* \[(?:[^\]:\n]*:\d+: )?([A-Za-z0-9_.-]+)\] Error")
+              import hashlib
+              make_error = re.compile(r"make: \*\*\* \[(?:[^\]:\n]*:\d+: )?([A-Za-z0-9_.-]+)\] Error (\d+)")
+              make_failures = []
+              block = hashlib.sha256()
+              block_lines = 0
               with open(make_log_path, "r", encoding="utf-8", errors="replace") as f:
                   for line in f:
-                      match = make_error.search(line)
+                      text = line.rstrip("\r\n")
+                      match = make_error.search(text)
                       if match:
                           make_failed_target = match.group(1)
+                          make_failures_total += 1
+                          if len(make_failures) < 20:
+                              make_failures.append({"target": match.group(1), "rc": int(match.group(2)),
+                                                    "block_sha256": block.hexdigest(), "block_lines": block_lines})
+                          block = hashlib.sha256()
+                          block_lines = 0
+                      else:
+                          block.update(text.encode("utf-8", "replace") + b"\n")
+                          block_lines += 1
 
           bep_path = os.path.join(runner_temp, "bep.json")
           counts = None
@@ -427,7 +443,7 @@ jobs:
 
           bazel_flags = os.environ.get("GATE_BAZEL_FLAGS", "")
           commands = [
-              f'make check BAZEL_FLAGS="{bazel_flags} --build_event_json_file={runner_temp}/bep.json"'
+              f'make -k check BAZEL_FLAGS="{bazel_flags} --build_event_json_file={runner_temp}/bep.json"'
           ]
           swap_added = os.environ.get("GATE_SWAP_ADDED", "")
           swap_added_bytes = int(swap_added) if swap_added.isdigit() else None
@@ -518,6 +534,8 @@ jobs:
               "exit_code": exit_code,
               "pre_fail": pre_fail,
               "make_failed_target": make_failed_target,
+              "make_failures": make_failures,
+              "make_failures_total": make_failures_total,
               "counts": counts,
               "bep_bad_lines": bep_bad_lines,
               "bep_deadline_hit": bep_deadline_hit,
